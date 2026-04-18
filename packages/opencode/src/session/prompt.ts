@@ -56,6 +56,7 @@ import { SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionReminders } from "./reminders"
 import { SessionTools } from "./tools"
 import { LLMEvent } from "@opencode-ai/llm"
+import { Todo } from "./todo"
 
 // @ts-ignore
 globalThis.AI_SDK_LOG_WARNINGS = false
@@ -141,6 +142,7 @@ const layer = Layer.effect(
     const flags = yield* RuntimeFlags.Service
     const database = yield* Database.Service
     const { db } = database
+    const todo = yield* Todo.Service
     const ops = Effect.fn("SessionPrompt.ops")(function* () {
       return {
         cancel: (sessionID: SessionID) => cancel(sessionID),
@@ -458,6 +460,7 @@ const layer = Layer.effect(
             if (session.revert) {
               yield* revert.cleanup(session)
             }
+            yield* todo.update({ sessionID: input.sessionID, todos: [] })
             const agent = yield* agents.get(input.agent)
             if (!agent) {
               const available = (yield* agents.list()).filter((a) => !a.hidden).map((a) => a.name)
@@ -1054,6 +1057,7 @@ const layer = Layer.effect(
     )(function* (input: PromptInput) {
       const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
       yield* revert.cleanup(session)
+      yield* todo.update({ sessionID: input.sessionID, todos: [] })
       const message = yield* createUserMessage(input)
       yield* sessions.touch(input.sessionID)
 
@@ -1625,6 +1629,7 @@ export const node = LayerNode.make({
     EventV2Bridge.node,
     RuntimeFlags.node,
     Database.node,
+    Todo.node,
   ],
 })
 
