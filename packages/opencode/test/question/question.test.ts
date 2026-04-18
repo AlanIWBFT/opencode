@@ -10,8 +10,18 @@ import { SessionID } from "../../src/session/schema"
 import { testEffect } from "../lib/effect"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { EventV2Bridge } from "../../src/event-v2-bridge"
+import { Session } from "../../src/session/session"
+import { Provider } from "../../src/provider/provider"
+import { ProviderTest } from "../fake/provider"
+import { Database } from "@opencode-ai/core/database/database"
 
-const questionLayer = LayerNode.compile(LayerNode.group([Question.node, EventV2Bridge.node, CrossSpawnSpawner.node]))
+const questionLayer = LayerNode.compile(
+  LayerNode.group([Question.node, EventV2Bridge.node, Session.node, Provider.node, Database.node, CrossSpawnSpawner.node]),
+  [
+    [Session.node, Layer.mock(Session.Service)({})],
+    [Provider.node, ProviderTest.fake().layer],
+  ],
+)
 const it = testEffect(questionLayer)
 const lifecycle = testEffect(Layer.mergeAll(questionLayer, testInstanceStoreLayer))
 

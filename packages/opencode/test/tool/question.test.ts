@@ -1,6 +1,6 @@
 import { describe, expect } from "bun:test"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { Effect, Fiber, Queue } from "effect"
+import { Effect, Fiber, Layer, Queue } from "effect"
 import { QuestionTool } from "../../src/tool/question"
 import { Question } from "../../src/question"
 import { SessionID, MessageID } from "../../src/session/schema"
@@ -8,6 +8,10 @@ import { Agent } from "../../src/agent/agent"
 import { Truncate } from "@/tool/truncate"
 import { testEffect } from "../lib/effect"
 import { EventV2Bridge } from "../../src/event-v2-bridge"
+import { Session } from "../../src/session/session"
+import { Provider } from "../../src/provider/provider"
+import { ProviderTest } from "../fake/provider"
+import { Database } from "@opencode-ai/core/database/database"
 
 const ctx = {
   sessionID: SessionID.make("ses_test-session"),
@@ -21,7 +25,13 @@ const ctx = {
 }
 
 const it = testEffect(
-  LayerNode.compile(LayerNode.group([Question.node, EventV2Bridge.node, Truncate.node, Agent.node])),
+  LayerNode.compile(
+    LayerNode.group([Question.node, EventV2Bridge.node, Session.node, Provider.node, Database.node, Truncate.node, Agent.node]),
+    [
+      [Session.node, Layer.mock(Session.Service)({})],
+      [Provider.node, ProviderTest.fake().layer],
+    ],
+  ),
 )
 
 const pending = Effect.fn("QuestionToolTest.pending")(function* (question: Question.Interface) {
