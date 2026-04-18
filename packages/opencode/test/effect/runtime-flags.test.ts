@@ -18,6 +18,16 @@ describe("RuntimeFlags", () => {
     }),
   )
 
+  it.effect("layer enables Exa unless explicitly disabled", () =>
+    Effect.gen(function* () {
+      expect((yield* readFlags.pipe(Effect.provide(fromConfig({})))).enableExa).toBe(true)
+      expect((yield* readFlags.pipe(Effect.provide(fromConfig({ OPENCODE_ENABLE_EXA: "false" })))).enableExa).toBe(
+        false,
+      )
+      expect((yield* readFlags.pipe(Effect.provide(fromConfig({ OPENCODE_ENABLE_EXA: "0" })))).enableExa).toBe(false)
+    }),
+  )
+
   it.effect("layer parses plugin flags from the active ConfigProvider", () =>
     Effect.gen(function* () {
       const flags = yield* readFlags.pipe(
@@ -60,7 +70,7 @@ describe("RuntimeFlags", () => {
       expect(flags.experimentalWorkspaces).toBe(true)
       expect(flags.experimentalIconDiscovery).toBe(true)
       expect(flags.experimentalNativeLlm).toBe(false)
-      expect(flags.experimentalWebSockets).toBe(false)
+      expect(flags.experimentalWebSockets).toBe(true)
       expect(flags.client).toBe("desktop")
     }),
   )
@@ -89,13 +99,31 @@ describe("RuntimeFlags", () => {
     }),
   )
 
-  it.effect("enables WebSockets via dedicated flag only", () =>
+  it.effect("enables WebSockets unless explicitly disabled", () =>
     Effect.gen(function* () {
-      const explicit = yield* readFlags.pipe(Effect.provide(fromConfig({ OPENCODE_EXPERIMENTAL_WEBSOCKETS: "true" })))
-      const umbrella = yield* readFlags.pipe(Effect.provide(fromConfig({ OPENCODE_EXPERIMENTAL: "true" })))
+      const defaults = yield* readFlags.pipe(Effect.provide(fromConfig({})))
+      const disabled = yield* readFlags.pipe(Effect.provide(fromConfig({ OPENCODE_EXPERIMENTAL_WEBSOCKETS: "false" })))
+      const zero = yield* readFlags.pipe(Effect.provide(fromConfig({ OPENCODE_EXPERIMENTAL_WEBSOCKETS: "0" })))
 
-      expect(explicit.experimentalWebSockets).toBe(true)
-      expect(umbrella.experimentalWebSockets).toBe(false)
+      expect(defaults.experimentalWebSockets).toBe(true)
+      expect(disabled.experimentalWebSockets).toBe(false)
+      expect(zero.experimentalWebSockets).toBe(false)
+    }),
+  )
+
+  it.effect("enables Code Mode only when explicitly enabled", () =>
+    Effect.gen(function* () {
+      const defaults = yield* readFlags.pipe(Effect.provide(fromConfig({})))
+      const enabled = yield* readFlags.pipe(
+        Effect.provide(fromConfig({ OPENCODE_EXPERIMENTAL_CODE_MODE: "true" })),
+      )
+      const disabled = yield* readFlags.pipe(
+        Effect.provide(fromConfig({ OPENCODE_EXPERIMENTAL_CODE_MODE: "false" })),
+      )
+
+      expect(defaults.experimentalCodeMode).toBe(false)
+      expect(enabled.experimentalCodeMode).toBe(true)
+      expect(disabled.experimentalCodeMode).toBe(false)
     }),
   )
 
@@ -113,7 +141,7 @@ describe("RuntimeFlags", () => {
       expect(flags.disableLspDownload).toBe(false)
       expect(flags.disableClaudeCodePrompt).toBe(false)
       expect(flags.disableClaudeCodeSkills).toBe(false)
-      expect(flags.enableExa).toBe(false)
+      expect(flags.enableExa).toBe(true)
       expect(flags.experimentalIconDiscovery).toBe(false)
       expect(flags.experimentalOxfmt).toBe(false)
       expect(flags.outputTokenMax).toBeUndefined()
@@ -339,7 +367,7 @@ describe("RuntimeFlags", () => {
       expect(flags.disableLspDownload).toBe(false)
       expect(flags.disableClaudeCodePrompt).toBe(false)
       expect(flags.disableClaudeCodeSkills).toBe(false)
-      expect(flags.enableExa).toBe(false)
+      expect(flags.enableExa).toBe(true)
       expect(flags.experimentalIconDiscovery).toBe(false)
       expect(flags.experimentalOxfmt).toBe(false)
       expect(flags.outputTokenMax).toBeUndefined()
