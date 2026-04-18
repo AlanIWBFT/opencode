@@ -1,5 +1,7 @@
+import { AppRuntime } from "@/effect/app-runtime"
 import { Question } from "@/question"
 import { QuestionID } from "@/question/schema"
+import { SessionPrompt } from "@/session/prompt"
 import { Effect } from "effect"
 import { HttpApiBuilder } from "effect/unstable/httpapi"
 import { InstanceHttpApi } from "../api"
@@ -8,6 +10,7 @@ import { QuestionNotFoundError } from "../errors"
 export const questionHandlers = HttpApiBuilder.group(InstanceHttpApi, "question", (handlers) =>
   Effect.gen(function* () {
     const svc = yield* Question.Service
+    const prompt = yield* SessionPrompt.Service
 
     const list = Effect.fn("QuestionHttpApi.list")(function* () {
       return yield* svc.list()
@@ -17,7 +20,7 @@ export const questionHandlers = HttpApiBuilder.group(InstanceHttpApi, "question"
       params: { requestID: QuestionID }
       payload: Question.Reply
     }) {
-      yield* svc
+      const sessionID = yield* svc
         .reply({
           requestID: ctx.params.requestID,
           answers: ctx.payload.answers,
@@ -32,6 +35,13 @@ export const questionHandlers = HttpApiBuilder.group(InstanceHttpApi, "question"
             ),
           ),
         )
+      if (sessionID) {
+        yield* Effect.sync(() => {
+          void AppRuntime.runPromise(prompt.loop({ sessionID })).catch((error) => {
+            console.error("question reply resume failed", { sessionID, error })
+          })
+        })
+      }
       return true
     })
 

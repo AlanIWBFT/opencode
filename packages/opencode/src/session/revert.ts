@@ -2,6 +2,7 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Effect, Layer, Context, Schema } from "effect"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { EventV2Bridge } from "@/event-v2-bridge"
+import { Question } from "../question"
 import { Snapshot } from "../snapshot"
 import { Storage } from "@/storage/storage"
 import { Session } from "./session"
@@ -32,11 +33,20 @@ const layer = Layer.effect(
     const snap = yield* Snapshot.Service
     const storage = yield* Storage.Service
     const events = yield* EventV2Bridge.Service
+    const question = yield* Question.Service
     const summary = yield* SessionSummary.Service
     const state = yield* SessionRunState.Service
 
+    const clear = Effect.fn("SessionRevert.clear")(function* (sessionID: SessionID) {
+      for (const item of yield* question.list()) {
+        if (item.sessionID !== sessionID) continue
+        yield* question.reject(item.id).pipe(Effect.catchTag("Question.NotFoundError", () => Effect.void))
+      }
+    })
+
     const revert = Effect.fn("SessionRevert.revert")(function* (input: RevertInput) {
       yield* state.assertNotBusy(input.sessionID)
+      yield* clear(input.sessionID)
       const all = yield* sessions.messages({ sessionID: input.sessionID }).pipe(Effect.orDie)
       let lastUser: SessionV1.User | undefined
       const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
@@ -130,7 +140,7 @@ const layer = Layer.effect(
 export const node = LayerNode.make({
   service: Service,
   layer: layer,
-  deps: [Session.node, Snapshot.node, Storage.node, EventV2Bridge.node, SessionSummary.node, SessionRunState.node],
+  deps: [Session.node, Snapshot.node, Storage.node, EventV2Bridge.node, Question.node, SessionSummary.node, SessionRunState.node],
 })
 
 export * as SessionRevert from "./revert"

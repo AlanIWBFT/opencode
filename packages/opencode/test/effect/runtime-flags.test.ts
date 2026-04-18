@@ -15,6 +15,7 @@ describe("RuntimeFlags", () => {
       const flags = yield* readFlags.pipe(Effect.provide(fromConfig({})))
 
       expect(flags.autoShare).toBe(false)
+      expect(flags.experimentalPlanMode).toBe(true)
     }),
   )
 

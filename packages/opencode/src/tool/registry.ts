@@ -55,6 +55,7 @@ import { MCP } from "@/mcp"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { McpCatalog } from "@/mcp/catalog"
 
+const clients = ["app", "cli", "desktop"]
 export function webSearchEnabled(providerID: ProviderV2.ID, flags = { exa: false, parallel: false }) {
   return (
     providerID === ProviderV2.ID.opencode ||
@@ -85,6 +86,8 @@ export interface Interface {
     permission?: PermissionV1.Ruleset
   }) => Effect.Effect<Tool.Def[]>
 }
+
+export const planEnabled = (client: string) => clients.includes(client)
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/ToolRegistry") {}
 
@@ -205,6 +208,7 @@ const layer = Layer.effect(
 
         yield* config.get()
         const questionEnabled = ["app", "cli", "desktop"].includes(flags.client) || flags.enableQuestionTool
+        const planOn = planEnabled(flags.client)
 
         const tool = yield* Effect.all({
           invalid: Tool.init(invalid),
@@ -245,7 +249,7 @@ const layer = Layer.effect(
             tool.patch,
             ...(tool.execute ? [tool.execute] : []),
             ...(flags.experimentalLspTool ? [tool.lsp] : []),
-            ...(flags.experimentalPlanMode && flags.client === "cli" ? [tool.plan] : []),
+            ...(planOn ? [tool.plan] : []),
           ],
           task: tool.task,
           read: tool.read,

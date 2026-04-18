@@ -5,6 +5,10 @@ import { SessionID } from "@/session/schema"
 import { QuestionID } from "./schema"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { QuestionV1 } from "@opencode-ai/schema/question-v1"
+import { Provider } from "@/provider/provider"
+import { Session } from "@/session/session"
+import { PlanState } from "@/tool/plan-state"
+import { Database } from "@opencode-ai/core/database/database"
 
 export const Option = QuestionV1.Option
 export type Option = typeof Option.Type
@@ -47,6 +51,7 @@ interface State {
 
 export interface Interface {
   readonly ask: (input: {
+    id?: QuestionID
     sessionID: SessionID
     questions: ReadonlyArray<Info>
     tool?: Tool
@@ -54,7 +59,7 @@ export interface Interface {
   readonly reply: (input: {
     requestID: QuestionID
     answers: ReadonlyArray<Answer>
-  }) => Effect.Effect<void, NotFoundError>
+  }) => Effect.Effect<SessionID | undefined, NotFoundError>
   readonly reject: (requestID: QuestionID) => Effect.Effect<void, NotFoundError>
   readonly list: () => Effect.Effect<ReadonlyArray<Request>>
 }
@@ -65,6 +70,9 @@ const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const events = yield* EventV2Bridge.Service
+    const session = yield* Session.Service
+    const provider = yield* Provider.Service
+    const database = yield* Database.Service
     const state = yield* InstanceState.make<State>(
       Effect.fn("Question.state")(function* () {
         const state = {
@@ -85,12 +93,13 @@ const layer = Layer.effect(
     )
 
     const ask = Effect.fn("Question.ask")(function* (input: {
+      id?: QuestionID
       sessionID: SessionID
       questions: ReadonlyArray<Info>
       tool?: Tool
     }) {
       const pending = (yield* InstanceState.get(state)).pending
-      const id = QuestionID.ascending()
+      const id = input.id ?? QuestionID.ascending()
       yield* Effect.logInfo("asking", { id, questions: input.questions.length })
 
       const deferred = yield* Deferred.make<ReadonlyArray<Answer>, RejectedError>()
@@ -117,45 +126,89 @@ const layer = Layer.effect(
     }) {
       const pending = (yield* InstanceState.get(state)).pending
       const existing = pending.get(input.requestID)
-      if (!existing) {
+      if (existing) {
+        pending.delete(input.requestID)
+        yield* Effect.logInfo("replied", { requestID: input.requestID, answers: input.answers })
+        yield* events.publish(Event.Replied, {
+          sessionID: existing.info.sessionID,
+          requestID: existing.info.id,
+          answers: input.answers.map((a) => [...a]),
+        })
+        yield* Deferred.succeed(existing.deferred, input.answers)
+        return undefined
+      }
+
+      const item = (yield* PlanState.recover(input.requestID).pipe(Effect.provideService(Database.Service, database)))[0]
+      if (!item) {
         yield* Effect.logWarning("reply for unknown request", { requestID: input.requestID })
         return yield* new NotFoundError({ requestID: input.requestID })
       }
-      pending.delete(input.requestID)
-      yield* Effect.logInfo("replied", { requestID: input.requestID, answers: input.answers })
+
+      yield* Effect.logInfo("replied recovered", { requestID: input.requestID, answers: input.answers })
       yield* events.publish(Event.Replied, {
-        sessionID: existing.info.sessionID,
-        requestID: existing.info.id,
+        sessionID: item.info.sessionID,
+        requestID: item.info.id,
         answers: input.answers.map((a) => [...a]),
       })
-      yield* Deferred.succeed(existing.deferred, input.answers)
+
+      return yield* PlanState.reply({
+        session,
+        provider,
+        item,
+        answer: input.answers[0]?.[0],
+        error: new RejectedError().message,
+      }).pipe(Effect.provideService(Database.Service, database))
     })
 
     const reject = Effect.fn("Question.reject")(function* (requestID: QuestionID) {
       const pending = (yield* InstanceState.get(state)).pending
       const existing = pending.get(requestID)
-      if (!existing) {
+      if (existing) {
+        pending.delete(requestID)
+        yield* Effect.logInfo("rejected", { requestID })
+        yield* events.publish(Event.Rejected, {
+          sessionID: existing.info.sessionID,
+          requestID: existing.info.id,
+        })
+        yield* Deferred.fail(existing.deferred, new RejectedError())
+        return
+      }
+
+      const item = (yield* PlanState.recover(requestID).pipe(Effect.provideService(Database.Service, database)))[0]
+      if (!item) {
         yield* Effect.logWarning("reject for unknown request", { requestID })
         return yield* new NotFoundError({ requestID })
       }
-      pending.delete(requestID)
-      yield* Effect.logInfo("rejected", { requestID })
+
+      yield* Effect.logInfo("rejected recovered", { requestID })
       yield* events.publish(Event.Rejected, {
-        sessionID: existing.info.sessionID,
-        requestID: existing.info.id,
+        sessionID: item.info.sessionID,
+        requestID: item.info.id,
       })
-      yield* Deferred.fail(existing.deferred, new RejectedError())
+      yield* PlanState.reject({ session, part: item.part, error: new RejectedError().message }).pipe(
+        Effect.provideService(Database.Service, database),
+      )
     })
 
     const list = Effect.fn("Question.list")(function* () {
       const pending = (yield* InstanceState.get(state)).pending
-      return Array.from(pending.values(), (x) => x.info)
+      const items = Array.from(pending.values(), (x) => x.info)
+      const seen = new Set(items.map((item) => item.id))
+      for (const item of yield* PlanState.recover().pipe(Effect.provideService(Database.Service, database))) {
+        if (seen.has(item.info.id)) continue
+        items.push(Schema.decodeUnknownSync(Request)(item.info))
+      }
+      return items
     })
 
     return Service.of({ ask, reply, reject, list })
   }),
 )
 
-export const node = LayerNode.make({ service: Service, layer: layer, deps: [EventV2Bridge.node] })
+export const node = LayerNode.make({
+  service: Service,
+  layer: layer,
+  deps: [EventV2Bridge.node, Session.node, Provider.node, Database.node],
+})
 
 export * as Question from "."

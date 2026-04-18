@@ -1,4 +1,4 @@
-import { afterEach, describe, expect } from "bun:test"
+import { afterEach, describe, expect, test } from "bun:test"
 import path from "path"
 import fs from "fs/promises"
 import { fileURLToPath, pathToFileURL } from "url"
@@ -569,4 +569,14 @@ describe("tool.registry", () => {
       expect(ids).toContain("cowsay")
     }),
   )
+
+  test("enables plan_exit for supported interactive clients", () => {
+    expect(ToolRegistry.planEnabled("app")).toBe(true)
+    expect(ToolRegistry.planEnabled("desktop")).toBe(true)
+    expect(ToolRegistry.planEnabled("cli")).toBe(true)
+  })
+
+  test("disables plan_exit for unsupported clients", () => {
+    expect(ToolRegistry.planEnabled("web")).toBe(false)
+  })
 })
