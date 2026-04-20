@@ -4,6 +4,7 @@ import { Context, Effect, Fiber, Layer, Schema, Stream } from "effect"
 import { ChildProcess } from "effect/unstable/process"
 import { Entry, Match } from "@opencode/schema/filesystem"
 import { makeLocationNode } from "@opencode/util/effect/app-node"
+import { FSUtil } from "@opencode/util/fs-util"
 import { collectStream, waitForAbort } from "@opencode/util/process"
 import { Environment } from "./environment/index.js"
 import { NonNegativeInt, PositiveInt, RelativePath } from "./schema.js"
@@ -104,6 +105,8 @@ const layer = Layer.effect(
   Effect.gen(function* () {
     const environment = yield* Environment.Service
     const binary = yield* RipgrepBinary.Service
+    const fs = yield* FSUtil.Service
+    const threads = yield* readThreads(fs)
 
     const run = <A>(input: {
       readonly cwd: string
@@ -118,7 +121,11 @@ const layer = Layer.effect(
         Effect.gen(function* () {
           // Hosted environments will resolve rg through their driver image; the spawner is the execution seam.
           const handle = yield* environment.spawner.spawn(
-            ChildProcess.make(yield* binary.filepath, input.args, { cwd: input.cwd, extendEnv: true, stdin: "ignore" }),
+            ChildProcess.make(yield* binary.filepath, [...threads, ...input.args], {
+              cwd: input.cwd,
+              extendEnv: true,
+              stdin: "ignore",
+            }),
           )
           const stderrFiber = yield* collectStream(handle.stderr, ERROR_BYTES).pipe(
             Effect.map((output) => output.buffer.toString("utf8")),
@@ -272,4 +279,30 @@ const layer = Layer.effect(
   }),
 )
 
-export const node = makeLocationNode({ service: Service, layer, deps: [Environment.node, RipgrepBinary.node] })
+function readThreads(fs: FSUtil.Interface) {
+  const filepath = process.env.RIPGREP_CONFIG_PATH
+  if (!filepath) return Effect.succeed<string[]>([])
+  return fs.readFileStringSafe(filepath).pipe(
+    Effect.map((content) => {
+      if (!content) return []
+      const args = content
+        .split(/\r?\n/u)
+        .map((line) => line.trim())
+        .filter((line) => line.length > 0 && !line.startsWith("#"))
+      return args.reduce<string[]>((result, arg, index) => {
+        const inline = /^(?:--threads=|-j=?)(\d+)$/u.exec(arg)
+        const value =
+          inline?.[1] ??
+          ((arg === "--threads" || arg === "-j") && /^\d+$/u.test(args[index + 1]) ? args[index + 1] : undefined)
+        return value ? [`--threads=${value}`] : result
+      }, [])
+    }),
+    Effect.catch(() => Effect.succeed([])),
+  )
+}
+
+export const node = makeLocationNode({
+  service: Service,
+  layer,
+  deps: [Environment.node, RipgrepBinary.node, FSUtil.node],
+})
