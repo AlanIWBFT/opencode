@@ -10,6 +10,7 @@ type Kind = "file" | "directory"
 type Options = {
   bypass?: boolean
   kind?: Kind
+  readOnly?: boolean
 }
 
 export const assertExternalDirectoryEffect = Effect.fn("Tool.assertExternalDirectory")(function* (
@@ -19,7 +20,7 @@ export const assertExternalDirectoryEffect = Effect.fn("Tool.assertExternalDirec
 ) {
   if (!target) return false
 
-  if (options?.bypass) return false
+  if (options?.bypass || options?.readOnly) return false
 
   const ins = yield* InstanceState.context
   const full = process.platform === "win32" ? FSUtil.normalizePath(target) : target

@@ -55,6 +55,7 @@ export const GrepTool = Tool.define(
           yield* assertExternalDirectoryEffect(ctx, requested, {
             bypass: false,
             kind: requestedInfo?.type === "Directory" ? "directory" : "file",
+            readOnly: true,
           })
 
           const search = FSUtil.resolve(requested)
