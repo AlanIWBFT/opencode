@@ -250,11 +250,12 @@ export const ReadTool = Tool.define<
       yield* assertExternalDirectoryEffect(ctx, filepath, {
         bypass: Boolean(ctx.extra?.["bypassCwdCheck"]),
         kind: stat?.type === "Directory" ? "directory" : "file",
+        readOnly: true,
       })
 
       yield* ctx.ask({
         permission: "read",
-        patterns: [path.relative(instance.worktree, filepath)],
+        patterns: [title.startsWith("..") || path.isAbsolute(title) ? filepath : title],
         always: ["*"],
         metadata: {},
       })

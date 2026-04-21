@@ -169,7 +169,7 @@ describe("tool.read external_directory permission", () => {
     }),
   )
 
-  it.live("asks for external_directory permission when reading absolute path outside project", () =>
+  it.live("skips external_directory permission when reading absolute path outside project", () =>
     Effect.gen(function* () {
       const outer = yield* tmpdirScoped()
       const dir = yield* tmpdirScoped({ git: true })
@@ -179,8 +179,10 @@ describe("tool.read external_directory permission", () => {
 
       yield* exec(dir, { filePath: path.join(outer, "secret.txt") }, next)
       const ext = items.find((item) => item.permission === "external_directory")
-      expect(ext).toBeDefined()
-      expect(ext!.patterns).toContain(glob(path.join(outer, "*")))
+      const read = items.find((item) => item.permission === "read")
+      expect(ext).toBeUndefined()
+      expect(read).toBeDefined()
+      expect(read!.patterns).toEqual([full(path.join(outer, "secret.txt"))])
     }),
   )
 
@@ -193,7 +195,7 @@ describe("tool.read external_directory permission", () => {
         const { items, next } = asks()
         const target = path.join(dir, "test.txt")
         const alt = target
-          .replace(/^[A-Za-z]:/, "")
+          .replace(/^([A-Za-z]):[\\/]/, (_, drive) => `/${drive}/`)
           .replaceAll("\\", "/")
           .toLowerCase()
 
@@ -218,7 +220,7 @@ describe("tool.read external_directory permission", () => {
     }),
   )
 
-  it.live("asks for directory-scoped external_directory permission when reading external directory", () =>
+  it.live("skips external_directory permission when reading external directory", () =>
     Effect.gen(function* () {
       const outer = yield* tmpdirScoped()
       const dir = yield* tmpdirScoped({ git: true })
@@ -228,12 +230,14 @@ describe("tool.read external_directory permission", () => {
 
       yield* exec(dir, { filePath: path.join(outer, "external") }, next)
       const ext = items.find((item) => item.permission === "external_directory")
-      expect(ext).toBeDefined()
-      expect(ext!.patterns).toContain(glob(path.join(outer, "external", "*")))
+      const read = items.find((item) => item.permission === "read")
+      expect(ext).toBeUndefined()
+      expect(read).toBeDefined()
+      expect(read!.patterns).toEqual([full(path.join(outer, "external"))])
     }),
   )
 
-  it.live("asks for external_directory permission when reading relative path outside project", () =>
+  it.live("skips external_directory permission when reading relative path outside project", () =>
     Effect.gen(function* () {
       const dir = yield* tmpdirScoped({ git: true })
 
@@ -241,7 +245,10 @@ describe("tool.read external_directory permission", () => {
 
       yield* fail(dir, { filePath: "../outside.txt" }, next)
       const ext = items.find((item) => item.permission === "external_directory")
-      expect(ext).toBeDefined()
+      const read = items.find((item) => item.permission === "read")
+      expect(ext).toBeUndefined()
+      expect(read).toBeDefined()
+      expect(read!.patterns).toEqual([full(path.resolve(dir, "../outside.txt"))])
     }),
   )
 
