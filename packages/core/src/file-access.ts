@@ -53,7 +53,7 @@ export interface Interface {
     context: Invocation,
     metadata?: Permission.AssertInput["metadata"],
   ) => Effect.Effect<void, Error | SessionErrors.NotFoundError>
-  /** Resolve a read target and obtain external-directory approval before read approval. */
+  /** Resolve a read target and enforce its read rules without extra directory approval. */
   readonly authorizeRead: (
     file: string,
     context: Invocation,
@@ -147,10 +147,7 @@ const layer = Layer.effect(
       options?: ReadOptions,
     ) {
       const target = yield* resolve({ path: file, kind: options ? "file" : undefined })
-      const sibling = options && path.dirname(target.absolute) === path.dirname(options.siblingOf.absolute)
-
-      // Filename recovery shares the directory approval, but checks the recovered file's own read rules.
-      if (!sibling) yield* authorizeExternal([target], context)
+      // Read-only access, including recovered filenames, still checks the target's own read rules.
       yield* permission.assert({
         action: "read",
         resources: [target.resource],

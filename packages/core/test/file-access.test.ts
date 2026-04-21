@@ -69,14 +69,13 @@ describe("FileAccess.authorizeRead", () => {
     }).pipe(provide(requests))
   })
 
-  it.live("authorizes an external directory before the file's read rules", () => {
+  it.live("checks absolute read rules without requesting external-directory approval", () => {
     const requests: Permission.AssertInput[] = []
     return Effect.gen(function* () {
       const access = yield* FileAccess.Service
       const target = yield* access.authorizeRead("../notes.txt", invocation)
 
       expect(requests).toMatchObject([
-        { action: "external_directory", resources: [slash(path.join(path.dirname(target.absolute), "*"))] },
         { action: "read", resources: [slash(target.absolute)] },
       ])
       for (const request of requests) {
@@ -89,22 +88,18 @@ describe("FileAccess.authorizeRead", () => {
     }).pipe(provide(requests))
   })
 
-  for (const action of ["external_directory", "read"]) {
-    it.live(`propagates ${action} denial without continuing authorization`, () => {
-      const requests: Permission.AssertInput[] = []
-      return Effect.gen(function* () {
-        const access = yield* FileAccess.Service
-        const error = yield* access.authorizeRead("../notes.txt", invocation).pipe(Effect.flip)
+  it.live("propagates read denial without continuing authorization", () => {
+    const requests: Permission.AssertInput[] = []
+    return Effect.gen(function* () {
+      const access = yield* FileAccess.Service
+      const error = yield* access.authorizeRead("../notes.txt", invocation).pipe(Effect.flip)
 
-        expect(error).toBeInstanceOf(Permission.BlockedError)
-        expect(requests.map((request) => request.action)).toEqual(
-          action === "external_directory" ? ["external_directory"] : ["external_directory", "read"],
-        )
-      }).pipe(provide(requests, action))
-    })
-  }
+      expect(error).toBeInstanceOf(Permission.BlockedError)
+      expect(requests.map((request) => request.action)).toEqual(["read"])
+    }).pipe(provide(requests, "read"))
+  })
 
-  it.live("reuses a sibling's directory approval only for the supplied recovery call", () => {
+  it.live("checks each recovered sibling's own read rules", () => {
     const requests: Permission.AssertInput[] = []
     return Effect.gen(function* () {
       const access = yield* FileAccess.Service
@@ -112,25 +107,19 @@ describe("FileAccess.authorizeRead", () => {
       const recovered = yield* access.authorizeRead("../report\u202ffinal.txt", invocation, { siblingOf: requested })
       yield* access.authorizeRead("../notes.txt", invocation)
 
-      expect(requests.map((request) => request.action)).toEqual([
-        "external_directory",
-        "read",
-        "read",
-        "external_directory",
-        "read",
-      ])
-      expect(requests[2].resources).toEqual([slash(recovered.absolute)])
+      expect(requests.map((request) => request.action)).toEqual(["read", "read", "read"])
+      expect(requests[1].resources).toEqual([slash(recovered.absolute)])
     }).pipe(provide(requests))
   })
 
-  it.live("checks the external directory for a target that is not a sibling", () => {
+  it.live("does not request directory approval for a recovered target outside the original directory", () => {
     const requests: Permission.AssertInput[] = []
     return Effect.gen(function* () {
       const access = yield* FileAccess.Service
       const requested = yield* access.authorizeRead("README.md", invocation)
       yield* access.authorizeRead("../notes.txt", invocation, { siblingOf: requested })
 
-      expect(requests.map((request) => request.action)).toEqual(["read", "external_directory", "read"])
+      expect(requests.map((request) => request.action)).toEqual(["read", "read"])
     }).pipe(provide(requests))
   })
 

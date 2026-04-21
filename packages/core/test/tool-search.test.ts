@@ -244,7 +244,7 @@ describe("search tools", () => {
     ),
   )
 
-  it.live("requires external_directory approval for external grep files and directories", () =>
+  it.live("checks grep rules without extra directory approval for external files and directories", () =>
     Effect.acquireUseRelease(
       Effect.promise(() => Promise.all([tmpdir(), tmpdir()])),
       ([active, outside]) => {
@@ -271,14 +271,8 @@ describe("search tools", () => {
           ),
           Effect.tap(() =>
             Effect.sync(() => {
-              expect(assertions.map((input) => input.action)).toEqual([
-                "external_directory",
-                "grep",
-                "external_directory",
-                "grep",
-              ])
-              expect(assertions[0]?.resources).toEqual([path.join(outside.path, "*").replaceAll("\\", "/")])
-              expect(assertions[2]?.resources).toEqual([path.join(outside.path, "*").replaceAll("\\", "/")])
+              expect(assertions.map((input) => input.action)).toEqual(["grep", "grep"])
+              expect(assertions.map((input) => input.resources)).toEqual([["needle"], ["needle"]])
             }),
           ),
         )
@@ -333,7 +327,7 @@ describe("search tools", () => {
     ),
   )
 
-  it.live("requires external_directory approval for an explicit external glob path", () =>
+  it.live("checks glob rules without extra directory approval for an explicit external path", () =>
     Effect.acquireUseRelease(
       Effect.promise(() => Promise.all([tmpdir(), tmpdir()])),
       ([active, outside]) => {
@@ -349,8 +343,8 @@ describe("search tools", () => {
           Effect.tap((result) =>
             Effect.sync(() => {
               expect(result.status).toBe("completed")
-              expect(assertions.map((input) => input.action)).toEqual(["external_directory", "glob"])
-              expect(assertions[0]?.resources).toEqual([path.join(outside.path, "*").replaceAll("\\", "/")])
+              expect(assertions.map((input) => input.action)).toEqual(["glob"])
+              expect(assertions[0]?.resources).toEqual(["*.txt"])
             }),
           ),
         )

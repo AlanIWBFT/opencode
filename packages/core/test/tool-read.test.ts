@@ -194,7 +194,7 @@ describe("ReadTool", () => {
     }),
   )
 
-  it.effect("asks for external_directory approval before reading an external absolute path", () =>
+  it.effect("checks absolute read rules without extra external_directory approval", () =>
     Effect.gen(function* () {
       const registry = yield* Tool.Service
       const external = path.join(path.parse(process.cwd()).root, "external-read", "notes.txt")
@@ -207,11 +207,6 @@ describe("ReadTool", () => {
         }),
       ).toMatchObject({ status: "completed" })
       expect(assertions).toMatchObject([
-        {
-          sessionID,
-          action: "external_directory",
-          resources: [path.join(path.dirname(external), "*").replaceAll("\\", "/")],
-        },
         { sessionID, action: "read", resources: [external.replaceAll("\\", "/")], save: ["*"] },
       ])
       expect(readCalls).toEqual([{ input: AbsolutePath.make(external), page: { offset: undefined, limit: undefined } }])
@@ -704,7 +699,7 @@ describe("ReadTool", () => {
     }),
   )
 
-  it.effect("recovers an external filename without repeating directory approval", () =>
+  it.effect("recovers an external filename using its own read rules", () =>
     Effect.gen(function* () {
       const directory = path.join(path.parse(process.cwd()).root, "external-read")
       const requested = path.join(directory, "report final.txt")
@@ -722,7 +717,6 @@ describe("ReadTool", () => {
         }),
       ).toMatchObject({ status: "completed" })
       expect(assertions).toMatchObject([
-        { action: "external_directory", resources: [path.join(directory, "*").replaceAll("\\", "/")] },
         { action: "read", resources: [requested.replaceAll("\\", "/")] },
         { action: "read", resources: [recovered.replaceAll("\\", "/")] },
       ])
