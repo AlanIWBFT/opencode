@@ -10,7 +10,6 @@ import { Shell } from "@opencode-ai/core/shell"
 import { ShellTool } from "../../src/tool/shell"
 import { Filesystem } from "@/util/filesystem"
 import { provideInstance, testInstanceStoreLayer, tmpdirScoped } from "../fixture/fixture"
-import type { Permission } from "../../src/permission"
 import { Agent } from "../../src/agent/agent"
 import { Truncate } from "@/tool/truncate"
 import { SessionID, MessageID } from "../../src/session/schema"
@@ -85,6 +84,7 @@ const ctx = {
 Shell.acceptable.reset()
 const quote = (text: string) => `"${text}"`
 const squote = (text: string) => `'${text}'`
+const psquote = (text: string) => `'${text.replaceAll("'", "''")}'`
 const projectRoot = path.join(__dirname, "../..")
 const bin = quote(process.execPath.replaceAll("\\", "/"))
 const bash = (() => {
@@ -278,6 +278,165 @@ describe("tool.shell PowerShell stdin", () => {
               ctx,
             )
             expect(result.metadata.exit).toBe(7)
+          }),
+        ),
+      ),
+    )
+
+    it.live(`wraps Remove-Item and delete aliases [${item.label}]`, () =>
+      withShell(
+        item,
+        runIn(
+          projectRoot,
+          Effect.gen(function* () {
+            const result = yield* run({
+              command:
+                "'Remove-Item','rm','del','erase','rmdir','rd' | ForEach-Object { $cmd = Get-Command $_; if ($cmd.CommandType -eq 'Alias') { Write-Output \"$_=$($cmd.CommandType):$($cmd.Definition)\" } else { Write-Output \"$_=$($cmd.CommandType)\" } }",
+            })
+            expect(result.metadata.exit).toBe(0)
+            expect(result.output).toContain("Remove-Item=Function")
+            for (const alias of ["rm", "del", "erase", "rmdir", "rd"]) {
+              expect(result.output).toContain(`${alias}=Alias:Remove-Item`)
+            }
+          }),
+        ),
+      ),
+    )
+
+    it.live(`keeps pipeline Remove-Item -WhatIf non-destructive [${item.label}]`, () =>
+      withShell(
+        item,
+        Effect.gen(function* () {
+          const tmp = yield* tmpdirScoped()
+          yield* Effect.promise(() => Bun.write(path.join(tmp, "whatif.txt"), "x"))
+          yield* runIn(
+            tmp,
+            Effect.gen(function* () {
+              const file = path.join(tmp, "whatif.txt")
+              const result = yield* run({
+                command: `Get-Item -LiteralPath ${psquote(file)} | Remove-Item -WhatIf
+if (Test-Path -LiteralPath ${psquote(file)}) { 'exists' } else { 'missing' }`,
+              })
+              expect(result.metadata.exit).toBe(0)
+              expect(result.output).toContain("exists")
+            }),
+          )
+        }),
+      ),
+    )
+
+    it.live(`removes hidden directories without requiring -Force [${item.label}]`, () =>
+      withShell(
+        item,
+        Effect.gen(function* () {
+          const tmp = yield* tmpdirScoped()
+          yield* runIn(
+            tmp,
+            Effect.gen(function* () {
+              const hidden = path.join(tmp, ".vs")
+              const result = yield* run({
+                command: `New-Item -ItemType Directory -Path ${psquote(hidden)} | Out-Null
+(Get-Item -LiteralPath ${psquote(hidden)} -Force).Attributes = [IO.FileAttributes]::Directory -bor [IO.FileAttributes]::Hidden
+Remove-Item -LiteralPath ${psquote(hidden)} -Recurse
+if (Test-Path -LiteralPath ${psquote(hidden)}) { 'exists' } else { 'missing' }`,
+              })
+              expect(result.metadata.exit).toBe(0)
+              expect(result.output).toContain("missing")
+              expect(result.output).not.toContain("opencode blocked deletion")
+            }),
+          )
+        }),
+      ),
+    )
+
+    it.live(`runs Remove-Item under StrictMode [${item.label}]`, () =>
+      withShell(
+        item,
+        Effect.gen(function* () {
+          const tmp = yield* tmpdirScoped()
+          yield* Effect.promise(() => Bun.write(path.join(tmp, "strict.txt"), "x"))
+          yield* runIn(
+            tmp,
+            Effect.gen(function* () {
+              const file = path.join(tmp, "strict.txt")
+              const result = yield* run({
+                command: `Set-StrictMode -Version Latest
+Remove-Item -LiteralPath ${psquote(file)}
+if (Test-Path -LiteralPath ${psquote(file)}) { 'exists' } else { 'missing' }`,
+              })
+              expect(result.metadata.exit).toBe(0)
+              expect(result.output).toContain("missing")
+              expect(result.output).not.toContain("cannot be retrieved because it has not been set")
+            }),
+          )
+        }),
+      ),
+    )
+
+    it.live(`blocks missing recycle targets with policy guidance [${item.label}]`, () =>
+      withShell(
+        item,
+        Effect.gen(function* () {
+          const tmp = yield* tmpdirScoped()
+          yield* runIn(
+            tmp,
+            Effect.gen(function* () {
+              const result = yield* run({
+                command: `Remove-Item -LiteralPath ${psquote(path.join(tmp, "missing.txt"))}`,
+              })
+              expect(result.metadata.exit).not.toBe(0)
+              expect(result.output).toContain("opencode blocked deletion")
+              expect(result.output).toContain("Do not retry with permanent deletion or bypass commands; ask the user.")
+            }),
+          )
+        }),
+      ),
+    )
+
+    it.live(
+      `reports the OS cause when a recycle target is locked [${item.label}]`,
+      () =>
+        withShell(
+          item,
+          Effect.gen(function* () {
+            const tmp = yield* tmpdirScoped()
+            yield* runIn(
+              tmp,
+              Effect.gen(function* () {
+                const file = path.join(tmp, "locked.txt")
+                const result = yield* run({
+                  command: `Set-Content -LiteralPath ${psquote(file)} -Value locked
+$stream = [System.IO.File]::Open(${psquote(file)}, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+try {
+  Remove-Item -LiteralPath ${psquote(file)}
+} finally {
+  $stream.Dispose()
+}`,
+                })
+                expect(result.metadata.exit).not.toBe(0)
+                expect(result.output).toContain("opencode blocked deletion")
+                expect(result.output).toMatch(/Cause: System\.IO\.IOException: .+ The target was not deleted/s)
+                expect(result.output).toContain("Do not retry with permanent deletion or bypass commands; ask the user.")
+              }),
+            )
+          }),
+        ),
+      15_000,
+    )
+
+    it.live(`falls back for non-filesystem Remove-Item providers [${item.label}]`, () =>
+      withShell(
+        item,
+        runIn(
+          projectRoot,
+          Effect.gen(function* () {
+            const result = yield* run({
+              command:
+                "$env:OPENCODE_RECYCLE_TEST = 'value'; Remove-Item env:OPENCODE_RECYCLE_TEST; if (Test-Path env:OPENCODE_RECYCLE_TEST) { 'exists' } else { 'missing' }",
+            })
+            expect(result.metadata.exit).toBe(0)
+            expect(result.output).toContain("missing")
+            expect(result.output).not.toContain("opencode blocked deletion")
           }),
         ),
       ),
@@ -488,6 +647,39 @@ describe("tool.shell permissions", () => {
               expect(bashReq!.patterns).toContain(`Get-Content ${file}`)
             }),
           ),
+        ),
+      )
+    }
+
+    for (const item of ps) {
+      it.live(`asks for external_directory permission for PowerShell delete aliases [${item.label}]`, () =>
+        withShell(
+          item,
+          Effect.gen(function* () {
+            const outerTmp = yield* tmpdirScoped()
+            yield* Effect.promise(() => Bun.write(path.join(outerTmp, "outside.txt"), "x"))
+            const tmp = yield* tmpdirScoped()
+            yield* runIn(
+              tmp,
+              Effect.gen(function* () {
+                for (const alias of ["del", "erase", "rmdir", "rd"]) {
+                  const err = new Error(`stop after ${alias} permission`)
+                  const requests: Array<Omit<PermissionV1.Request, "id" | "sessionID" | "tool">> = []
+                  expect(
+                    yield* fail(
+                      {
+                        command: `${alias} -WhatIf ${psquote(path.join(outerTmp, "outside.txt"))}`,
+                      },
+                      capture(requests, err),
+                    ),
+                  ).toMatchObject({ message: err.message })
+                  const extDirReq = requests.find((r) => r.permission === "external_directory")
+                  expect(extDirReq).toBeDefined()
+                  expect(extDirReq!.patterns).toContain(glob(path.join(outerTmp, "*")))
+                }
+              }),
+            )
+          }),
         ),
       )
     }
