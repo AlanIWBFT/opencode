@@ -219,6 +219,72 @@ describe("tool.shell", () => {
   )
 })
 
+describe("tool.shell PowerShell stdin", () => {
+  for (const item of ps) {
+    it.live(`does not pass the user command in argv [${item.label}]`, () =>
+      withShell(
+        item,
+        runIn(
+          projectRoot,
+          Effect.gen(function* () {
+            const marker = `OPENCODE_STDIN_ARGV_MARKER_${item.label.toUpperCase()}`
+            const shell = yield* initShell()
+            const result = yield* shell.execute(
+              {
+                command: `$null = "${marker}"\n[Environment]::CommandLine`,
+              },
+              ctx,
+            )
+            expect(result.metadata.exit).toBe(0)
+            expect(result.output).not.toContain(marker)
+            expect(result.output).not.toContain("PS ")
+          }),
+        ),
+      ),
+    )
+
+    it.live(`runs multi-line commands from stdin [${item.label}]`, () =>
+      withShell(
+        item,
+        runIn(
+          projectRoot,
+          Effect.gen(function* () {
+            const shell = yield* initShell()
+            const result = yield* shell.execute(
+              {
+                command: "Write-Output stdin-first\nWrite-Output stdin-second",
+              },
+              ctx,
+            )
+            expect(result.metadata.exit).toBe(0)
+            expect(result.output).toContain("stdin-first")
+            expect(result.output).toContain("stdin-second")
+          }),
+        ),
+      ),
+    )
+
+    it.live(`propagates native process exit codes from stdin [${item.label}]`, () =>
+      withShell(
+        item,
+        runIn(
+          projectRoot,
+          Effect.gen(function* () {
+            const shell = yield* initShell()
+            const result = yield* shell.execute(
+              {
+                command: `& ${bin} -e 'process.exit(7)'`,
+              },
+              ctx,
+            )
+            expect(result.metadata.exit).toBe(7)
+          }),
+        ),
+      ),
+    )
+  }
+})
+
 describe("tool.shell permissions", () => {
   each("asks for bash permission with correct pattern", () =>
     Effect.gen(function* () {
