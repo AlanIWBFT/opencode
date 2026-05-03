@@ -292,10 +292,14 @@ const ask = Effect.fn("ShellTool.ask")(function* (ctx: Tool.Context, scan: Scan,
 
 function cmd(shell: string, command: string, cwd: string, env: NodeJS.ProcessEnv) {
   if (process.platform === "win32" && Shell.ps(shell)) {
-    return ChildProcess.make(shell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command], {
+    return ChildProcess.make(shell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "-"], {
       cwd,
       env,
-      stdin: "ignore",
+      stdin: Stream.make(
+        new TextEncoder().encode(
+          `${command}\nif ($?) { exit 0 }\nif ($global:LASTEXITCODE -is [int]) { exit $global:LASTEXITCODE }\nexit 1\n`,
+        ),
+      ),
       detached: false,
     })
   }
