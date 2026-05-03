@@ -147,6 +147,7 @@ Usage notes:
   - The command argument is required.
   - You can specify an optional timeout in milliseconds. If not specified, commands will time out after ${defaultTimeoutMs}ms.
   - If the output exceeds ${limits.maxLines} lines or ${limits.maxBytes} bytes, it will be truncated and the full output will be written to a file. You can use Read with offset/limit to read specific sections or Grep to search the full content. Do NOT use \`Select-Object -First\`, \`Select-Object -Last\`, or other truncation commands to limit output; the full output will already be captured to a file for more precise searching.
+  - On Windows, filesystem deletion through \`Remove-Item\`, \`rm\`, \`del\`, \`erase\`, \`rmdir\`, or \`rd\` is routed to the Recycle Bin in this tool process only. If recycling is blocked or unavailable, do not retry with permanent deletion, fully qualified cmdlets, \`cmd /c\`, or external deletion tools; stop and ask the user.
 
   - Avoid using Shell with PowerShell file/content cmdlets unless explicitly instructed or when these cmdlets are truly necessary for the task. Instead, always prefer using the dedicated tools for these commands:
     - File search: Use Glob (NOT Get-ChildItem)

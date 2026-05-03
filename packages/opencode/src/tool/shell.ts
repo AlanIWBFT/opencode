@@ -36,9 +36,8 @@ const FILES = new Set([
   "chmod",
   "chown",
   "cat",
-  // Leave PowerShell aliases out for now. Common ones like cat/cp/mv/rm/mkdir
-  // already hit the entries above, and alias normalization should happen in one
-  // place later so we do not risk double-prompting.
+  // PowerShell cmdlet names are tracked here; delete aliases are gated by ps
+  // below so POSIX shells do not get extra file-path prompts.
   "get-content",
   "set-content",
   "add-content",
@@ -48,6 +47,7 @@ const FILES = new Set([
   "new-item",
   "rename-item",
 ])
+const PS_DELETE_ALIASES = new Set(["del", "erase", "rmdir", "rd"])
 const CMD_FILES = new Set([
   "copy",
   "del",
@@ -64,6 +64,132 @@ const CMD_FILES = new Set([
 ])
 const FLAGS = new Set(["-destination", "-literalpath", "-path"])
 const SWITCHES = new Set(["-confirm", "-debug", "-force", "-nonewline", "-recurse", "-verbose", "-whatif"])
+
+const POWERSHELL_RECYCLE_PRELUDE = String.raw`
+$script:__opencodeOriginalRemoveItem = Get-Command Remove-Item -CommandType Cmdlet
+$script:__opencodeRecycleApiLoaded = $false
+
+function __opencodeBlockedDelete {
+  param(
+    [Parameter(Mandatory = $true)] [string] $Reason,
+    [System.Exception] $Exception
+  )
+
+  $detail = if ($null -ne $Exception) {
+    $root = $Exception.GetBaseException()
+    " Cause: $($root.GetType().FullName): $($root.Message)"
+  } else {
+    ''
+  }
+  throw "opencode blocked deletion: $Reason$detail The target was not deleted because it could not be moved to the Recycle Bin. Do not retry with permanent deletion or bypass commands; ask the user."
+}
+
+function __opencodeEnsureRecycleApi {
+  if ($script:__opencodeRecycleApiLoaded) { return }
+  try {
+    Add-Type -AssemblyName Microsoft.VisualBasic -ErrorAction Stop
+  } catch {
+    __opencodeBlockedDelete -Reason 'the Recycle Bin API is unavailable.' -Exception $_.Exception
+  }
+  $script:__opencodeRecycleApiLoaded = $true
+}
+
+function __opencodeResolveRemoveItemTargets {
+  param(
+    [object[]] $Value,
+    [bool] $Literal,
+    [bool] $Force
+  )
+
+  foreach ($item in $Value) {
+    if ($null -eq $item) { continue }
+    try {
+      if ($null -ne $item.PSObject.Properties['PSPath']) {
+        Get-Item -LiteralPath $item.PSPath -Force -ErrorAction Stop
+        continue
+      }
+      if ($Literal) {
+        Get-Item -LiteralPath ([string] $item) -Force -ErrorAction Stop
+        continue
+      }
+      Get-Item -Path ([string] $item) -Force -ErrorAction Stop
+    } catch {
+      __opencodeBlockedDelete -Reason "the target could not be resolved to an existing item: $item." -Exception $_.Exception
+    }
+  }
+}
+
+function __opencodeMoveToRecycleBin {
+  param(
+    [Parameter(Mandatory = $true)] [object] $Item,
+    [Parameter(Mandatory = $true)] [System.Management.Automation.PSCmdlet] $Cmdlet,
+    [bool] $Recurse,
+    [bool] $Force
+  )
+
+  if ($null -eq $Item.PSObject.Properties['PSProvider'] -or $Item.PSProvider.Name -ne 'FileSystem') {
+    & $script:__opencodeOriginalRemoveItem -LiteralPath $Item.PSPath -Recurse:$Recurse -Force:$Force
+    return
+  }
+
+  $target = if ($null -ne $Item.PSObject.Properties['FullName']) {
+    [string] $Item.FullName
+  } else {
+    $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Item.PSPath)
+  }
+
+  if (-not $Cmdlet.ShouldProcess($target, 'Move to Recycle Bin')) { return }
+  __opencodeEnsureRecycleApi
+
+  if ([System.IO.Directory]::Exists($target)) {
+    try {
+      [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory($target, [Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs, [Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin)
+    } catch {
+      __opencodeBlockedDelete -Reason "the directory could not be moved to the Recycle Bin: $target." -Exception $_.Exception
+    }
+    return
+  }
+
+  if ([System.IO.File]::Exists($target)) {
+    try {
+      [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile($target, [Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs, [Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin)
+    } catch {
+      __opencodeBlockedDelete -Reason "the file could not be moved to the Recycle Bin: $target." -Exception $_.Exception
+    }
+    return
+  }
+
+  __opencodeBlockedDelete "the filesystem target no longer exists: $target."
+}
+
+function Remove-Item {
+  [CmdletBinding(SupportsShouldProcess = $true, DefaultParameterSetName = 'Path')]
+  param(
+    [Parameter(Position = 0, ValueFromPipeline = $true, ValueFromPipelineByPropertyName = $true, ParameterSetName = 'Path')]
+    [SupportsWildcards()]
+    [object[]] $Path,
+
+    [Parameter(ValueFromPipelineByPropertyName = $true, ParameterSetName = 'LiteralPath')]
+    [Alias('PSPath', 'LP')]
+    [object[]] $LiteralPath,
+
+    [switch] $Recurse,
+    [switch] $Force
+  )
+
+  process {
+    $values = if ($PSCmdlet.ParameterSetName -eq 'LiteralPath') { $LiteralPath } else { $Path }
+    if ($null -eq $values) { throw 'Remove-Item requires a path.' }
+    foreach ($item in (__opencodeResolveRemoveItemTargets -Value $values -Literal:($PSCmdlet.ParameterSetName -eq 'LiteralPath') -Force:$Force)) {
+      __opencodeMoveToRecycleBin -Item $item -Cmdlet $PSCmdlet -Recurse:$Recurse -Force:$Force
+    }
+  }
+}
+
+foreach ($__opencodeAlias in @('rm', 'del', 'erase', 'rmdir', 'rd')) {
+  Set-Alias -Name $__opencodeAlias -Value Remove-Item -Option AllScope -Force
+}
+`
 
 type Part = {
   type: string
@@ -297,7 +423,7 @@ function cmd(shell: string, command: string, cwd: string, env: NodeJS.ProcessEnv
       env,
       stdin: Stream.make(
         new TextEncoder().encode(
-          `${command}\nif ($?) { exit 0 }\nif ($global:LASTEXITCODE -is [int]) { exit $global:LASTEXITCODE }\nexit 1\n`,
+          `${POWERSHELL_RECYCLE_PRELUDE}\n${command}\nif ($?) { exit 0 }\nif ($global:LASTEXITCODE -is [int]) { exit $global:LASTEXITCODE }\nexit 1\n`,
         ),
       ),
       detached: false,
@@ -398,7 +524,10 @@ export const ShellTool = Tool.define(
         const tokens = command.map((item) => item.text)
         const cmd = ps || shellKind === "cmd" ? tokens[0]?.toLowerCase() : tokens[0]
 
-        if (cmd && (FILES.has(cmd) || (shellKind === "cmd" && CMD_FILES.has(cmd)))) {
+        if (
+          cmd &&
+          (FILES.has(cmd) || (ps && PS_DELETE_ALIASES.has(cmd)) || (shellKind === "cmd" && CMD_FILES.has(cmd)))
+        ) {
           for (const arg of pathArgs(command, ps, shellKind === "cmd")) {
             const resolved = yield* argPath(arg, cwd, ps, shell)
             yield* Effect.logInfo("resolved path", { arg, resolved })
