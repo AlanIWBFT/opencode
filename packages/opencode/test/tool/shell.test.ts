@@ -283,6 +283,28 @@ describe("tool.shell PowerShell stdin", () => {
       ),
     )
 
+    it.live(`does not continue after PowerShell parse errors [${item.label}]`, () =>
+      withShell(
+        item,
+        runIn(
+          projectRoot,
+          Effect.gen(function* () {
+            const shell = yield* initShell()
+            const result = yield* shell.execute(
+              {
+                command: "foreach ($name in 1) { $name } | Format-Table",
+              },
+              ctx,
+            )
+            expect(result.metadata.exit).not.toBe(0)
+            expect(result.output).toContain("foreach ($name in 1) { $name } | Format-Table")
+            expect(result.output).not.toContain("[scriptblock]::Create")
+            expect(result.output).not.toContain("& $__opencodeBlock")
+          }),
+        ),
+      ),
+    )
+
     it.live(`wraps Remove-Item and delete aliases [${item.label}]`, () =>
       withShell(
         item,

@@ -191,6 +191,41 @@ foreach ($__opencodeAlias in @('rm', 'del', 'erase', 'rmdir', 'rd')) {
 }
 `
 
+const POWERSHELL_UTF8_STDIN_BOOTSTRAP = String.raw`
+$__opencodeUtf8 = [System.Text.UTF8Encoding]::new($false)
+$__opencodeUtf8Strict = [System.Text.UTF8Encoding]::new($false, $true)
+$__opencodeStdin = [Console]::OpenStandardInput()
+$__opencodeMemory = [System.IO.MemoryStream]::new()
+$__opencodeStdin.CopyTo($__opencodeMemory)
+$__opencodeScript = $__opencodeUtf8Strict.GetString($__opencodeMemory.ToArray())
+[Console]::InputEncoding = $__opencodeUtf8
+[Console]::OutputEncoding = $__opencodeUtf8
+$OutputEncoding = $__opencodeUtf8
+
+$__opencodeTokens = $null
+$__opencodeErrors = $null
+$null = [System.Management.Automation.Language.Parser]::ParseInput($__opencodeScript, [ref] $__opencodeTokens, [ref] $__opencodeErrors)
+if ($__opencodeErrors.Count -gt 0) {
+  $__opencodeLines = $__opencodeScript.Split([char]10)
+  foreach ($__opencodeError in $__opencodeErrors) {
+    $__opencodeIndex = $__opencodeError.Extent.StartLineNumber - 1
+    $__opencodeLine = if ($__opencodeIndex -ge 0 -and $__opencodeIndex -lt $__opencodeLines.Length) { $__opencodeLines[$__opencodeIndex].TrimEnd([char]13) } else { "" }
+    [Console]::Error.WriteLine("ParserError: At line:$($__opencodeError.Extent.StartLineNumber) char:$($__opencodeError.Extent.StartColumnNumber)")
+    [Console]::Error.WriteLine("+ $__opencodeLine")
+    [Console]::Error.WriteLine("+ $(' ' * ([Math]::Max(0, $__opencodeError.Extent.StartColumnNumber - 1)))~")
+    [Console]::Error.WriteLine($__opencodeError.Message)
+  }
+  exit 1
+}
+
+try {
+  $__opencodeBlock = [scriptblock]::Create($__opencodeScript)
+  & $__opencodeBlock
+} catch {
+  throw
+}
+`
+
 type Part = {
   type: string
   text: string
@@ -418,16 +453,23 @@ const ask = Effect.fn("ShellTool.ask")(function* (ctx: Tool.Context, scan: Scan,
 
 function cmd(shell: string, command: string, cwd: string, env: NodeJS.ProcessEnv) {
   if (process.platform === "win32" && Shell.ps(shell)) {
-    return ChildProcess.make(shell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "-"], {
-      cwd,
-      env,
-      stdin: Stream.make(
-        new TextEncoder().encode(
-          `${POWERSHELL_RECYCLE_PRELUDE}\n${command}\nif ($?) { exit 0 }\nif ($global:LASTEXITCODE -is [int]) { exit $global:LASTEXITCODE }\nexit 1\n`,
-        ),
-      ),
-      detached: false,
-    })
+    const script = `${command}\nif ($?) { exit 0 }\nif ($global:LASTEXITCODE -is [int] -and $global:LASTEXITCODE -ne 0) { exit $global:LASTEXITCODE }\nexit 1\n`
+    return ChildProcess.make(
+      shell,
+      [
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        `${POWERSHELL_RECYCLE_PRELUDE}\n${POWERSHELL_UTF8_STDIN_BOOTSTRAP}`,
+      ],
+      {
+        cwd,
+        env,
+        stdin: Stream.make(new TextEncoder().encode(script)),
+        detached: false,
+      },
+    )
   }
 
   return ChildProcess.make(command, [], {
