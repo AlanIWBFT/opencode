@@ -1,6 +1,6 @@
 export * as SessionStore from "./store.js"
 
-import { and, asc, desc, eq, gt, isNotNull, isNull, like, lt, notInArray, or, sql, type SQL } from "drizzle-orm"
+import { and, asc, desc, eq, gt, inArray, isNotNull, isNull, like, lt, notInArray, or, sql, type SQL } from "drizzle-orm"
 import { Context, Effect, Layer, Schema } from "effect"
 import { Project } from "@opencode/schema/project"
 import { Workspace } from "@opencode/schema/workspace"
@@ -86,6 +86,18 @@ export interface Interface {
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/SessionStore") {}
 
+function directoryCondition(directory: string) {
+  const code = directory.charCodeAt(0)
+  const windows =
+    (directory[1] === ":" && ((code >= 65 && code <= 90) || (code >= 97 && code <= 122))) ||
+    directory.startsWith("\\\\") ||
+    directory.startsWith("//")
+  if (!windows) return eq(SessionTable.directory, directory)
+  return inArray(SessionTable.directory, [
+    ...new Set([directory, directory.replaceAll("\\", "/"), directory.replaceAll("/", "\\")]),
+  ])
+}
+
 const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
@@ -102,7 +114,7 @@ const layer = Layer.effect(
         const order = direction === "previous" ? (requestedOrder === "asc" ? "desc" : "asc") : requestedOrder
         const sortColumn = SessionTable.time_updated
         const conditions: SQL[] = []
-        if ("directory" in input) conditions.push(eq(SessionTable.directory, input.directory))
+        if ("directory" in input) conditions.push(directoryCondition(input.directory))
         if (input.workspaceID) conditions.push(eq(SessionTable.workspace_id, input.workspaceID))
         if ("project" in input) conditions.push(eq(SessionTable.project_id, input.project))
         if ("project" in input && input.subpath !== undefined) conditions.push(eq(SessionTable.path, input.subpath))
