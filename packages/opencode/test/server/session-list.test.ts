@@ -113,28 +113,23 @@ describe("session.list", () => {
   )
 
   it.instance(
-    "matches a session regardless of directory separator on Windows",
+    "matches Windows directory separators",
     () =>
       Effect.gen(function* () {
-        if (process.platform !== "win32") return
-        const test = yield* TestInstance
-        const dir = path.join(test.directory, "packages", "opencode")
-        yield* Effect.promise(() => mkdir(dir, { recursive: true }))
+        const current = yield* withSession({ title: "windows-separator" })
 
-        const created = yield* withSession({ title: "separator" }).pipe(provideInstance(dir))
+        const { db } = yield* Database.Service
+        yield* db
+          .update(SessionTable)
+          .set({ directory: "C:\\opencode\\repo" })
+          .where(eq(SessionTable.id, current.id))
+          .run()
+          .pipe(Effect.orDie)
 
-        // A forward-slash query (e.g. from the SDK/HTTP layer) must still find it —
-        // this is the regression: backslash-stored vs forward-slash-queried.
-        const forwardIDs = (yield* SessionNs.Service.use((session) =>
-          session.list({ directory: dir.replaceAll("\\", "/") }),
+        const ids = (yield* SessionNs.Service.use((session) =>
+          session.list({ directory: "C:/opencode/repo" }),
         )).map((session) => session.id)
-        expect(forwardIDs).toContain(created.id)
-
-        // The native form must keep matching too.
-        const nativeIDs = (yield* SessionNs.Service.use((session) => session.list({ directory: dir }))).map(
-          (session) => session.id,
-        )
-        expect(nativeIDs).toContain(created.id)
+        expect(ids).toContain(current.id)
       }),
     { git: true },
   )
