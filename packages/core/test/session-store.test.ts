@@ -36,7 +36,7 @@ const partRows = Config.testLayer([
   }),
 ])
 
-const seedSessions = (rows: { id: string; updated: number }[]) =>
+const seedSessions = (rows: { id: string; updated: number; directory?: string }[]) =>
   Effect.gen(function* () {
     const database = yield* Database.Service
     const bus = yield* Bus.Service
@@ -48,7 +48,7 @@ const seedSessions = (rows: { id: string; updated: number }[]) =>
         yield* bus.publish(SessionEvent.Created, {
           sessionID,
           projectID: Project.ID.global,
-          location: { directory },
+          location: { directory: row.directory === undefined ? directory : AbsolutePath.make(row.directory) },
           slug: "store-test",
           version: "test",
         })
@@ -66,6 +66,23 @@ const seedSessions = (rows: { id: string; updated: number }[]) =>
   })
 
 describe("SessionStore", () => {
+  it.effect("matches Windows directory separators without including other directories", () =>
+    Effect.gen(function* () {
+      yield* seedSessions([
+        { id: "ses_native", updated: 20, directory: "C:\\opencode\\repo" },
+        { id: "ses_forward", updated: 10, directory: "C:/opencode/repo" },
+        { id: "ses_other", updated: 30, directory: "C:/opencode/other" },
+      ])
+      const store = yield* SessionStore.Service
+      for (const directory of ["C:/opencode/repo", "C:\\opencode\\repo"]) {
+        expect((yield* store.list({ directory: AbsolutePath.make(directory) })).map((session) => session.id)).toEqual([
+          "ses_native",
+          "ses_forward",
+        ])
+      }
+    }),
+  )
+
   it.effect("lists by updated time and ID with exclusive two-item pages in either direction", () =>
     Effect.gen(function* () {
       yield* seedSessions([
