@@ -172,6 +172,18 @@ function sessionPath(worktree: string, cwd: string) {
   return path.relative(path.resolve(worktree), cwd).replaceAll("\\", "/")
 }
 
+function directoryCondition(directory: string) {
+  const code = directory.charCodeAt(0)
+  const windows =
+    (directory[1] === ":" && ((code >= 65 && code <= 90) || (code >= 97 && code <= 122))) ||
+    directory.startsWith("\\\\") ||
+    directory.startsWith("//")
+  if (!windows) return eq(SessionTable.directory, directory)
+  return inArray(SessionTable.directory, [
+    ...new Set([directory, directory.replaceAll("\\", "/"), directory.replaceAll("/", "\\")]),
+  ])
+}
+
 const Summary = Schema.Struct({
   additions: Schema.Finite,
   deletions: Schema.Finite,
@@ -979,7 +991,7 @@ function listByProject(
     }
   } else if (input.scope !== "project") {
     if (input.directory) {
-      conditions.push(eq(SessionTable.directory, input.directory))
+      conditions.push(directoryCondition(input.directory))
     }
   }
   if (input.roots) {
