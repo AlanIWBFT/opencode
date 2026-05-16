@@ -493,6 +493,40 @@ it.effect("manual compaction summarizes short context instead of no-op", () =>
   }),
 )
 
+for (const scenario of [
+  { user: ["请继续调查迁移问题。"], chinese: true },
+  { user: ["请继续。", "Check the API.", "Check the client.", "Continue the migration."], chinese: false },
+]) {
+  it.effect(`compaction selects Chinese body=${scenario.chinese} from the last three real user messages`, () =>
+    Effect.gen(function* () {
+      requests = []
+      const compaction = yield* SessionCompaction.Service
+      const session = yield* insertSession(Session.ID.make("ses_compaction_language"))
+      const messages: SessionMessage.Info[] = scenario.user.map((text) => ({
+        id: SessionMessage.ID.create(),
+        type: "user",
+        text,
+        time: { created: DateTime.makeUnsafe(0) },
+      }))
+      messages.push({
+        id: SessionMessage.ID.create(),
+        type: "synthetic",
+        text: "这段自动生成的内容不应改变用户的语言。",
+        time: { created: DateTime.makeUnsafe(1) },
+      })
+      expect(yield* compaction.compact({
+        reason: "manual",
+        context: loaded(session, messages),
+        inputID: SessionMessage.ID.make("msg_compaction_language"),
+      })).toEqual({ status: "completed" })
+      expect(requests).toHaveLength(1)
+      const prompt = JSON.stringify(requests[0]?.messages.at(-1))
+      expect(prompt.includes("Write the summary body in Chinese")).toBe(scenario.chinese)
+      expect(prompt).toContain("## Objective")
+    }),
+  )
+}
+
 it.effect("compaction hooks can supply the summary instead of the model", () =>
   Effect.gen(function* () {
     requests = []
