@@ -1423,6 +1423,56 @@ describe("session.compaction.process", () => {
   )
 
   itCompaction.instance(
+    "uses Chinese compaction prompt for recent Chinese turns",
+    () => {
+      const stub = llm()
+      let capturedPrompt = ""
+      let capturedAgentPrompt = ""
+      stub.push(
+        reply("summary", (input) => {
+          capturedPrompt = JSON.stringify(input.messages.at(-1))
+          capturedAgentPrompt = input.agent.prompt ?? ""
+        }),
+      )
+
+      return Effect.gen(function* () {
+        const ssn = yield* SessionNs.Service
+        const session = yield* ssn.create({})
+        yield* createUserMessage(session.id, "older context")
+        yield* createUserMessage(session.id, "请保留中文上下文")
+        yield* createUserMessage(session.id, "继续用中文总结这件事")
+        yield* createCompactionMarker(session.id)
+
+        const msgs = yield* ssn.messages({ sessionID: session.id })
+        const parent = msgs.at(-1)?.info.id
+        expect(parent).toBeTruthy()
+        yield* SessionCompaction.use.process({
+          parentID: parent!,
+          messages: msgs,
+          sessionID: session.id,
+          auto: true,
+        })
+        const all = yield* ssn.messages({ sessionID: session.id })
+
+        expect(capturedPrompt).toContain("## 目标")
+        expect(capturedPrompt).not.toContain("近期未压缩尾部")
+        expect(capturedPrompt).not.toContain("继续用中文总结这件事")
+        expect(capturedPrompt).not.toContain("## Goal")
+        expect(capturedAgentPrompt).toContain("锚定上下文摘要助手")
+        expect(capturedAgentPrompt).not.toContain("anchored context")
+        expect(
+          all.some(
+            (msg) =>
+              msg.info.role === "user" &&
+              msg.parts.some((part) => part.type === "text" && part.synthetic && part.text.includes("如果你有下一步")),
+          ),
+        ).toBe(true)
+      }).pipe(withCompaction({ llm: stub.layer }))
+    },
+    { git: true },
+  )
+
+  itCompaction.instance(
     "anchors repeated compactions with the previous summary",
     () => {
       const stub = llm()

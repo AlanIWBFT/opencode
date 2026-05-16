@@ -20,8 +20,10 @@ import { RuntimeFlags } from "@/effect/runtime-flags"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
-import { buildPrompt } from "@opencode-ai/core/session/compaction"
+import { buildPrompt as buildEnglishPrompt } from "@opencode-ai/core/session/compaction"
 import { SessionCompactionEvent } from "@opencode-ai/schema/session-compaction-event"
+import PROMPT_COMPACTION from "@/agent/prompt/compaction.txt"
+import PROMPT_COMPACTION_ZH from "@/agent/prompt/compaction.zh.txt"
 
 export const Event = SessionCompactionEvent
 
@@ -31,6 +33,50 @@ const TOOL_OUTPUT_MAX_CHARS = 2_000
 const PRUNE_PROTECTED_TOOLS = ["skill"]
 const MIN_PRESERVE_RECENT_TOKENS = 2_000
 const MAX_PRESERVE_RECENT_TOKENS = 15_000
+const CHINESE_CHARACTER = /[\u3400-\u9fff\uf900-\ufaff]/u
+type SummaryLanguage = "en" | "zh"
+
+const CHINESE_SUMMARY_TEMPLATE = `请严格输出 <template> 中展示的 Markdown 结构，并保持章节顺序不变。回复中不要包含 <template> 标签。
+<template>
+## 目标
+- [用一两句简短的话说明用户希望完成什么]
+
+## 重要细节
+- [约束或偏好、决策及原因、重要事实或假设、继续工作所需的准确上下文，或“（无）”]
+
+## 工作状态
+### 已完成
+- [已经完成的工作、已验证的事实或已经实施的修改；否则为“（无）”]
+
+### 进行中
+- [当前工作、部分完成的修改或调查状态；否则为“（无）”]
+
+### 受阻
+- [阻塞事项、失败的命令或未知问题；否则为“（无）”]
+
+## 下一步
+1. [立即要执行的具体动作，或“（无）”]
+2. [已知时列出之后的动作，或“（无）”]
+
+## 相关文件
+- [文件或目录路径：重要原因，或“（无）”]
+</template>
+
+规则：
+- 保留每个章节，即使为空。
+- 使用简短要点，不要写成散文段落。
+- 已知时保留准确的文件路径、符号、命令、错误字符串、URL 和标识符。
+- 不要提及摘要过程或上下文已被压缩。`
+
+const CHINESE_SUMMARY_UPDATE_INSTRUCTIONS = `<prior-summary> 概括了 <conversation> 之前发生的一切。请构建一个合并两者的新摘要。之后 <prior-summary> 将被丢弃：任何未写入新摘要的内容都会丢失。
+
+合并时：
+- 即使 <conversation> 没有提及，也要保留 <prior-summary> 中的目标、约束、用户指示、决策和并行工作流。仅删除已经完成且不再需要的内容。
+- <conversation> 比 <prior-summary> 更新。如果二者冲突，以对话为准：写出更正后的事实并删除旧说法。
+- 加入对话中的新进展、决策、约束和上下文。
+- 将已完成的工作从“进行中”移到“已完成”。
+- 如果阻塞已解决，更新摘要以反映这一点，同时保留继续工作仍需的细节。
+- 更新“目标”和“下一步”以反映当前工作状态。`
 type Turn = {
   start: number
   end: number
@@ -110,6 +156,55 @@ function completedCompactions(messages: SessionV1.WithParts[]) {
     if (userIndex === undefined) return []
     return [{ userIndex, assistantIndex, summary: summaryText(msg) }]
   })
+}
+
+function buildPrompt(input: { previousSummary?: string; context: string[]; language: SummaryLanguage }) {
+  if (input.language === "en") {
+    return buildEnglishPrompt({ previousSummary: input.previousSummary, context: input.context })
+  }
+  const conversation = `以下是目前的对话：\n\n<conversation>\n${input.context.join("\n\n")}\n</conversation>`
+  if (!input.previousSummary) {
+    return [
+      conversation,
+      "请根据上面 <conversation> 标签中的对话历史创建新的锚定摘要，以便另一个编码代理继续工作。",
+      CHINESE_SUMMARY_TEMPLATE,
+    ].join("\n\n")
+  }
+  return [
+    conversation,
+    `以下是上述 <conversation> 之前对话的摘要：\n\n<prior-summary>\n${input.previousSummary}\n</prior-summary>`,
+    CHINESE_SUMMARY_UPDATE_INSTRUCTIONS,
+    CHINESE_SUMMARY_TEMPLATE,
+  ].join("\n\n")
+}
+
+function promptLanguage(messages: SessionV1.WithParts[]): SummaryLanguage {
+  return messages
+    .filter((msg) => msg.info.role === "user" && !msg.parts.some((part) => part.type === "compaction"))
+    .slice(-3)
+    .some((msg) => msg.parts.some((part) => part.type === "text" && CHINESE_CHARACTER.test(part.text)))
+    ? "zh"
+    : "en"
+}
+
+function localizeAgent(input: { agent: Agent.Info; language: SummaryLanguage }) {
+  if (input.language !== "zh") return input.agent
+  if (input.agent.prompt !== PROMPT_COMPACTION) return input.agent
+  return { ...input.agent, prompt: PROMPT_COMPACTION_ZH }
+}
+
+function autoContinueText(input: { overflow: boolean; language: SummaryLanguage }) {
+  const overflow = input.overflow
+    ? input.language === "zh"
+      ? "上一请求由于大型媒体附件超过了提供商的大小限制。对话已被压缩，媒体文件已从上下文中移除。如果用户询问的是附加图片或文件，请说明附件太大无法处理，并建议他们使用更小或更少的文件重试。\n\n"
+      : "The previous request exceeded the provider's size limit due to large media attachments. The conversation was compacted and media files were removed from context. If the user was asking about attached images or files, explain that the attachments were too large to process and suggest they try again with smaller or fewer files.\n\n"
+    : ""
+  return (
+    overflow +
+    (input.language === "zh"
+      ? "如果你有下一步，请继续；如果你不确定如何进行，请停止并请求澄清。"
+      : "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed.")
+  )
 }
 
 function preserveRecentBudget(input: { cfg: ConfigV1.Info; model: Provider.Model }) {
@@ -364,6 +459,8 @@ const layer = Layer.effect(
       const prior = completedCompactions(history)
       const hidden = new Set(prior.flatMap((item) => [item.userIndex, item.assistantIndex]))
       const previousSummary = prior.at(-1)?.summary
+      const language = promptLanguage(replay ? [...history, { info: replay.info, parts: replay.parts }] : history)
+      const compactionAgent = localizeAgent({ agent, language })
       const selected = yield* select({
         messages: history.filter((_, index) => !hidden.has(index)),
         cfg,
@@ -384,6 +481,7 @@ const layer = Layer.effect(
           buildPrompt({
             previousSummary,
             context: [conversation],
+            language,
           }),
           ...compacting.context,
         ]
@@ -424,7 +522,7 @@ const layer = Layer.effect(
       })
       const result = yield* processor.process({
         user: userMessage,
-        agent,
+        agent: compactionAgent,
         sessionID: input.sessionID,
         tools: {},
         system: [],
@@ -524,11 +622,7 @@ const layer = Layer.effect(
               agent: userMessage.agent,
               model: userMessage.model,
             })
-            const text =
-              (input.overflow
-                ? "The previous request exceeded the provider's size limit due to large media attachments. The conversation was compacted and media files were removed from context. If the user was asking about attached images or files, explain that the attachments were too large to process and suggest they try again with smaller or fewer files.\n\n"
-                : "") +
-              "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed."
+            const text = autoContinueText({ overflow: input.overflow === true, language })
             yield* session.updatePart({
               id: PartID.ascending(),
               messageID: continueMsg.id,
