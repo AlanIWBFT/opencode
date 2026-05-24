@@ -16,6 +16,8 @@ ${commandSection}
 - Write a concise but informative commit message that matches the repo style and focuses on why the change is needed; use a short subject plus body when root cause, impact, or tradeoff matters.
 - For non-trivial fixes, explain the observed problem, root cause, impact, and why the fix addresses it.
 - Do not update git config, skip hooks, use interactive `-i`, force-push, or create empty commits unless explicitly requested.
+- Avoid git commands that open an editor. Pass explicit message/no-edit flags when appropriate, or set `GIT_EDITOR=true` for that single command before running commands like `git rebase --continue`, `git merge --continue`, or `git cherry-pick --continue`.
+- For non-interactive `git rebase -i` commands, including `--autosquash`, set `GIT_SEQUENCE_EDITOR=true` for that single command when accepting Git's generated todo list. `GIT_EDITOR=true` alone does not prevent the rebase todo editor from opening.
 - If a commit fails or hooks reject it, fix the issue and create a new commit; do not amend the failed commit.
 - Before creating a PR, inspect status, diff, remote tracking, recent commits, and the diff from the base branch.
 - Review all commits included in the PR, not just the latest commit.
