@@ -60,7 +60,7 @@ describe("SessionStore", () => {
       ])
       const store = yield* SessionStore.Service
       for (const directory of ["C:/opencode/repo", "C:\\opencode\\repo"]) {
-        expect((yield* store.list({ directory: AbsolutePath.make(directory) })).map((session) => session.id)).toEqual([
+        expect((yield* store.list({ directory: AbsolutePath.make(directory) })).map((session) => String(session.id))).toEqual([
           "ses_native",
           "ses_forward",
         ])
