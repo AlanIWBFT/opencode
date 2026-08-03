@@ -167,6 +167,45 @@ const withTempTool = <A, E, R>(body: (directory: string, registry: Tool.Interfac
   )
 
 describe("PatchTool", () => {
+  for (const scenario of [
+    { name: "LF file with CRLF patch", original: "before\nalpha\nomega\nafter\n", ending: "\r\n", expected: "before\nalpha\ninserted\nomega\nafter\n" },
+    { name: "CRLF file with LF patch", original: "before\r\nalpha\r\nomega\r\nafter\r\n", ending: "\n", expected: "before\r\nalpha\r\ninserted\r\nomega\r\nafter\r\n" },
+    {
+      name: "mixed context",
+      original: "header\nbefore\r\nalpha\r\nmiddle\nomega\r\nafter\r\n",
+      ending: "\n",
+      middle: true,
+      expected: "header\nbefore\r\nalpha\r\nmiddle\ninserted\r\nomega\r\nafter\r\n",
+    },
+    { name: "missing final newline", original: "before\r\nalpha\r\nomega", ending: "\n", expected: "before\r\nalpha\r\ninserted\r\nomega\r\n" },
+  ]) {
+    it.live(`preserves line endings: ${scenario.name}`, () =>
+      withTempTool((directory, registry) => Effect.gen(function* () {
+        const target = path.join(directory, "context.txt")
+        yield* Effect.promise(() => fs.writeFile(target, scenario.original))
+        const result = yield* executeTool(registry, call([
+          "*** Begin Patch", "*** Update File: context.txt", "@@", " alpha",
+          ...(scenario.middle ? [" middle"] : []), "+inserted", " omega", "*** End Patch",
+        ].join(scenario.ending)))
+        expect(result.status).toBe("completed")
+        expect(yield* Effect.promise(() => fs.readFile(target, "utf8"))).toBe(scenario.expected)
+        if (result.status !== "completed") return
+        expect(result.output).toMatchObject({ files: [{ patch: expect.stringContaining("+inserted") }] })
+        if (scenario.original.endsWith("\n")) expect(result.output).toMatchObject({ files: [{ additions: 1, deletions: 0 }] })
+      })),
+    )
+  }
+
+  it.live("preserves CRLF in an add-file patch including its final newline", () =>
+    withTempTool((directory, registry) => Effect.gen(function* () {
+      const result = yield* executeTool(registry, call([
+        "*** Begin Patch", "*** Add File: added.txt", "+first", "+second", "*** End Patch",
+      ].join("\r\n")))
+      expect(result.status).toBe("completed")
+      expect(yield* Effect.promise(() => fs.readFile(path.join(directory, "added.txt"), "utf8"))).toBe("first\r\nsecond\r\n")
+    })),
+  )
+
   it.live("selects the same edit tools for compaction and generate requests as the agent loop", () =>
     withTempTool(() =>
       Effect.gen(function* () {
