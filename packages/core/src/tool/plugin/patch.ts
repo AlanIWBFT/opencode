@@ -128,7 +128,7 @@ export const Plugin = {
                   const target = yield* resolveTarget(hunk.path)
                   if (hunk.type === "add") {
                     const content =
-                      hunk.contents.endsWith("\n") || hunk.contents === "" ? hunk.contents : `${hunk.contents}\n`
+                      hunk.contents.endsWith("\n") || hunk.contents === "" ? hunk.contents : `${hunk.contents}${Patch.lineEnding(input.patchText)}`
                     prepared.push({
                       ...hunk,
                       target,
