@@ -37,6 +37,8 @@ export type Hunk =
 export interface UpdateFileChunk {
   readonly oldLines: ReadonlyArray<string>
   readonly newLines: ReadonlyArray<string>
+  /** Original and replacement indexes of unchanged context, including fuzzy matches. */
+  readonly contextLines?: ReadonlyArray<readonly [oldIndex: number, newIndex: number]>
   readonly changeContext?: string
   readonly endOfFile?: boolean
 }
@@ -70,7 +72,7 @@ export function parse(patchText: string): Result.Result<ReadonlyArray<Hunk>, Par
     }
     if (header.startsWith("*** Add File: ")) {
       const path = header.slice("*** Add File: ".length).trim()
-      const parsed = parseAdd(lines, index + 1, end, path)
+      const parsed = parseAdd(lines, index + 1, end, path, lineEnding(patchText))
       if ("error" in parsed) return Result.fail(parsed.error)
       hunks.push({ type: "add", path, contents: parsed.content })
       index = parsed.next
@@ -127,11 +129,16 @@ export function parse(patchText: string): Result.Result<ReadonlyArray<Hunk>, Par
 
 export function derive(path: string, chunks: ReadonlyArray<UpdateFileChunk>, original: string): FileUpdate {
   const source = Bom.split(original)
+  const trailing = source.text.endsWith("\n")
   const lines = source.text.split("\n")
   if (lines.at(-1) === "") lines.pop()
-  const replacements = computeReplacements(lines, path, chunks)
+  const ending = dominantLineEnding(lines, lines.length, 0, trailing)
+  const replacements = computeReplacements(lines, path, chunks, trailing)
   for (const [start, remove, insert] of replacements.reverse()) lines.splice(start, remove, ...insert)
-  if (lines.at(-1) !== "") lines.push("")
+  if (lines.at(-1) !== "") {
+    if (ending === "\r\n" && lines.length > 0 && !lines.at(-1)!.endsWith("\r")) lines[lines.length - 1] += "\r"
+    lines.push("")
+  }
   const next = Bom.split(lines.join("\n"))
   return { content: next.text, bom: source.bom || next.bom }
 }
@@ -140,11 +147,14 @@ export function joinBom(text: string, bom: boolean) {
   return Bom.join(text, bom)
 }
 
+export const lineEnding = (text: string): "\n" | "\r\n" => text.match(/\r\n|\n/)?.[0] === "\r\n" ? "\r\n" : "\n"
+
 function parseAdd(
   lines: ReadonlyArray<string>,
   start: number,
   end: number,
   path: string,
+  ending: "\n" | "\r\n",
 ): { content: string; next: number } | { error: InvalidHunkError } {
   const content: string[] = []
   let index = start
@@ -162,7 +172,7 @@ function parseAdd(
     content.push(lines[index]!.slice(1))
     index++
   }
-  return { content: content.join("\n"), next: index }
+  return { content: content.join(ending), next: index }
 }
 
 function parseUpdate(
@@ -175,6 +185,7 @@ function parseUpdate(
   const chunks: Array<{
     oldLines: string[]
     newLines: string[]
+    contextLines?: Array<readonly [oldIndex: number, newIndex: number]>
     changeContext?: string
     endOfFile?: boolean
   }> = []
@@ -241,12 +252,14 @@ function parseUpdate(
     if (chunks.length === 0) chunks.push({ oldLines: [], newLines: [] })
     const chunk = chunks.at(-1)!
     if (line === "") {
+      ;(chunk.contextLines ??= []).push([chunk.oldLines.length, chunk.newLines.length])
       chunk.oldLines.push("")
       chunk.newLines.push("")
       index++
       continue
     }
     if (line.startsWith(" ")) {
+      ;(chunk.contextLines ??= []).push([chunk.oldLines.length, chunk.newLines.length])
       chunk.oldLines.push(line.slice(1))
       chunk.newLines.push(line.slice(1))
       index++
@@ -308,7 +321,7 @@ function isBoundary(line: string) {
   )
 }
 
-function computeReplacements(lines: ReadonlyArray<string>, path: string, chunks: ReadonlyArray<UpdateFileChunk>) {
+function computeReplacements(lines: ReadonlyArray<string>, path: string, chunks: ReadonlyArray<UpdateFileChunk>, trailing: boolean) {
   const replacements: Array<readonly [start: number, remove: number, insert: ReadonlyArray<string>]> = []
   let lineIndex = 0
   for (const chunk of chunks) {
@@ -318,7 +331,8 @@ function computeReplacements(lines: ReadonlyArray<string>, path: string, chunks:
       lineIndex = context + 1
     }
     if (chunk.oldLines.length === 0) {
-      replacements.push([lines.length, 0, chunk.newLines])
+      const ending = dominantLineEnding(lines, lines.length, 0, trailing)
+      replacements.push([lines.length, 0, withLineEnding(chunk.newLines, ending)])
       continue
     }
     let oldLines = chunk.oldLines
@@ -335,10 +349,36 @@ function computeReplacements(lines: ReadonlyArray<string>, path: string, chunks:
       throw new Error(`Failed to find ${expected} in ${path}`)
     }
     if (found === -1) throw new Error(`Failed to find expected lines in ${path}:\n${chunk.oldLines.join("\n")}`)
-    replacements.push([found, oldLines.length, newLines])
+    const ending = dominantLineEnding(lines, found, oldLines.length, trailing)
+    const insert = withLineEnding(newLines, ending)
+    for (const [oldIndex, newIndex] of chunk.contextLines ?? []) {
+      if (oldIndex < oldLines.length && newIndex < newLines.length) insert[newIndex] = lines[found + oldIndex]!
+    }
+    replacements.push([found, oldLines.length, insert])
     lineIndex = found + oldLines.length
   }
   return replacements.sort((left, right) => left[0] - right[0])
+}
+
+function dominantLineEnding(lines: ReadonlyArray<string>, start: number, length: number, trailing: boolean): "\n" | "\r\n" {
+  const count = (from: number, to: number) => {
+    let crlf = 0
+    let lf = 0
+    for (let index = Math.max(0, from); index < Math.min(lines.length, to); index++) {
+      if (index === lines.length - 1 && !trailing) continue
+      if (lines[index]!.endsWith("\r")) crlf++
+      else lf++
+    }
+    return { crlf, lf }
+  }
+  const context = count(start, start + length)
+  if (context.crlf !== context.lf) return context.crlf > context.lf ? "\r\n" : "\n"
+  const nearby = count(start - 3, start + length + 3)
+  return nearby.crlf > nearby.lf ? "\r\n" : "\n"
+}
+
+function withLineEnding(lines: ReadonlyArray<string>, ending: "\n" | "\r\n") {
+  return lines.map((line) => ending === "\r\n" ? `${line}\r` : line)
 }
 
 function seek(lines: ReadonlyArray<string>, pattern: ReadonlyArray<string>, start: number, eof = false) {

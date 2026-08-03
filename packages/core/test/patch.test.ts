@@ -382,7 +382,7 @@ describe("Patch", () => {
         type: "update",
         path: "file.txt",
         movePath: undefined,
-        chunks: [{ oldLines: ["import foo"], newLines: ["import foo", "bar"] }],
+        chunks: [{ oldLines: ["import foo"], newLines: ["import foo", "bar"], contextLines: [[0, 0]] }],
       },
     ])
   })
@@ -401,6 +401,7 @@ describe("Patch", () => {
           {
             oldLines: ["old a", "*** Update File: b.txt"],
             newLines: ["new a", "*** Update File: b.txt"],
+            contextLines: [[1, 1]],
             changeContext: undefined,
           },
           { oldLines: ["old b"], newLines: ["new b"], changeContext: undefined },
@@ -423,6 +424,7 @@ describe("Patch", () => {
           {
             oldLines: ["before", "*** Move to: moved.txt", "*** End of File"],
             newLines: ["before", "*** Move to: moved.txt", "*** End of File"],
+            contextLines: [[0, 0], [1, 1], [2, 2]],
             changeContext: undefined,
           },
         ],
@@ -453,6 +455,7 @@ describe("Patch", () => {
           {
             oldLines: ["context before", "", "context after"],
             newLines: ["context before", "", "context after"],
+            contextLines: [[0, 0], [1, 1], [2, 2]],
             changeContext: undefined,
           },
         ],
@@ -470,6 +473,26 @@ describe("Patch", () => {
     expect(() =>
       parse("*** Begin Patch\n*** Delete File: file.txt\n*** Frobnicate File: next.txt\n*** End Patch"),
     ).toThrow("Invalid hunk at line 3: '*** Frobnicate File: next.txt' is not a valid hunk header")
+  })
+
+  test("preserves mixed context bytes without treating identical delete/add lines as context", () => {
+    const [hunk] = parse("*** Begin Patch\n*** Update File: mixed.txt\n@@\n same\n-same\n+same\n tail\n*** End Patch")
+    if (hunk?.type !== "update") throw new Error("Expected update")
+    expect(Patch.derive(hunk.path, hunk.chunks, "same\nsame\r\ntail\r\n").content).toBe("same\nsame\r\ntail\r\n")
+    expect(Patch.derive(hunk.path, hunk.chunks, "same \nsame\r\ntail\r\n").content).toBe("same \nsame\r\ntail\r\n")
+  })
+
+  test("reconstructs a large replacement without quadratic line matching", () => {
+    const oldLines = Array.from({ length: 5_000 }, (_, index) => `old-${index}`)
+    const newLines = Array.from({ length: 5_000 }, (_, index) => `new-${index}`)
+    const [hunk] = parse([
+      "*** Begin Patch", "*** Update File: large.txt", "@@",
+      ...oldLines.map((line) => `-${line}`), ...newLines.map((line) => `+${line}`), "*** End Patch",
+    ].join("\n"))
+    if (hunk?.type !== "update") throw new Error("Expected update")
+    const start = performance.now()
+    expect(Patch.derive(hunk.path, hunk.chunks, `${oldLines.join("\r\n")}\r\n`).content).toBe(`${newLines.join("\r\n")}\r\n`)
+    expect(performance.now() - start).toBeLessThan(1_000)
   })
 
   test("rejects an empty update hunk", () => {
