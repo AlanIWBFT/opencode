@@ -37,9 +37,11 @@ export const ApplyPatchTool = Tool.define(
 
       // Parse the patch to get hunks
       let hunks: Patch.Hunk[]
+      let patchLineEnding: "\n" | "\r\n" = "\n"
       try {
         const parseResult = Patch.parsePatch(params.patchText)
         hunks = parseResult.hunks
+        patchLineEnding = parseResult.lineEnding
       } catch (error) {
         return yield* Effect.fail(new Error(`apply_patch verification failed: ${error}`))
       }
@@ -77,7 +79,9 @@ export const ApplyPatchTool = Tool.define(
           case "add": {
             const oldContent = ""
             const newContent =
-              hunk.contents.length === 0 || hunk.contents.endsWith("\n") ? hunk.contents : `${hunk.contents}\n`
+              hunk.contents.length === 0 || hunk.contents.endsWith("\n")
+                ? hunk.contents
+                : `${hunk.contents}${patchLineEnding}`
             const next = Bom.split(newContent)
             const diff = trimDiff(createTwoFilesPatch(filePath, filePath, oldContent, next.text))
 

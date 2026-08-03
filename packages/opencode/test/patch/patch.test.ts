@@ -67,6 +67,48 @@ describe("Patch namespace", () => {
       expect(result.hunks[1].type).toBe("update")
     })
 
+    test("should preserve explicit update line operations", () => {
+      const patchText = `*** Begin Patch
+*** Update File: existing.txt
+@@
+ context
+-removed
++added
+*** End Patch`
+
+      const hunk = Patch.parsePatch(patchText).hunks[0]
+      expect(hunk?.type).toBe("update")
+      if (hunk?.type !== "update") throw new Error("Expected update hunk")
+      expect(hunk.chunks[0]?.operations).toEqual([
+        { type: "context", content: "context" },
+        { type: "delete", content: "removed" },
+        { type: "add", content: "added" },
+      ])
+    })
+
+    test("should reconstruct a large replacement without quadratic line matching", () => {
+      const count = 5_000
+      const oldLines = Array.from({ length: count }, (_, index) => `old-${index}`)
+      const newLines = Array.from({ length: count }, (_, index) => `new-${index}`)
+      const patchText = [
+        "*** Begin Patch",
+        "*** Update File: existing.txt",
+        "@@",
+        ...oldLines.map((line) => `-${line}`),
+        ...newLines.map((line) => `+${line}`),
+        "*** End Patch",
+      ].join("\n")
+      const hunk = Patch.parsePatch(patchText).hunks[0]
+      if (hunk?.type !== "update") throw new Error("Expected update hunk")
+
+      const start = performance.now()
+      const result = Patch.deriveNewContentsFromChunks("existing.txt", hunk.chunks, `${oldLines.join("\n")}\n`)
+      const elapsed = performance.now() - start
+
+      expect(result.content).toBe(`${newLines.join("\n")}\n`)
+      expect(elapsed).toBeLessThan(1_000)
+    })
+
     test("should parse file move operation", () => {
       const patchText = `*** Begin Patch
 *** Update File: old-name.txt
