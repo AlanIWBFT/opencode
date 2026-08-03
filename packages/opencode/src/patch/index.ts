@@ -24,6 +24,7 @@ export type Hunk =
 export interface UpdateFileChunk {
   old_lines: string[]
   new_lines: string[]
+  operations: Array<{ type: "context" | "delete" | "add"; content: string }>
   change_context?: string
   is_end_of_file?: boolean
 }
@@ -112,6 +113,7 @@ function parseUpdateFileChunks(lines: string[], startIdx: number): { chunks: Upd
 
       const oldLines: string[] = []
       const newLines: string[] = []
+      const operations: UpdateFileChunk["operations"] = []
       let isEndOfFile = false
 
       // Parse change lines
@@ -129,12 +131,17 @@ function parseUpdateFileChunks(lines: string[], startIdx: number): { chunks: Upd
           const content = changeLine.substring(1)
           oldLines.push(content)
           newLines.push(content)
+          operations.push({ type: "context", content })
         } else if (changeLine.startsWith("-")) {
           // Remove line - only in old
-          oldLines.push(changeLine.substring(1))
+          const content = changeLine.substring(1)
+          oldLines.push(content)
+          operations.push({ type: "delete", content })
         } else if (changeLine.startsWith("+")) {
           // Add line - only in new
-          newLines.push(changeLine.substring(1))
+          const content = changeLine.substring(1)
+          newLines.push(content)
+          operations.push({ type: "add", content })
         }
 
         i++
@@ -143,6 +150,7 @@ function parseUpdateFileChunks(lines: string[], startIdx: number): { chunks: Upd
       chunks.push({
         old_lines: oldLines,
         new_lines: newLines,
+        operations,
         change_context: contextLine || undefined,
         is_end_of_file: isEndOfFile || undefined,
       })
@@ -154,23 +162,22 @@ function parseUpdateFileChunks(lines: string[], startIdx: number): { chunks: Upd
   return { chunks, nextIdx: i }
 }
 
-function parseAddFileContent(lines: string[], startIdx: number): { content: string; nextIdx: number } {
-  let content = ""
+function parseAddFileContent(
+  lines: string[],
+  startIdx: number,
+  lineEnding: "\n" | "\r\n",
+): { content: string; nextIdx: number } {
+  const content: string[] = []
   let i = startIdx
 
   while (i < lines.length && !lines[i].startsWith("***")) {
     if (lines[i].startsWith("+")) {
-      content += lines[i].substring(1) + "\n"
+      content.push(lines[i].substring(1))
     }
     i++
   }
 
-  // Remove trailing newline
-  if (content.endsWith("\n")) {
-    content = content.slice(0, -1)
-  }
-
-  return { content, nextIdx: i }
+  return { content: content.join(lineEnding), nextIdx: i }
 }
 
 function stripHeredoc(input: string): string {
@@ -182,8 +189,9 @@ function stripHeredoc(input: string): string {
   return input
 }
 
-export function parsePatch(patchText: string): { hunks: Hunk[] } {
-  const cleaned = stripHeredoc(patchText.trim())
+export function parsePatch(patchText: string): { hunks: Hunk[]; lineEnding: "\n" | "\r\n" } {
+  const lineEnding = patchText.match(/\r\n|\n/)?.[0] === "\r\n" ? "\r\n" : "\n"
+  const cleaned = stripHeredoc(patchText.replace(/\r\n/g, "\n").replace(/\r/g, "\n").trim())
   const lines = cleaned.split("\n")
   const hunks: Hunk[] = []
   let i = 0
@@ -210,7 +218,7 @@ export function parsePatch(patchText: string): { hunks: Hunk[] } {
     }
 
     if (lines[i].startsWith("*** Add File:")) {
-      const { content, nextIdx } = parseAddFileContent(lines, header.nextIdx)
+      const { content, nextIdx } = parseAddFileContent(lines, header.nextIdx, lineEnding)
       hunks.push({
         type: "add",
         path: header.filePath,
@@ -237,7 +245,7 @@ export function parsePatch(patchText: string): { hunks: Hunk[] } {
     }
   }
 
-  return { hunks }
+  return { hunks, lineEnding }
 }
 
 // Apply patch functionality
@@ -310,6 +318,7 @@ export function deriveNewContentsFromChunks(
   originalText: string,
 ): ApplyPatchFileUpdate {
   const originalContent = Bom.split(originalText)
+  const hasTrailingNewline = originalContent.text.endsWith("\n")
 
   let originalLines = originalContent.text.split("\n")
 
@@ -318,11 +327,15 @@ export function deriveNewContentsFromChunks(
     originalLines.pop()
   }
 
-  const replacements = computeReplacements(originalLines, filePath, chunks)
+  const replacements = computeReplacements(originalLines, filePath, chunks, hasTrailingNewline)
   let newLines = applyReplacements(originalLines, replacements)
 
   // Ensure trailing newline
   if (newLines.length === 0 || newLines[newLines.length - 1] !== "") {
+    const lineEnding = dominantLineEnding(originalLines, originalLines.length, 0, hasTrailingNewline)
+    if (lineEnding === "\r\n" && newLines.length > 0 && !newLines[newLines.length - 1].endsWith("\r")) {
+      newLines[newLines.length - 1] += "\r"
+    }
     newLines.push("")
   }
 
@@ -343,6 +356,7 @@ function computeReplacements(
   originalLines: string[],
   filePath: string,
   chunks: UpdateFileChunk[],
+  hasTrailingNewline: boolean,
 ): Array<[number, number, string[]]> {
   const replacements: Array<[number, number, string[]]> = []
   let lineIndex = 0
@@ -363,7 +377,8 @@ function computeReplacements(
         originalLines.length > 0 && originalLines[originalLines.length - 1] === ""
           ? originalLines.length - 1
           : originalLines.length
-      replacements.push([insertionIdx, 0, chunk.new_lines])
+      const lineEnding = dominantLineEnding(originalLines, insertionIdx, 0, hasTrailingNewline)
+      replacements.push([insertionIdx, 0, withLineEnding(chunk.new_lines, lineEnding)])
       continue
     }
 
@@ -382,7 +397,12 @@ function computeReplacements(
     }
 
     if (found !== -1) {
-      replacements.push([found, pattern.length, newSlice])
+      const lineEnding = dominantLineEnding(originalLines, found, pattern.length, hasTrailingNewline)
+      replacements.push([
+        found,
+        pattern.length,
+        buildReplacementLines(chunk.operations, pattern.length, newSlice.length, originalLines, found, lineEnding),
+      ])
       lineIndex = found + pattern.length
     } else {
       throw new Error(`Failed to find expected lines in ${filePath}:\n${chunk.old_lines.join("\n")}`)
@@ -393,6 +413,73 @@ function computeReplacements(
   replacements.sort((a, b) => a[0] - b[0])
 
   return replacements
+}
+
+function dominantLineEnding(
+  originalLines: string[],
+  start: number,
+  length: number,
+  hasTrailingNewline: boolean,
+): "\n" | "\r\n" {
+  const count = (from: number, to: number) => {
+    let crlf = 0
+    let lf = 0
+    for (let index = Math.max(0, from); index < Math.min(originalLines.length, to); index++) {
+      if (index === originalLines.length - 1 && !hasTrailingNewline) continue
+      if (originalLines[index].endsWith("\r")) crlf++
+      else lf++
+    }
+    return { crlf, lf }
+  }
+
+  const context = count(start, start + length)
+  if (context.crlf !== context.lf) return context.crlf > context.lf ? "\r\n" : "\n"
+
+  const nearby = count(start - 3, start + length + 3)
+  if (nearby.crlf !== nearby.lf) return nearby.crlf > nearby.lf ? "\r\n" : "\n"
+  return "\n"
+}
+
+function buildReplacementLines(
+  operations: UpdateFileChunk["operations"],
+  oldLength: number,
+  newLength: number,
+  originalLines: string[],
+  start: number,
+  lineEnding: "\n" | "\r\n",
+): string[] {
+  const result: string[] = []
+  let oldOffset = 0
+  let newOffset = 0
+
+  for (const operation of operations) {
+    if (operation.type === "context") {
+      const consumeOld = oldOffset < oldLength
+      const produceNew = newOffset < newLength
+      if (consumeOld && produceNew) {
+        const line = originalLines[start + oldOffset]
+        if (line === undefined) throw new Error("Invalid patch context operation")
+        result.push(line)
+      } else if (produceNew) {
+        result.push(...withLineEnding([operation.content], lineEnding))
+      }
+      if (consumeOld) oldOffset++
+      if (produceNew) newOffset++
+    } else if (operation.type === "delete") {
+      if (oldOffset < oldLength) oldOffset++
+    } else if (newOffset < newLength) {
+      result.push(...withLineEnding([operation.content], lineEnding))
+      newOffset++
+    }
+  }
+
+  if (oldOffset !== oldLength || newOffset !== newLength) throw new Error("Invalid patch line operations")
+  return result
+}
+
+function withLineEnding(lines: string[], lineEnding: "\n" | "\r\n"): string[] {
+  if (lineEnding === "\n") return lines
+  return lines.map((line) => `${line}\r`)
 }
 
 function applyReplacements(lines: string[], replacements: Array<[number, number, string[]]>): string[] {

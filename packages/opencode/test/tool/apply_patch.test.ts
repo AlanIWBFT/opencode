@@ -260,6 +260,136 @@ describe("tool.apply_patch freeform", () => {
     }),
   )
 
+  it.instance("does not turn LF context into replacements for a CRLF patch", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const { ctx } = makeCtx()
+      const target = path.join(test.directory, "lf_context.txt")
+      yield* writeText(target, "before\nalpha\nomega\nafter\n")
+
+      const patchText = [
+        "*** Begin Patch",
+        "*** Update File: lf_context.txt",
+        "@@",
+        " alpha",
+        "+inserted",
+        " omega",
+        "*** End Patch",
+      ].join("\r\n")
+
+      const result = yield* execute({ patchText }, ctx)
+      const file = result.metadata.files[0]
+      expect(yield* readText(target)).toBe("before\nalpha\ninserted\nomega\nafter\n")
+      expect(file?.additions).toBe(1)
+      expect(file?.deletions).toBe(0)
+      expect(file?.patch).not.toContain("-alpha")
+      expect(file?.patch).not.toContain("+alpha")
+      expect(file?.patch).toContain("+inserted")
+    }),
+  )
+
+  it.instance("preserves CRLF files when applying an LF patch", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const { ctx } = makeCtx()
+      const target = path.join(test.directory, "crlf_context.txt")
+      yield* writeText(target, "before\r\nalpha\r\nomega\r\nafter\r\n")
+
+      const patchText = [
+        "*** Begin Patch",
+        "*** Update File: crlf_context.txt",
+        "@@",
+        " alpha",
+        "+inserted",
+        " omega",
+        "*** End Patch",
+      ].join("\n")
+
+      const result = yield* execute({ patchText }, ctx)
+      const file = result.metadata.files[0]
+      expect(yield* readText(target)).toBe("before\r\nalpha\r\ninserted\r\nomega\r\nafter\r\n")
+      expect(file?.additions).toBe(1)
+      expect(file?.deletions).toBe(0)
+      expect(file?.patch).not.toContain("-alpha")
+      expect(file?.patch).not.toContain("+alpha")
+      expect(file?.patch).toContain("+inserted")
+    }),
+  )
+
+  it.instance("uses the dominant line ending in the matched context", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const { ctx } = makeCtx()
+      const target = path.join(test.directory, "mixed_context.txt")
+      yield* writeText(target, "header\nbefore\r\nalpha\r\nmiddle\nomega\r\nafter\r\n")
+
+      const patchText = [
+        "*** Begin Patch",
+        "*** Update File: mixed_context.txt",
+        "@@",
+        " alpha",
+        " middle",
+        "+inserted",
+        " omega",
+        "*** End Patch",
+      ].join("\n")
+
+      const result = yield* execute({ patchText }, ctx)
+      const file = result.metadata.files[0]
+      expect(yield* readText(target)).toBe("header\nbefore\r\nalpha\r\nmiddle\ninserted\r\nomega\r\nafter\r\n")
+      expect(file?.additions).toBe(1)
+      expect(file?.deletions).toBe(0)
+      expect(file?.patch).not.toContain("-alpha")
+      expect(file?.patch).not.toContain("+alpha")
+      expect(file?.patch).not.toContain("-middle")
+      expect(file?.patch).not.toContain("+middle")
+      expect(file?.patch).toContain("+inserted")
+    }),
+  )
+
+  it.instance("does not count a missing EOF newline as LF context", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const { ctx } = makeCtx()
+      const target = path.join(test.directory, "crlf_no_eof_newline.txt")
+      yield* writeText(target, "before\r\nalpha\r\nomega")
+
+      const patchText = [
+        "*** Begin Patch",
+        "*** Update File: crlf_no_eof_newline.txt",
+        "@@",
+        " alpha",
+        "+inserted",
+        " omega",
+        "*** End Patch",
+      ].join("\n")
+
+      const result = yield* execute({ patchText }, ctx)
+      const file = result.metadata.files[0]
+      expect(yield* readText(target)).toBe("before\r\nalpha\r\ninserted\r\nomega\r\n")
+      expect(file?.patch).not.toContain("-alpha")
+      expect(file?.patch).not.toContain("+alpha")
+      expect(file?.patch).toContain("+inserted")
+    }),
+  )
+
+  it.instance("preserves CRLF from an add-file patch", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const { ctx } = makeCtx()
+      const patchText = [
+        "*** Begin Patch",
+        "*** Add File: crlf_added.txt",
+        "+first",
+        "+second",
+        "*** End Patch",
+      ].join("\r\n")
+
+      yield* execute({ patchText }, ctx)
+      expect(yield* readText(path.join(test.directory, "crlf_added.txt"))).toBe("first\r\nsecond\r\n")
+    }),
+  )
+
   it.instance("appends trailing newline on update", () =>
     Effect.gen(function* () {
       const test = yield* TestInstance
