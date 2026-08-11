@@ -2,6 +2,7 @@ import { castDraft, produce, type WritableDraft } from "immer"
 import { DateTime, Effect, Match, pipe, Schema } from "effect"
 import { SessionEvent } from "./event.js"
 import { SessionMessage } from "./message.js"
+import { applyExecMetadata, applyScriptMetadata } from "./exec-metadata.js"
 
 export interface Adapter {
   readonly getAgent: () => Effect.Effect<SessionMessage.AgentSelected["agent"] | undefined>
@@ -138,6 +139,7 @@ export function update(adapter: Adapter, event: SessionEvent.DurableEvent) {
         }),
       "session.renamed": () => Effect.void,
       "session.metadata.updated": () => Effect.void,
+      "session.archive.updated": () => Effect.void,
       "session.permissions": () => Effect.void,
       "session.deleted": () => Effect.void,
       "session.forked": () => Effect.void,
@@ -387,6 +389,13 @@ export function update(adapter: Adapter, event: SessionEvent.DurableEvent) {
           },
         )
       },
+      "session.exec.captured": (event) => {
+        return updateOwnedAssistant(event.data.assistantMessageID, (draft) => {
+          applyExecMetadata(draft, event.data)
+        })
+      },
+      "session.script.captured": (event) =>
+        updateOwnedAssistant(event.data.assistantMessageID, (draft) => applyScriptMetadata(draft, event.data)),
       "session.reasoning.started": (event) => {
         return adapter.appendAssistantPart(
           event.data.assistantMessageID,

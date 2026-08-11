@@ -1237,10 +1237,11 @@ describe("Tool", () => {
       })
 
       expect(execution).toMatchObject({ content: [{ type: "text" }] })
-      expect(execution.metadata?.toolCalls).toEqual([{ tool: "echo", status: "completed", input: { text: "request" } }])
+      expect(execution.metadata?.toolCalls).toMatchObject([{ id: "0", tool: "echo", status: "completed", input: { text: "request" }, metadata: { stage: "old" } }])
       expect(executed).toEqual(["old:request"])
-      // The inner tool's own progress would replace the call rows, so it is not published.
-      expect(progress).toEqual([{ toolCalls: [{ tool: "echo", status: "running", input: { text: "request" } }] }])
+      // The initial update is immediate; inner metadata stays on its child in the final result.
+      expect(progress[0]).toMatchObject({ toolCalls: [{ id: "0", tool: "echo", status: "running", input: { text: "request" } }] })
+      expect(progress.every((update) => !Object.hasOwn(update, "stage"))).toBe(true)
     }),
   )
 })
