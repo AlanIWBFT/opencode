@@ -7,6 +7,7 @@ import { AgentNotFoundError, StepFailedError } from "./error.js"
 import { ModelResolver } from "../model-resolver.js"
 import { ModelRetry } from "../model-retry.js"
 import { SessionRunnerModel } from "./runner/model.js"
+import { ProviderRecovery } from "./provider-recovery.js"
 
 const tokenSharingMessages = {
   subscription_sharing_user_not_eligible:
@@ -134,11 +135,14 @@ function unreachable(reason: AIError["reason"]): SessionError.Error {
 function providerError(type: string, reason: AIError["reason"]): SessionError.Error {
   const status = reason.http?.status
   const retryAfterMs = "retryAfterMs" in reason ? reason.retryAfterMs : undefined
+  const resolution = ProviderRecovery.resolution(reason)
   return {
     type,
     message: Object.entries(tokenSharingMessages).find(([code]) => reason.body?.includes(code))?.[1] ?? reason.message,
     ...(status === undefined ? {} : { status }),
     ...(reason.body === undefined ? {} : { response: { body: reason.body } }),
     ...(retryAfterMs === undefined ? {} : { retryAfterMs }),
+    ...(resolution === undefined ? {} : { resolution }),
+    ...(reason.http === undefined ? {} : { responseHeaders: reason.http.headers, url: reason.http.url }),
   }
 }
