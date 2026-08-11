@@ -1105,6 +1105,7 @@ describe("ACP service sessions", () => {
     await called.promise
     fixture.events.push({
       id: "evt_part",
+      seq: 1,
       type: "message.part.updated",
       properties: {
         sessionID: session.sessionId,

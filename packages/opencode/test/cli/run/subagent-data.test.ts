@@ -160,6 +160,7 @@ function childMessage(input: {
     return {
       info: {
         id: input.messageID,
+        seq: 1,
         sessionID: input.sessionID,
         role: "user",
         time: {
@@ -178,6 +179,7 @@ function childMessage(input: {
   return {
     info: {
       id: input.messageID,
+      seq: 1,
       sessionID: input.sessionID,
       role: "assistant",
       time: {
@@ -440,6 +442,7 @@ describe("run subagent data", () => {
             parts: [
               {
                 id: "txt-user-1",
+                seq: 1,
                 messageID: "msg-user-1",
                 sessionID: "child-1",
                 type: "text",
@@ -455,6 +458,7 @@ describe("run subagent data", () => {
             parts: [
               {
                 id: "reason-1",
+                seq: 1,
                 messageID: "msg-assistant-1",
                 sessionID: "child-1",
                 type: "reasoning",
@@ -463,6 +467,7 @@ describe("run subagent data", () => {
               },
               {
                 id: "txt-1",
+                seq: 2,
                 messageID: "msg-assistant-1",
                 sessionID: "child-1",
                 type: "text",

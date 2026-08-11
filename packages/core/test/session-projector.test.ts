@@ -19,10 +19,12 @@ import { SessionMessageUpdater } from "@opencode-ai/core/session/message-updater
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { SessionExecution } from "@opencode-ai/core/session/execution"
 import { SessionInput } from "@opencode-ai/core/session/input"
-import { SessionInputTable, SessionMessageTable, SessionTable } from "@opencode-ai/core/session/sql"
+import { MessageTable, PartTable, SessionInputTable, SessionMessageTable, SessionTable } from "@opencode-ai/core/session/sql"
+import { LocalMessageOrder } from "@opencode-ai/core/database/local-message-order"
 import { testEffect } from "./lib/effect"
 import { Snapshot } from "@opencode-ai/core/snapshot"
 import { Location } from "@opencode-ai/core/location"
+import { SessionV1 } from "@opencode-ai/core/v1/session"
 
 const it = testEffect(AppNodeBuilder.build(LayerNode.group([Database.node, EventV2.node, SessionProjector.node])))
 const sessionsLayer = AppNodeBuilder.build(SessionV2.node, [[SessionExecution.node, SessionExecution.noopLayer]])
@@ -75,6 +77,382 @@ describe("SessionProjector", () => {
       expect(yield* db.select({ directory: SessionTable.directory }).from(SessionTable).get()).toEqual({
         directory: "/project/subdir",
       })
+    }),
+  )
+
+  it.effect("keeps projected sequence metadata out of event data and rejects identity reassignment", () =>
+    Effect.gen(function* () {
+      const { db } = yield* Database.Service
+      yield* db
+        .insert(ProjectTable)
+        .values({ id: Project.ID.global, worktree: AbsolutePath.make("/project"), sandboxes: [] })
+        .run()
+        .pipe(Effect.orDie)
+      const otherSessionID = SessionV2.ID.make("ses_projector_other")
+      yield* db
+        .insert(SessionTable)
+        .values([
+          {
+            id: sessionID,
+            project_id: Project.ID.global,
+            slug: "test",
+            directory: "/project",
+            title: "test",
+            version: "test",
+          },
+          {
+            id: otherSessionID,
+            project_id: Project.ID.global,
+            slug: "other",
+            directory: "/project",
+            title: "other",
+            version: "test",
+          },
+        ])
+        .run()
+        .pipe(Effect.orDie)
+      const events = yield* EventV2.Service
+      const messageID = SessionV1.MessageID.make("msg_projected_identity")
+      const message = {
+        id: messageID,
+        sessionID,
+        role: "user",
+        time: { created: 1 },
+        agent: "build",
+        model: { providerID: "provider", modelID: "model" },
+      } as SessionV1.User
+      const projected = yield* events.publish(SessionV1.Event.MessageUpdated, { sessionID, info: message })
+
+      expect("seq" in message).toBe(false)
+      expect("seq" in projected.data.info).toBe(false)
+      if (!projected.durable) return yield* Effect.die("Projected event is not durable")
+      expect(SessionProjector.projectedSequence(projected)).toBe(0)
+      expect(
+        yield* db
+          .select()
+          .from(LocalMessageOrder.MessageOrderTable)
+          .where(eq(LocalMessageOrder.MessageOrderTable.message_id, messageID))
+          .get()
+          .pipe(Effect.orDie),
+      ).toMatchObject({ session_id: sessionID, seq: 0 })
+
+      const messageConflict = yield* events
+        .publish(SessionV1.Event.MessageUpdated, {
+          sessionID: otherSessionID,
+          info: { ...message, sessionID: otherSessionID },
+        })
+        .pipe(Effect.as(false), Effect.catchCause(() => Effect.succeed(true)))
+      expect(messageConflict).toBe(true)
+      expect(yield* db.select().from(MessageTable).where(eq(MessageTable.id, messageID)).get().pipe(Effect.orDie)).toMatchObject(
+        { session_id: sessionID },
+      )
+
+      const partID = SessionV1.PartID.make("prt_projected_identity")
+      const part = { id: partID, sessionID, messageID, type: "text", text: "hello" } as SessionV1.TextPart
+      yield* events.publish(SessionV1.Event.PartUpdated, { sessionID, part, time: 1 })
+      expect("seq" in part).toBe(false)
+      expect(
+        yield* db
+          .select()
+          .from(LocalMessageOrder.PartOrderTable)
+          .where(eq(LocalMessageOrder.PartOrderTable.part_id, partID))
+          .get()
+          .pipe(Effect.orDie),
+      ).toMatchObject({ message_id: messageID, session_id: sessionID, seq: 0 })
+      const partConflict = yield* events
+        .publish(SessionV1.Event.PartUpdated, {
+          sessionID: otherSessionID,
+          part: { ...part, sessionID: otherSessionID },
+          time: 2,
+        })
+        .pipe(Effect.as(false), Effect.catchCause(() => Effect.succeed(true)))
+      expect(partConflict).toBe(true)
+      expect(yield* db.select().from(PartTable).where(eq(PartTable.id, partID)).get().pipe(Effect.orDie)).toMatchObject({
+        session_id: sessionID,
+        message_id: messageID,
+      })
+
+      const assistantID = SessionV1.MessageID.make("msg_projected_child")
+      yield* events.publish(SessionV1.Event.MessageUpdated, {
+        sessionID,
+        info: {
+          id: assistantID,
+          sessionID,
+          role: "assistant",
+          parentID: messageID,
+          time: { created: 2 },
+          modelID: ModelV2.ID.make("model"),
+          providerID: ProviderV2.ID.make("provider"),
+          mode: "build",
+          agent: "build",
+          path: { cwd: "/project", root: "/project" },
+          cost: 0,
+          tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        },
+      })
+      const parentRemoval = yield* events
+        .publish(SessionV1.Event.MessageRemoved, { sessionID, messageID })
+        .pipe(Effect.as(false), Effect.catchCause(() => Effect.succeed(true)))
+      expect(parentRemoval).toBe(true)
+      expect(yield* db.select().from(MessageTable).where(eq(MessageTable.id, messageID)).get().pipe(Effect.orDie)).toBeDefined()
+
+      yield* events.publish(SessionV1.Event.MessageRemoved, { sessionID, messageID: assistantID })
+      yield* events.publish(SessionV1.Event.MessageRemoved, { sessionID, messageID })
+      expect(
+        yield* db
+          .select()
+          .from(LocalMessageOrder.MessageOrderTable)
+          .where(eq(LocalMessageOrder.MessageOrderTable.session_id, sessionID))
+          .all()
+          .pipe(Effect.orDie),
+      ).toEqual([])
+
+      const corruptMessageID = SessionV1.MessageID.make("msg_projected_corrupt_part")
+      const corruptPartID = SessionV1.PartID.make("prt_projected_corrupt_session")
+      yield* events.publish(SessionV1.Event.MessageUpdated, {
+        sessionID,
+        info: { ...message, id: corruptMessageID },
+      })
+      yield* events.publish(SessionV1.Event.PartUpdated, {
+        sessionID,
+        part: {
+          id: corruptPartID,
+          messageID: corruptMessageID,
+          sessionID,
+          type: "text",
+          text: "corrupt",
+        },
+        time: 3,
+      })
+      yield* db
+        .update(PartTable)
+        .set({ session_id: otherSessionID })
+        .where(eq(PartTable.id, corruptPartID))
+        .run()
+        .pipe(Effect.orDie)
+
+      const corruptRemoval = yield* events
+        .publish(SessionV1.Event.MessageRemoved, { sessionID, messageID: corruptMessageID })
+        .pipe(Effect.as(false), Effect.catchCause(() => Effect.succeed(true)))
+
+      expect(corruptRemoval).toBe(true)
+      expect(
+        yield* db.select().from(MessageTable).where(eq(MessageTable.id, corruptMessageID)).get().pipe(Effect.orDie),
+      ).toBeDefined()
+      expect(yield* db.select().from(PartTable).where(eq(PartTable.id, corruptPartID)).get().pipe(Effect.orDie)).toBeDefined()
+    }),
+  )
+
+  it.effect("projects a fork batch with contiguous message and part order plus usage", () =>
+    Effect.gen(function* () {
+      const { db } = yield* Database.Service
+      const events = yield* EventV2.Service
+      const forkID = SessionV2.ID.make("ses_projector_fork_batch")
+      yield* db
+        .insert(ProjectTable)
+        .values({ id: Project.ID.global, worktree: AbsolutePath.make("/project"), sandboxes: [] })
+        .run()
+        .pipe(Effect.orDie)
+      yield* db
+        .insert(SessionTable)
+        .values({
+          id: forkID,
+          project_id: Project.ID.global,
+          slug: "fork",
+          directory: "/project",
+          title: "fork",
+          version: "test",
+        })
+        .run()
+        .pipe(Effect.orDie)
+      const userID = SessionV1.MessageID.make("msg_fork_batch_user")
+      const assistantID = SessionV1.MessageID.make("msg_fork_batch_assistant")
+      const textID = SessionV1.PartID.make("prt_fork_batch_text")
+      const usageID = SessionV1.PartID.make("prt_fork_batch_usage")
+      yield* db.run("CREATE TABLE fork_batch_order_probe (session_id text NOT NULL)")
+      yield* db.run(`
+        CREATE TRIGGER fork_batch_order_update_probe
+        AFTER UPDATE ON local_session_order
+        BEGIN
+          INSERT INTO fork_batch_order_probe (session_id) VALUES (NEW.session_id);
+        END
+      `)
+      const projected = yield* events.publishBatch(
+        [
+          EventV2.publishItem(SessionV1.Event.MessageUpdated, {
+            sessionID: forkID,
+            info: {
+              id: userID,
+              sessionID: forkID,
+              role: "user",
+              time: { created: 1 },
+              agent: "build",
+              model: { providerID: ProviderV2.ID.make("provider"), modelID: ModelV2.ID.make("model") },
+            },
+          }),
+          EventV2.publishItem(SessionV1.Event.PartUpdated, {
+            sessionID: forkID,
+            part: { id: textID, sessionID: forkID, messageID: userID, type: "text", text: "hello" },
+            time: 1,
+          }),
+          EventV2.publishItem(SessionV1.Event.MessageUpdated, {
+            sessionID: forkID,
+            info: {
+              id: assistantID,
+              sessionID: forkID,
+              role: "assistant",
+              parentID: userID,
+              time: { created: 2 },
+              modelID: ModelV2.ID.make("model"),
+              providerID: ProviderV2.ID.make("provider"),
+              mode: "build",
+              agent: "build",
+              path: { cwd: "/project", root: "/project" },
+              cost: 0,
+              tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+            },
+          }),
+          EventV2.publishItem(SessionV1.Event.PartUpdated, {
+            sessionID: forkID,
+            part: {
+              id: usageID,
+              sessionID: forkID,
+              messageID: assistantID,
+              type: "step-finish",
+              reason: "stop",
+              cost: 2,
+              tokens: { input: 3, output: 4, reasoning: 5, cache: { read: 6, write: 7 } },
+            },
+            time: 2,
+          }),
+        ],
+        { projector: "session.fork" },
+      )
+      const messages = yield* db
+        .select({ id: MessageTable.id, data: MessageTable.data, seq: LocalMessageOrder.MessageOrderTable.seq })
+        .from(MessageTable)
+        .innerJoin(LocalMessageOrder.MessageOrderTable, eq(LocalMessageOrder.MessageOrderTable.message_id, MessageTable.id))
+        .where(eq(MessageTable.session_id, forkID))
+        .orderBy(asc(LocalMessageOrder.MessageOrderTable.seq))
+        .all()
+        .pipe(Effect.orDie)
+      const parts = yield* db
+        .select({ id: PartTable.id, seq: LocalMessageOrder.PartOrderTable.seq })
+        .from(PartTable)
+        .innerJoin(LocalMessageOrder.PartOrderTable, eq(LocalMessageOrder.PartOrderTable.part_id, PartTable.id))
+        .where(eq(PartTable.session_id, forkID))
+        .orderBy(asc(LocalMessageOrder.PartOrderTable.seq))
+        .all()
+        .pipe(Effect.orDie)
+      const session = yield* db.select().from(SessionTable).where(eq(SessionTable.id, forkID)).get().pipe(Effect.orDie)
+      const order = yield* db
+        .select()
+        .from(LocalMessageOrder.SessionOrderTable)
+        .where(eq(LocalMessageOrder.SessionOrderTable.session_id, forkID))
+        .get()
+        .pipe(Effect.orDie)
+
+      expect(messages.map((row) => [row.id, row.seq])).toEqual([
+        [userID, 0],
+        [assistantID, 1],
+      ])
+      expect((messages[1]?.data as SessionV1.Assistant | undefined)?.parentID).toBe(userID)
+      expect(parts.map((row) => [row.id, row.seq])).toEqual([
+        [textID, 0],
+        [usageID, 1],
+      ])
+      expect(order).toEqual({ session_id: forkID, message_seq: 2, part_seq: 2 })
+      expect(session).toMatchObject({
+        cost: 2,
+        tokens_input: 3,
+        tokens_output: 4,
+        tokens_reasoning: 5,
+        tokens_cache_read: 6,
+        tokens_cache_write: 7,
+      })
+      expect(projected.map((event) => SessionProjector.projectedSequence(event))).toEqual([0, 0, 1, 1])
+      expect(
+        yield* db.all<{ session_id: string }>(
+          `SELECT session_id FROM fork_batch_order_probe WHERE session_id = '${forkID}'`,
+        ),
+      ).toEqual([{ session_id: forkID }])
+    }),
+  )
+
+  it.effect("projects fork batches larger than read and write chunks", () =>
+    Effect.gen(function* () {
+      const { db } = yield* Database.Service
+      const events = yield* EventV2.Service
+      const forkID = SessionV2.ID.make("ses_projector_fork_large")
+      yield* db
+        .insert(ProjectTable)
+        .values({ id: Project.ID.global, worktree: AbsolutePath.make("/project"), sandboxes: [] })
+        .run()
+        .pipe(Effect.orDie)
+      yield* db
+        .insert(SessionTable)
+        .values({
+          id: forkID,
+          project_id: Project.ID.global,
+          slug: "fork-large",
+          directory: "/project",
+          title: "fork-large",
+          version: "test",
+        })
+        .run()
+        .pipe(Effect.orDie)
+      const count = 501
+      const items = Array.from({ length: count }, (_, index) => {
+        const messageID = SessionV1.MessageID.make(`msg_fork_large_${index}`)
+        return [
+          EventV2.publishItem(SessionV1.Event.MessageUpdated, {
+            sessionID: forkID,
+            info: {
+              id: messageID,
+              sessionID: forkID,
+              role: "user" as const,
+              time: { created: index },
+              agent: "build",
+              model: { providerID: ProviderV2.ID.make("provider"), modelID: ModelV2.ID.make("model") },
+            },
+          }),
+          EventV2.publishItem(SessionV1.Event.PartUpdated, {
+            sessionID: forkID,
+            part: {
+              id: SessionV1.PartID.make(`prt_fork_large_${index}`),
+              sessionID: forkID,
+              messageID,
+              type: "text" as const,
+              text: String(index),
+            },
+            time: index,
+          }),
+        ]
+      }).flat()
+
+      yield* events.publishBatch(items, { projector: "session.fork" })
+      const order = yield* db
+        .select()
+        .from(LocalMessageOrder.SessionOrderTable)
+        .where(eq(LocalMessageOrder.SessionOrderTable.session_id, forkID))
+        .get()
+        .pipe(Effect.orDie)
+      const messages = yield* db
+        .select({ count: sql<number>`count(*)` })
+        .from(MessageTable)
+        .where(eq(MessageTable.session_id, forkID))
+        .get()
+        .pipe(Effect.orDie)
+      const parts = yield* db
+        .select({ count: sql<number>`count(*)` })
+        .from(PartTable)
+        .where(eq(PartTable.session_id, forkID))
+        .get()
+        .pipe(Effect.orDie)
+
+      expect(order).toEqual({ session_id: forkID, message_seq: count, part_seq: count })
+      expect(messages?.count).toBe(count)
+      expect(parts?.count).toBe(count)
     }),
   )
 

@@ -45,8 +45,8 @@ test("live messages use creation time with an ID tie-break", async () => {
   ]
 
   try {
-    for (const info of messages) {
-      emit(global({ id: `evt_${info.id}`, type: "message.updated", properties: { sessionID, info } }))
+    for (const [index, info] of messages.entries()) {
+      emit(global({ id: `evt_${info.id}`, seq: index + 1, type: "message.updated", properties: { sessionID, info } }))
     }
     await wait(() => sync.data.message[sessionID]?.length === messages.length)
 
@@ -78,10 +78,11 @@ test("stale session hydration does not overwrite live message parts", async () =
   try {
     const hydrate = sync.session.sync(sessionID)
     await wait(() => requested)
-    emit(global({ id: "evt_message", type: "message.updated", properties: { sessionID, info: assistant } }))
+    emit(global({ id: "evt_message", seq: 1, type: "message.updated", properties: { sessionID, info: assistant } }))
     emit(
       global({
         id: "evt_part",
+        seq: 2,
         type: "message.part.updated",
         properties: {
           sessionID,
@@ -168,10 +169,11 @@ test("hydration does not clear text streamed before it starts", async () => {
   }, tmp.path)
 
   try {
-    emit(global({ id: "evt_message", type: "message.updated", properties: { sessionID, info: assistant } }))
+    emit(global({ id: "evt_message", seq: 1, type: "message.updated", properties: { sessionID, info: assistant } }))
     emit(
       global({
         id: "evt_part",
+        seq: 2,
         type: "message.part.updated",
         properties: {
           sessionID,
@@ -222,7 +224,7 @@ test("live messages merged during hydration retain the 100 message window", asyn
     const hydrate = sync.session.sync(sessionID)
     await wait(() => requested)
     const live = { ...assistant, id: "msg_z_live" }
-    emit(global({ id: "evt_live", type: "message.updated", properties: { sessionID, info: live } }))
+    emit(global({ id: "evt_live", seq: 1, type: "message.updated", properties: { sessionID, info: live } }))
     await wait(() => sync.data.message[sessionID]?.some((message) => message.id === live.id) ?? false)
     resolveMessages(
       json(
@@ -266,7 +268,7 @@ test("a message removed during hydration does not regain stale parts", async () 
   }, tmp.path)
 
   try {
-    emit(global({ id: "evt_message", type: "message.updated", properties: { sessionID, info: assistant } }))
+    emit(global({ id: "evt_message", seq: 1, type: "message.updated", properties: { sessionID, info: assistant } }))
     await wait(() => sync.data.message[sessionID]?.length === 1)
     const hydrate = sync.session.sync(sessionID)
     await wait(() => requested)

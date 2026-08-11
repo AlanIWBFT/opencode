@@ -5,7 +5,7 @@ import { SessionProjector } from "@opencode-ai/core/session/projector"
 import fs from "fs/promises"
 import path from "path"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
-import { Effect } from "effect"
+import { Cause, Deferred, Effect, Exit, Fiber, Layer } from "effect"
 import { Session } from "@/session/session"
 
 import { SessionRevert } from "../../src/session/revert"
@@ -16,22 +16,51 @@ import { provideTmpdirInstance } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
+import { EventV2Bridge } from "@/event-v2-bridge"
+import { Database } from "@opencode-ai/core/database/database"
+import { SessionSummary } from "@/session/summary"
 
-const it = testEffect(
-  LayerNode.compile(
-    LayerNode.group([Session.node, SessionRevert.node, Snapshot.node, SessionProjector.node, CrossSpawnSpawner.node]),
-  ),
+const root = LayerNode.group([
+  Session.node,
+  SessionRevert.node,
+  Snapshot.node,
+  SessionProjector.node,
+  CrossSpawnSpawner.node,
+  EventV2Bridge.node,
+  Database.node,
+])
+const it = testEffect(LayerNode.compile(root))
+const diffBlocks: Array<{ entered: Deferred.Deferred<void>; release: Deferred.Deferred<void> }> = []
+const blockingSummary = Layer.succeed(
+  SessionSummary.Service,
+  SessionSummary.Service.of({
+    summarize: () => Effect.void,
+    diff: () => Effect.succeed([]),
+    computeDiff: () =>
+      Effect.gen(function* () {
+        const block = diffBlocks.shift()
+        if (!block) return []
+        yield* Deferred.succeed(block.entered, undefined)
+        yield* Deferred.await(block.release)
+        return []
+      }),
+  }),
 )
+const staleIt = testEffect(LayerNode.compile(root, [[SessionSummary.node, blockingSummary]]))
 
-const user = Effect.fn("test.user")(function* (sessionID: SessionID, agent = "default") {
+const user = Effect.fn("test.user")(function* (
+  sessionID: SessionID,
+  agent = "default",
+  options?: { id?: MessageID; created?: number },
+) {
   const session = yield* Session.Service
   return yield* session.updateMessage({
-    id: MessageID.ascending(),
+    id: options?.id ?? MessageID.ascending(),
     role: "user" as const,
     sessionID,
     agent,
     model: { providerID: ProviderV2.ID.make("openai"), modelID: ModelV2.ID.make("gpt-4") },
-    time: { created: Date.now() },
+    time: { created: options?.created ?? Date.now() },
   })
 })
 
@@ -47,10 +76,15 @@ const userAt = Effect.fn("test.userAt")(function* (sessionID: SessionID, id: str
   })
 })
 
-const assistant = Effect.fn("test.assistant")(function* (sessionID: SessionID, parentID: MessageID, dir: string) {
+const assistant = Effect.fn("test.assistant")(function* (
+  sessionID: SessionID,
+  parentID: MessageID,
+  dir: string,
+  options?: { id?: MessageID; created?: number },
+) {
   const session = yield* Session.Service
   return yield* session.updateMessage({
-    id: MessageID.ascending(),
+    id: options?.id ?? MessageID.ascending(),
     role: "assistant" as const,
     sessionID,
     mode: "default",
@@ -61,7 +95,7 @@ const assistant = Effect.fn("test.assistant")(function* (sessionID: SessionID, p
     modelID: ModelV2.ID.make("gpt-4"),
     providerID: ProviderV2.ID.make("openai"),
     parentID,
-    time: { created: Date.now() },
+    time: { created: options?.created ?? Date.now() },
     finish: "end_turn",
   })
 })
@@ -108,6 +142,112 @@ const tokens = {
 }
 
 describe("revert + compact workflow", () => {
+  staleIt.live(
+    "restores the worktree when a revert commit becomes stale",
+    provideTmpdirInstance(
+      (dir) =>
+        Effect.gen(function* () {
+          const sessions = yield* Session.Service
+          const revert = yield* SessionRevert.Service
+          const snapshot = yield* Snapshot.Service
+          const info = yield* sessions.create({})
+          const file = path.join(dir, "stale-revert.txt")
+          yield* write(file, "before")
+          const boundary = yield* user(info.id)
+          yield* text(info.id, boundary.id, "boundary")
+          const reply = yield* assistant(info.id, boundary.id, dir)
+          const before = yield* snapshot.track()
+          if (!before) throw new Error("expected snapshot")
+          yield* write(file, "after")
+          const patch = yield* snapshot.patch(before)
+          yield* sessions.updatePart({
+            id: PartID.ascending(),
+            messageID: reply.id,
+            sessionID: info.id,
+            type: "patch",
+            hash: patch.hash,
+            files: patch.files,
+          })
+
+          const entered = yield* Deferred.make<void>()
+          const release = yield* Deferred.make<void>()
+          diffBlocks.push({ entered, release })
+          const running = yield* revert
+            .revert({ sessionID: info.id, messageID: boundary.id })
+            .pipe(Effect.exit, Effect.forkChild)
+          yield* Deferred.await(entered)
+          expect(yield* read(file)).toBe("before")
+
+          const later = MessageID.ascending()
+          yield* sessions.updateMessage({
+            id: later,
+            role: "user",
+            sessionID: info.id,
+            agent: "default",
+            model: { providerID: ProviderV2.ID.make("openai"), modelID: ModelV2.ID.make("gpt-4") },
+            time: { created: Date.now() },
+          })
+          yield* Deferred.succeed(release, undefined)
+          const exit = yield* Fiber.join(running)
+
+          expect(Exit.isFailure(exit)).toBe(true)
+          if (Exit.isFailure(exit)) expect(Cause.squash(exit.cause)).toBeInstanceOf(Session.BusyError)
+          expect((yield* sessions.get(info.id)).revert).toBeUndefined()
+          expect(yield* read(file)).toBe("after")
+        }),
+      { git: true },
+    ),
+    30_000,
+  )
+
+  it.live(
+    "cleans up a reverted turn when later message IDs sort before the boundary",
+    provideTmpdirInstance(
+      (dir) =>
+        Effect.gen(function* () {
+          const sessions = yield* Session.Service
+          const revert = yield* SessionRevert.Service
+          const info = yield* sessions.create({})
+          const before = yield* user(info.id, "default", {
+            id: MessageID.make("msg_before"),
+            created: 100,
+          })
+          const boundary = yield* user(info.id, "default", {
+            id: MessageID.make("msg_z_boundary"),
+            created: 200,
+          })
+          const child = yield* assistant(info.id, boundary.id, dir, {
+            id: MessageID.make("msg_a_child"),
+            created: 200,
+          })
+          const followup = yield* user(info.id, "default", {
+            id: MessageID.make("msg_1_followup"),
+            created: 200,
+          })
+          const grandchild = yield* assistant(info.id, followup.id, dir, {
+            id: MessageID.make("msg_0_grandchild"),
+            created: 200,
+          })
+          yield* text(info.id, before.id, "before")
+          yield* text(info.id, boundary.id, "boundary")
+          yield* text(info.id, child.id, "child")
+          yield* text(info.id, followup.id, "followup")
+          yield* text(info.id, grandchild.id, "grandchild")
+
+          yield* revert.revert({ sessionID: info.id, messageID: boundary.id })
+          yield* revert.cleanup(yield* sessions.get(info.id))
+
+          const remaining = yield* sessions.messages({ sessionID: info.id })
+          expect(remaining.map((message) => message.info.id)).toEqual([before.id])
+          expect(remaining.some((message) => message.info.id === child.id)).toBe(false)
+          expect(remaining.some((message) => message.info.id === followup.id)).toBe(false)
+          expect(remaining.some((message) => message.info.id === grandchild.id)).toBe(false)
+          expect((yield* sessions.get(info.id)).revert).toBeUndefined()
+        }),
+      { git: true },
+    ),
+  )
+
   it.live(
     "should properly handle compact command after revert",
     provideTmpdirInstance(

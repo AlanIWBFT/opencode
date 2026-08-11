@@ -1,12 +1,10 @@
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
-import { Agent } from "@/agent/agent"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Command } from "@/command"
 import { Permission } from "@/permission"
 import { SessionShare } from "@/share/session"
 import { Session } from "@/session/session"
-import { SessionCompaction } from "@/session/compaction"
 import { MessageV2 } from "@/session/message-v2"
 import { SessionPrompt } from "@/session/prompt"
 import { SessionRevert } from "@/session/revert"
@@ -52,9 +50,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
     const shareSvc = yield* SessionShare.Service
     const promptSvc = yield* SessionPrompt.Service
     const revertSvc = yield* SessionRevert.Service
-    const compactSvc = yield* SessionCompaction.Service
     const runState = yield* SessionRunState.Service
-    const agentSvc = yield* Agent.Service
     const permissionSvc = yield* Permission.Service
     const statusSvc = yield* SessionStatus.Service
     const todoSvc = yield* Todo.Service
@@ -118,7 +114,8 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       }
       yield* requireSession(ctx.params.sessionID)
       if (ctx.query.limit === undefined || ctx.query.limit === 0) {
-        return yield* SessionError.mapStorageNotFound(session.messages({ sessionID: ctx.params.sessionID }))
+        const items = yield* SessionError.mapStorageNotFound(session.messages({ sessionID: ctx.params.sessionID }))
+        return Schema.decodeUnknownSync(Schema.Array(SessionV1.StoredWithParts))(items)
       }
 
       const page = yield* SessionError.mapStorageNotFound(
@@ -128,7 +125,8 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
           before: ctx.query.before,
         }),
       )
-      if (!page.cursor) return page.items
+      const items = Schema.decodeUnknownSync(Schema.Array(SessionV1.StoredWithParts))(page.items)
+      if (!page.cursor) return items
 
       const request = yield* HttpServerRequest.HttpServerRequest
       // toURL() honors the Host + x-forwarded-proto headers, so the Link
@@ -136,7 +134,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       const url = Option.getOrElse(HttpServerRequest.toURL(request), () => new URL(request.url, "http://localhost"))
       url.searchParams.set("limit", ctx.query.limit.toString())
       url.searchParams.set("before", page.cursor)
-      return HttpServerResponse.jsonUnsafe(page.items, {
+      return HttpServerResponse.jsonUnsafe(items, {
         headers: {
           "Access-Control-Expose-Headers": "Link, X-Next-Cursor",
           Link: `<${url.toString()}>; rel="next"`,
@@ -148,9 +146,10 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
     const message = Effect.fn("SessionHttpApi.message")(function* (ctx: {
       params: { sessionID: SessionID; messageID: MessageID }
     }) {
-      return yield* SessionError.mapStorageNotFound(
+      const item = yield* SessionError.mapStorageNotFound(
         MessageV2.get({ sessionID: ctx.params.sessionID, messageID: ctx.params.messageID }),
       )
+      return Schema.decodeUnknownSync(SessionV1.StoredWithParts)(item)
     })
 
     const create = Effect.fn("SessionHttpApi.create")(function* (ctx: { payload?: Session.CreateInput }) {
@@ -289,35 +288,12 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       params: { sessionID: SessionID }
       payload: typeof SummarizePayload.Type
     }) {
-      yield* revertSvc.cleanup(yield* requireSession(ctx.params.sessionID))
-      const messages = yield* SessionError.mapStorageNotFound(session.messages({ sessionID: ctx.params.sessionID }))
-      const latest = messages.at(-1)?.info
-      if (
-        latest?.role === "assistant" &&
-        latest.summary === true &&
-        latest.finish &&
-        !latest.error &&
-        typeof latest.time.completed === "number"
-      )
-        return true
-      if ((yield* statusSvc.get(ctx.params.sessionID)).type !== "idle") return true
-      const defaultAgent = yield* agentSvc.defaultAgent()
-      const currentAgent = messages.findLast((message) => message.info.role === "user")?.info.agent ?? defaultAgent
-
-      yield* statusSvc.set(ctx.params.sessionID, { type: "busy" })
-      return yield* Effect.gen(function* () {
-        yield* compactSvc.create({
-          sessionID: ctx.params.sessionID,
-          agent: currentAgent,
-          model: {
-            providerID: ctx.payload.providerID,
-            modelID: ctx.payload.modelID,
-          },
-          auto: ctx.payload.auto ?? false,
-        })
-        yield* promptSvc.loop({ sessionID: ctx.params.sessionID })
-        return true
-      }).pipe(Effect.ensuring(statusSvc.set(ctx.params.sessionID, { type: "idle" })))
+      yield* requireSession(ctx.params.sessionID)
+      return yield* promptSvc.summarize({
+        sessionID: ctx.params.sessionID,
+        model: { providerID: ctx.payload.providerID, modelID: ctx.payload.modelID },
+        auto: ctx.payload.auto ?? false,
+      })
     })
 
     const prompt = Effect.fn("SessionHttpApi.prompt")(function* (ctx: {
@@ -409,8 +385,11 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       params: { sessionID: SessionID; messageID: MessageID }
     }) {
       yield* requireSession(ctx.params.sessionID)
-      yield* SessionError.mapBusy(runState.assertNotBusy(ctx.params.sessionID))
-      yield* session.removeMessage(ctx.params)
+      yield* SessionError.mapBusy(
+        runState.withMutation(ctx.params.sessionID)(
+          runState.assertNotBusy(ctx.params.sessionID).pipe(Effect.andThen(session.removeMessage(ctx.params))),
+        ),
+      )
       return true
     })
 
@@ -418,7 +397,11 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       params: { sessionID: SessionID; messageID: MessageID; partID: PartID }
     }) {
       yield* requireSession(ctx.params.sessionID)
-      yield* session.removePart(ctx.params)
+      yield* SessionError.mapBusy(
+        runState.withMutation(ctx.params.sessionID)(
+          runState.assertNotBusy(ctx.params.sessionID).pipe(Effect.andThen(session.removePart(ctx.params))),
+        ),
+      )
       return true
     })
 
@@ -435,7 +418,11 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       ) {
         return yield* new HttpApiError.BadRequest({})
       }
-      return yield* session.updatePart(payload)
+      return yield* SessionError.mapBusy(
+        runState.withMutation(ctx.params.sessionID)(
+          runState.assertNotBusy(ctx.params.sessionID).pipe(Effect.andThen(session.updatePart(payload))),
+        ),
+      )
     })
 
     return handlers

@@ -5,8 +5,8 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { eq } from "drizzle-orm"
 import { EventV2Bridge } from "@/event-v2-bridge"
-import { expect } from "bun:test"
-import { Cause, Deferred, Duration, Effect, Exit, Fiber, Layer } from "effect"
+import { expect, test } from "bun:test"
+import { Cause, Deferred, Duration, Effect, Exit, Fiber, Latch, Layer } from "effect"
 import path from "path"
 import { fileURLToPath } from "url"
 import { NamedError } from "@opencode-ai/core/util/error"
@@ -58,6 +58,7 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { LocationServiceMap, locationServiceMapLayer } from "@opencode-ai/core/location-services"
 import { ExecSession } from "@/tool/exec-session"
+import { persistentShellScript } from "@/tool/shell"
 
 const summary = Layer.succeed(
   SessionSummary.Service,
@@ -165,6 +166,24 @@ const blockingProcessor = Layer.succeed(
   }),
 )
 
+const chatMessageBlocks: Array<{ entered: Deferred.Deferred<void>; release: Deferred.Deferred<void> }> = []
+const blockingChatPlugin = Layer.succeed(
+  Plugin.Service,
+  Plugin.Service.of({
+    trigger: ((name: string, _input: unknown, output: unknown) =>
+      Effect.gen(function* () {
+        if (name !== "chat.message") return output
+        const block = chatMessageBlocks.shift()
+        if (!block) return output
+        yield* Deferred.succeed(block.entered, undefined)
+        yield* Deferred.await(block.release)
+        return output
+      })) as Plugin.Interface["trigger"],
+    list: () => Effect.succeed([]),
+    init: () => Effect.void,
+  }),
+)
+
 const runtimeFlags = RuntimeFlags.layer({ experimentalEventSystem: true })
 
 const testLLMServerNode = LayerNode.make({ service: TestLLMServer, layer: TestLLMServer.layer, deps: [] })
@@ -210,7 +229,11 @@ const promptRoot = LayerNode.group([
   ExecSession.node,
 ])
 
-function makePrompt(input?: { mcpInstructions?: MCP.ServerInstructions[]; processor?: "blocking" }) {
+function makePrompt(input?: {
+  mcpInstructions?: MCP.ServerInstructions[]
+  processor?: "blocking"
+  plugin?: "blocking-chat"
+}) {
   const replacements = [
     [SessionSummary.node, summary],
     [LSP.node, lsp],
@@ -220,10 +243,17 @@ function makePrompt(input?: { mcpInstructions?: MCP.ServerInstructions[]; proces
   if (input?.processor === "blocking") {
     return LayerNode.compile(promptRoot, [...replacements, [SessionProcessor.node, blockingProcessor]])
   }
+  if (input?.plugin === "blocking-chat") {
+    return LayerNode.compile(promptRoot, [...replacements, [Plugin.node, blockingChatPlugin]])
+  }
   return LayerNode.compile(promptRoot, replacements)
 }
 
-function makeHttp(input?: { mcpInstructions?: MCP.ServerInstructions[]; processor?: "blocking" }) {
+function makeHttp(input?: {
+  mcpInstructions?: MCP.ServerInstructions[]
+  processor?: "blocking"
+  plugin?: "blocking-chat"
+}) {
   const root = LayerNode.group([promptRoot, testLLMServerNode])
   const replacements = [
     [SessionSummary.node, summary],
@@ -234,16 +264,24 @@ function makeHttp(input?: { mcpInstructions?: MCP.ServerInstructions[]; processo
   if (input?.processor === "blocking") {
     return LayerNode.compile(root, [...replacements, [SessionProcessor.node, blockingProcessor]])
   }
+  if (input?.plugin === "blocking-chat") {
+    return LayerNode.compile(root, [...replacements, [Plugin.node, blockingChatPlugin]])
+  }
   return LayerNode.compile(root, replacements)
 }
 
-function makeHttpNoLLMServer(input?: { mcpInstructions?: MCP.ServerInstructions[]; processor?: "blocking" }) {
+function makeHttpNoLLMServer(input?: {
+  mcpInstructions?: MCP.ServerInstructions[]
+  processor?: "blocking"
+  plugin?: "blocking-chat"
+}) {
   return makePrompt(input)
 }
 
 const it = testEffect(makeHttp())
 const noLLMServer = testEffect(makeHttpNoLLMServer())
 const raceNoLLMServer = testEffect(makeHttpNoLLMServer({ processor: "blocking" }))
+const blockingChatNoLLMServer = testEffect(makeHttpNoLLMServer({ plugin: "blocking-chat" }))
 const withMcpInstructions = testEffect(
   makeHttp({
     mcpInstructions: [
@@ -274,20 +312,27 @@ it.instance("cancel leaves detached exec sessions running until explicit stop", 
     const env = Object.fromEntries(
       Object.entries(process.env).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
     )
+    const shell = Shell.acceptable()
+    const command = Shell.ps(shell)
+      ? "Start-Sleep 30"
+      : Shell.name(shell) === "cmd"
+        ? "ping -n 31 127.0.0.1 >nul"
+        : "sleep 30"
     const launched = yield* execSessions.launch({
       command: "wait",
-      shell: process.execPath,
-      args: ["-e", "setInterval(() => {}, 50)"],
+      shell,
       cwd: test.directory,
       env,
+      laneID: 0,
       yieldTimeMs: 0,
       invocation,
+      prepare: () => Effect.succeed({ script: persistentShellScript(shell, { command }) }),
     })
     expect(launched.running).toBe(true)
 
     yield* prompt.cancel(chat.id)
     const afterCancel = yield* execSessions.write({
-      sessionID: launched.sessionID!,
+      execID: launched.execID!,
       yieldTimeMs: 0,
       invocation: { ...invocation, display: "poll" },
     })
@@ -338,13 +383,19 @@ it.instance("persists natural exit after the launching tool call is interrupted"
     const env = Object.fromEntries(
       Object.entries(process.env).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
     )
+    const shell = Shell.acceptable()
+    const command = Shell.ps(shell)
+      ? `& '${process.execPath.replaceAll("'", "''")}' -e 'setTimeout(() => process.exit(0), 300)'`
+      : Shell.name(shell) === "cmd"
+        ? `"${process.execPath.replaceAll('"', '""')}" -e "setTimeout(() => process.exit(0), 300)"`
+        : `'${process.execPath.replaceAll("'", `'\\''`)}' -e 'setTimeout(() => process.exit(0), 300)'`
     const fiber = yield* execSessions
       .launch({
         command: "exit later",
-        shell: process.execPath,
-        args: ["-e", "setTimeout(() => process.exit(0), 300)"],
+        shell,
         cwd: test.directory,
         env,
+        laneID: 0,
         yieldTimeMs: 30_000,
         invocation: {
           sessionID: chat.id,
@@ -353,7 +404,8 @@ it.instance("persists natural exit after the launching tool call is interrupted"
           display: "root",
           metadata: () => Effect.void,
         },
-        onSession: (sessionID) => Deferred.succeed(launched, sessionID).pipe(Effect.asVoid),
+        onExecutionStarted: (execID) => Deferred.succeed(launched, execID).pipe(Effect.asVoid),
+        prepare: () => Effect.succeed({ script: persistentShellScript(shell, { command }) }),
       })
       .pipe(Effect.forkScoped)
     yield* Deferred.await(launched)
@@ -363,17 +415,20 @@ it.instance("persists natural exit after the launching tool call is interrupted"
       Effect.gen(function* () {
         const current = yield* sessions.getPart({ sessionID: chat.id, messageID: message.id, partID: part.id })
         if (current?.type !== "tool" || current.state.status === "pending") return
-        return current.state.metadata?.processRunning === false ? current : undefined
+        return current.state.metadata?.processRunning === false && typeof current.state.metadata.durationMs === "number"
+          ? current
+          : undefined
       }),
       "interrupted launch watcher did not persist natural exit",
     )
     expect(updated.state.status).toBe("running")
     if (updated.state.status === "pending") return
     expect(updated.state.metadata?.exitCode).toBe(0)
+    expect(updated.state.metadata?.durationMs).toBeGreaterThan(0)
   }),
 )
 
-it.instance("reverted branch stop preserves exec sessions before the boundary", () =>
+it.instance("reverted branch stop closes all exec slots in the rewritten session", () =>
   Effect.gen(function* () {
     const prompt = yield* SessionPrompt.Service
     const sessions = yield* Session.Service
@@ -385,13 +440,19 @@ it.instance("reverted branch stop preserves exec sessions before the boundary", 
     const env = Object.fromEntries(
       Object.entries(process.env).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
     )
-    const launch = (messageID: MessageID) =>
-      execSessions.launch({
+    const launch = (messageID: MessageID, laneID: number) => {
+      const shell = Shell.acceptable()
+      const command = Shell.ps(shell)
+        ? "Start-Sleep 30"
+        : Shell.name(shell) === "cmd"
+          ? "ping -n 31 127.0.0.1 >nul"
+          : "sleep 30"
+      return execSessions.launch({
         command: "wait",
-        shell: process.execPath,
-        args: ["-e", "setInterval(() => {}, 50)"],
+        shell,
         cwd: test.directory,
         env,
+        laneID,
         yieldTimeMs: 0,
         invocation: {
           sessionID: chat.id,
@@ -399,14 +460,16 @@ it.instance("reverted branch stop preserves exec sessions before the boundary", 
           display: "root",
           metadata: () => Effect.void,
         },
+        prepare: () => Effect.succeed({ script: persistentShellScript(shell, { command }) }),
       })
-    const retainedExec = yield* launch(retained.id)
-    const hiddenExec = yield* launch(boundary.id)
+    }
+    const retainedExec = yield* launch(retained.id, 0)
+    const hiddenExec = yield* launch(boundary.id, 1)
 
     const stopped = yield* prompt.stop({ sessionID: chat.id, scope: "reverted-branch", messageID: boundary.id })
-    expect(stopped).toEqual({ sessions: 1, matched: 1, terminated: 1, failed: 0 })
+    expect(stopped).toEqual({ sessions: 1, matched: 2, terminated: 2, failed: 0 })
     const retainedResult = yield* execSessions.write({
-      sessionID: retainedExec.sessionID!,
+      execID: retainedExec.execID!,
       yieldTimeMs: 0,
       invocation: {
         sessionID: chat.id,
@@ -416,7 +479,7 @@ it.instance("reverted branch stop preserves exec sessions before the boundary", 
       },
     })
     const hiddenResult = yield* execSessions.write({
-      sessionID: hiddenExec.sessionID!,
+      execID: hiddenExec.execID!,
       yieldTimeMs: 0,
       invocation: {
         sessionID: chat.id,
@@ -425,17 +488,8 @@ it.instance("reverted branch stop preserves exec sessions before the boundary", 
         metadata: () => Effect.void,
       },
     })
-    expect(retainedResult.running).toBe(true)
+    expect(retainedResult.running).toBe(false)
     expect(hiddenResult.running).toBe(false)
-    yield* execSessions.terminate({
-      sessionID: retainedExec.sessionID!,
-      invocation: {
-        sessionID: chat.id,
-        messageID: retained.id,
-        display: "terminate",
-        metadata: () => Effect.void,
-      },
-    })
   }),
 )
 
@@ -454,41 +508,54 @@ it.instance("reverted branch stop preserves an unrelated existing child session"
     const env = Object.fromEntries(
       Object.entries(process.env).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
     )
-    const launch = (sessionID: SessionID, messageID: MessageID) =>
-      execSessions.launch({
+    const launch = (sessionID: SessionID, messageID: MessageID) => {
+      const shell = Shell.acceptable()
+      const command = Shell.ps(shell)
+        ? "Start-Sleep 30"
+        : Shell.name(shell) === "cmd"
+          ? "ping -n 31 127.0.0.1 >nul"
+          : "sleep 30"
+      return execSessions.launch({
         command: "wait",
-        shell: process.execPath,
-        args: ["-e", "setInterval(() => {}, 50)"],
+        shell,
         cwd: test.directory,
         env,
+        laneID: 0,
         yieldTimeMs: 0,
         invocation: { sessionID, messageID, display: "root", metadata: () => Effect.void },
+        prepare: () => Effect.succeed({ script: persistentShellScript(shell, { command }) }),
       })
+    }
     const siblingExec = yield* launch(sibling.id, siblingMessage.id)
     const hiddenExec = yield* launch(chat.id, boundary.id)
 
     const stopped = yield* prompt.stop({ sessionID: chat.id, scope: "reverted-branch", messageID: boundary.id })
     expect(stopped).toEqual({ sessions: 1, matched: 1, terminated: 1, failed: 0 })
     const siblingResult = yield* execSessions.write({
-      sessionID: siblingExec.sessionID!,
+      execID: siblingExec.execID!,
       yieldTimeMs: 0,
       invocation: { sessionID: sibling.id, messageID: siblingMessage.id, display: "poll", metadata: () => Effect.void },
     })
     const hiddenResult = yield* execSessions.write({
-      sessionID: hiddenExec.sessionID!,
+      execID: hiddenExec.execID!,
       yieldTimeMs: 0,
       invocation: { sessionID: chat.id, messageID: boundary.id, display: "poll", metadata: () => Effect.void },
     })
     expect(siblingResult.running).toBe(true)
     expect(hiddenResult.running).toBe(false)
     yield* execSessions.terminate({
-      sessionID: siblingExec.sessionID!,
-      invocation: { sessionID: sibling.id, messageID: siblingMessage.id, display: "terminate", metadata: () => Effect.void },
+      execID: siblingExec.execID!,
+      invocation: {
+        sessionID: sibling.id,
+        messageID: siblingMessage.id,
+        display: "terminate",
+        metadata: () => Effect.void,
+      },
     })
   }),
 )
 
-it.instance("reverted branch stop preserves earlier exec when first resuming an existing child", () =>
+it.instance("reverted branch stop closes all exec slots when first rewriting an existing child", () =>
   Effect.gen(function* () {
     const prompt = yield* SessionPrompt.Service
     const sessions = yield* Session.Service
@@ -536,41 +603,45 @@ it.instance("reverted branch stop preserves earlier exec when first resuming an 
     const env = Object.fromEntries(
       Object.entries(process.env).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
     )
-    const launch = (messageID: MessageID) =>
-      execSessions.launch({
+    const launch = (messageID: MessageID, laneID: number) => {
+      const shell = Shell.acceptable()
+      const command = Shell.ps(shell)
+        ? "Start-Sleep 30"
+        : Shell.name(shell) === "cmd"
+          ? "ping -n 31 127.0.0.1 >nul"
+          : "sleep 30"
+      return execSessions.launch({
         command: "wait",
-        shell: process.execPath,
-        args: ["-e", "setInterval(() => {}, 50)"],
+        shell,
         cwd: test.directory,
         env,
+        laneID,
         yieldTimeMs: 0,
         invocation: { sessionID: child.id, messageID, display: "root", metadata: () => Effect.void },
+        prepare: () => Effect.succeed({ script: persistentShellScript(shell, { command }) }),
       })
-    const retainedExec = yield* launch(childRetained.id)
-    const hiddenExec = yield* launch(childHidden.id)
+    }
+    const retainedExec = yield* launch(childRetained.id, 0)
+    const hiddenExec = yield* launch(childHidden.id, 1)
 
     const stopped = yield* prompt.stop({ sessionID: chat.id, scope: "reverted-branch", messageID: boundary.id })
-    expect(stopped).toEqual({ sessions: 2, matched: 1, terminated: 1, failed: 0 })
+    expect(stopped).toEqual({ sessions: 2, matched: 2, terminated: 2, failed: 0 })
     const retainedResult = yield* execSessions.write({
-      sessionID: retainedExec.sessionID!,
+      execID: retainedExec.execID!,
       yieldTimeMs: 0,
       invocation: { sessionID: child.id, messageID: childRetained.id, display: "poll", metadata: () => Effect.void },
     })
     const hiddenResult = yield* execSessions.write({
-      sessionID: hiddenExec.sessionID!,
+      execID: hiddenExec.execID!,
       yieldTimeMs: 0,
       invocation: { sessionID: child.id, messageID: childHidden.id, display: "poll", metadata: () => Effect.void },
     })
-    expect(retainedResult.running).toBe(true)
+    expect(retainedResult.running).toBe(false)
     expect(hiddenResult.running).toBe(false)
-    yield* execSessions.terminate({
-      sessionID: retainedExec.sessionID!,
-      invocation: { sessionID: child.id, messageID: childRetained.id, display: "terminate", metadata: () => Effect.void },
-    })
   }),
 )
 
-it.instance("reverted branch stop preserves earlier exec in a resumed child session", () =>
+it.instance("reverted branch stop closes all exec slots in a rewritten child session", () =>
   Effect.gen(function* () {
     const prompt = yield* SessionPrompt.Service
     const sessions = yield* Session.Service
@@ -641,37 +712,41 @@ it.instance("reverted branch stop preserves earlier exec in a resumed child sess
     const env = Object.fromEntries(
       Object.entries(process.env).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
     )
-    const launch = (messageID: MessageID) =>
-      execSessions.launch({
+    const launch = (messageID: MessageID, laneID: number) => {
+      const shell = Shell.acceptable()
+      const command = Shell.ps(shell)
+        ? "Start-Sleep 30"
+        : Shell.name(shell) === "cmd"
+          ? "ping -n 31 127.0.0.1 >nul"
+          : "sleep 30"
+      return execSessions.launch({
         command: "wait",
-        shell: process.execPath,
-        args: ["-e", "setInterval(() => {}, 50)"],
+        shell,
         cwd: test.directory,
         env,
+        laneID,
         yieldTimeMs: 0,
         invocation: { sessionID: child.id, messageID, display: "root", metadata: () => Effect.void },
+        prepare: () => Effect.succeed({ script: persistentShellScript(shell, { command }) }),
       })
-    const retainedExec = yield* launch(childRetained.id)
-    const hiddenExec = yield* launch(childHidden.id)
+    }
+    const retainedExec = yield* launch(childRetained.id, 0)
+    const hiddenExec = yield* launch(childHidden.id, 1)
 
     const stopped = yield* prompt.stop({ sessionID: chat.id, scope: "reverted-branch", messageID: boundary.id })
-    expect(stopped).toEqual({ sessions: 2, matched: 1, terminated: 1, failed: 0 })
+    expect(stopped).toEqual({ sessions: 2, matched: 2, terminated: 2, failed: 0 })
     const retainedResult = yield* execSessions.write({
-      sessionID: retainedExec.sessionID!,
+      execID: retainedExec.execID!,
       yieldTimeMs: 0,
       invocation: { sessionID: child.id, messageID: childRetained.id, display: "poll", metadata: () => Effect.void },
     })
     const hiddenResult = yield* execSessions.write({
-      sessionID: hiddenExec.sessionID!,
+      execID: hiddenExec.execID!,
       yieldTimeMs: 0,
       invocation: { sessionID: child.id, messageID: childHidden.id, display: "poll", metadata: () => Effect.void },
     })
-    expect(retainedResult.running).toBe(true)
+    expect(retainedResult.running).toBe(false)
     expect(hiddenResult.running).toBe(false)
-    yield* execSessions.terminate({
-      sessionID: retainedExec.sessionID!,
-      invocation: { sessionID: child.id, messageID: childRetained.id, display: "terminate", metadata: () => Effect.void },
-    })
   }),
 )
 
@@ -1915,6 +1990,121 @@ it.instance("prompt submitted during an active run is included in the next LLM i
   }),
 )
 
+it.instance("prompt admitted while an old run finishes starts a follow-up run", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const run = yield* SessionRunState.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+    const previous = yield* seed(chat.id, { finish: "stop" })
+    const previousMessage = (yield* sessions.messages({ sessionID: chat.id })).find(
+      (message) => message.info.id === previous.assistant.id,
+    )
+    if (!previousMessage) throw new Error("missing previous assistant")
+    const started = yield* Deferred.make<void>()
+    const release = yield* Deferred.make<void>()
+    const old = yield* run
+      .ensureRunning(
+        chat.id,
+        Effect.succeed(previousMessage),
+        Deferred.succeed(started, undefined).pipe(
+          Effect.andThen(Deferred.await(release)),
+          Effect.as(previousMessage),
+        ),
+      )
+      .pipe(Effect.forkChild)
+    yield* Deferred.await(started)
+    yield* llm.text("fresh reply")
+
+    const messageID = MessageID.ascending()
+    const next = yield* prompt
+      .prompt({
+        sessionID: chat.id,
+        messageID,
+        agent: "build",
+        model: ref,
+        parts: [{ type: "text", text: "fresh prompt" }],
+      })
+      .pipe(Effect.forkChild)
+    yield* pollWithTimeout(
+      sessions
+        .messages({ sessionID: chat.id })
+        .pipe(Effect.map((messages) => (messages.some((message) => message.info.id === messageID) ? true : undefined))),
+      "timed out waiting for follow-up admission",
+    )
+    yield* Deferred.succeed(release, undefined)
+
+    yield* Fiber.join(old)
+    const result = yield* Fiber.join(next)
+    expect(result.info.role).toBe("assistant")
+    if (result.info.role === "assistant") expect(result.info.parentID).toBe(messageID)
+    expect(result.parts.some((part) => part.type === "text" && part.text === "fresh reply")).toBe(true)
+    expect(yield* llm.calls).toBe(1)
+  }),
+)
+
+it.instance("revert cannot commit after a new prompt message is admitted", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const revert = yield* SessionRevert.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+    const previous = yield* seed(chat.id, { finish: "stop" })
+    const nextID = MessageID.ascending()
+    yield* llm.hang
+
+    const running = yield* prompt
+      .prompt({
+        sessionID: chat.id,
+        messageID: nextID,
+        agent: "build",
+        model: ref,
+        parts: [{ type: "text", text: "next" }],
+      })
+      .pipe(Effect.forkChild)
+
+    yield* pollWithTimeout(
+      sessions
+        .messages({ sessionID: chat.id })
+        .pipe(Effect.map((msgs) => (msgs.some((msg) => msg.info.id === nextID) ? true : undefined))),
+      "timed out waiting for prompt admission",
+    )
+    const exit = yield* revert.revert({ sessionID: chat.id, messageID: previous.user.id }).pipe(Effect.exit)
+
+    expect(Exit.isFailure(exit)).toBe(true)
+    if (Exit.isFailure(exit)) expect(Cause.squash(exit.cause)).toBeInstanceOf(Session.BusyError)
+    expect((yield* sessions.get(chat.id)).revert).toBeUndefined()
+
+    yield* prompt.cancel(chat.id)
+    yield* Fiber.await(running)
+  }),
+)
+
+it.instance("manual summarize claims the runner before exposing its compaction message", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const run = yield* SessionRunState.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+    yield* seed(chat.id, { finish: "stop" })
+    yield* llm.hang
+
+    const fiber = yield* prompt
+      .summarize({ sessionID: chat.id, model: ref, auto: false })
+      .pipe(Effect.forkChild)
+    yield* llm.wait(1)
+    const messages = yield* sessions.messages({ sessionID: chat.id })
+    expect(messages.some((message) => message.parts.some((part) => part.type === "compaction"))).toBe(true)
+    expect(Exit.isFailure(yield* run.assertNotBusy(chat.id).pipe(Effect.exit))).toBe(true)
+
+    yield* prompt.cancel(chat.id)
+    yield* Fiber.await(fiber)
+  }),
+)
+
 it.instance("assertNotBusy fails with BusyError when loop running", () =>
   Effect.gen(function* () {
     const { llm } = yield* useServerConfig(providerCfg)
@@ -1950,6 +2140,221 @@ noLLMServer.instance("assertNotBusy succeeds when idle", () =>
     const chat = yield* sessions.create({})
     const exit = yield* run.assertNotBusy(chat.id).pipe(Effect.exit)
     expect(Exit.isSuccess(exit)).toBe(true)
+  }),
+)
+
+noLLMServer.instance("session mutations serialize per session", () =>
+  Effect.gen(function* () {
+    const run = yield* SessionRunState.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({})
+    const entered = yield* Deferred.make<void>()
+    const release = yield* Deferred.make<void>()
+    const second = yield* Deferred.make<void>()
+
+    const firstFiber = yield* run
+      .withMutation(chat.id)(
+        Effect.gen(function* () {
+          yield* Deferred.succeed(entered, undefined)
+          yield* Deferred.await(release)
+        }),
+      )
+      .pipe(Effect.forkChild)
+    yield* Deferred.await(entered)
+    const secondFiber = yield* run
+      .withMutation(chat.id)(Deferred.succeed(second, undefined).pipe(Effect.asVoid))
+      .pipe(Effect.forkChild)
+
+    yield* Effect.yieldNow
+    expect(yield* Deferred.isDone(second)).toBe(false)
+    yield* Deferred.succeed(release, undefined)
+    yield* Fiber.join(firstFiber)
+    yield* Fiber.join(secondFiber)
+    expect(yield* Deferred.isDone(second)).toBe(true)
+  }),
+)
+
+noLLMServer.instance("idle cleanup holds the mutation gate before a new runner can start", () =>
+  Effect.gen(function* () {
+    const run = yield* SessionRunState.Service
+    const sessions = yield* Session.Service
+    const events = yield* EventV2Bridge.Service
+    const chat = yield* sessions.create({})
+    const idleEntered = yield* Deferred.make<void>()
+    const releaseIdle = yield* Deferred.make<void>()
+    const secondStarted = yield* Deferred.make<void>()
+    const releaseSecond = yield* Deferred.make<void>()
+    let blockIdle = true
+    const unsubscribe = yield* events.listen((event) => {
+      if (event.type !== SessionStatus.Event.Status.type) return Effect.void
+      const data = event.data as typeof SessionStatus.Event.Status.data.Type
+      if (data.sessionID !== chat.id || data.status.type !== "idle" || !blockIdle) return Effect.void
+      blockIdle = false
+      return Deferred.succeed(idleEntered, undefined).pipe(Effect.andThen(Deferred.await(releaseIdle)))
+    })
+    yield* Effect.addFinalizer(() => unsubscribe)
+
+    const first = yield* run
+      .ensureRunning(chat.id, Effect.die("unused interrupt"), Effect.succeed({} as SessionV1.WithParts))
+      .pipe(Effect.forkChild)
+    yield* Deferred.await(idleEntered)
+    const second = yield* run
+      .ensureRunning(
+        chat.id,
+        Effect.die("unused interrupt"),
+        Deferred.succeed(secondStarted, undefined).pipe(
+          Effect.andThen(Deferred.await(releaseSecond)),
+          Effect.as({} as SessionV1.WithParts),
+        ),
+      )
+      .pipe(Effect.forkChild)
+
+    yield* Effect.yieldNow
+    expect(yield* Deferred.isDone(secondStarted)).toBe(false)
+    yield* Deferred.succeed(releaseIdle, undefined)
+    yield* Fiber.join(first)
+    yield* Deferred.await(secondStarted).pipe(Effect.timeout("250 millis"))
+    expect(Exit.isFailure(yield* run.assertNotBusy(chat.id).pipe(Effect.exit))).toBe(true)
+
+    yield* Deferred.succeed(releaseSecond, undefined)
+    yield* Fiber.join(second)
+  }),
+)
+
+noLLMServer.instance("status notification defects preserve local runner state", () =>
+  Effect.gen(function* () {
+    const run = yield* SessionRunState.Service
+    const sessions = yield* Session.Service
+    const events = yield* EventV2Bridge.Service
+    const status = yield* SessionStatus.Service
+    const chat = yield* sessions.create({})
+    const entered = yield* Deferred.make<void>()
+    const release = yield* Deferred.make<void>()
+    const unsubscribe = yield* events.listen((event) => {
+      if (event.type !== SessionStatus.Event.Status.type) return Effect.void
+      const data = event.data as typeof SessionStatus.Event.Status.data.Type
+      return data.sessionID === chat.id ? Effect.die(`${data.status.type} status failed`) : Effect.void
+    })
+    yield* Effect.addFinalizer(() => unsubscribe)
+
+    const shell = yield* run
+      .startShell(
+        chat.id,
+        Effect.die("unused interrupt"),
+        Deferred.succeed(entered, undefined).pipe(
+          Effect.andThen(Deferred.await(release)),
+          Effect.as({} as SessionV1.WithParts),
+        ),
+      )
+      .pipe(Effect.forkChild)
+    yield* Deferred.await(entered).pipe(Effect.timeout("250 millis"))
+    expect((yield* status.get(chat.id)).type).toBe("busy")
+
+    yield* Deferred.succeed(release, undefined)
+    yield* Fiber.join(shell).pipe(Effect.timeout("250 millis"))
+    expect((yield* status.get(chat.id)).type).toBe("idle")
+    expect(Exit.isSuccess(yield* run.assertNotBusy(chat.id).pipe(Effect.exit))).toBe(true)
+    yield* run.withMutation(chat.id)(Effect.void).pipe(Effect.timeout("250 millis"))
+  }),
+)
+
+noLLMServer.instance("shell keeps the session mutation gate until its initial messages are durable", () =>
+  Effect.gen(function* () {
+    const run = yield* SessionRunState.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({})
+    const previous = yield* seed(chat.id, { finish: "stop" })
+    const fallback = (yield* sessions.messages({ sessionID: chat.id })).find(
+      (message) => message.info.id === previous.assistant.id,
+    )
+    if (!fallback) throw new Error("missing fallback assistant")
+    const ready = yield* Latch.make()
+    const entered = yield* Deferred.make<void>()
+    const release = yield* Deferred.make<void>()
+    const mutation = yield* Deferred.make<void>()
+
+    const shell = yield* run
+      .startShell(
+        chat.id,
+        Effect.succeed(fallback),
+        Deferred.succeed(entered, undefined).pipe(
+          Effect.andThen(Deferred.await(release)),
+          Effect.andThen(ready.open),
+          Effect.as(fallback),
+        ),
+        ready,
+      )
+      .pipe(Effect.forkChild)
+    yield* Deferred.await(entered)
+    const waiting = yield* run
+      .withMutation(chat.id)(Deferred.succeed(mutation, undefined).pipe(Effect.asVoid))
+      .pipe(Effect.forkChild)
+
+    yield* Effect.yieldNow
+    expect(yield* Deferred.isDone(mutation)).toBe(false)
+    yield* Deferred.succeed(release, undefined)
+    yield* Fiber.join(shell)
+    yield* Fiber.join(waiting)
+    expect(yield* Deferred.isDone(mutation)).toBe(true)
+  }),
+)
+
+it.instance("loop waits for the session mutation gate before claiming the runner", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const run = yield* SessionRunState.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({})
+    yield* user(chat.id, "resume")
+    yield* llm.hang
+    const entered = yield* Deferred.make<void>()
+    const release = yield* Deferred.make<void>()
+    const holder = yield* run
+      .withMutation(chat.id)(
+        Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release))),
+      )
+      .pipe(Effect.forkChild)
+    yield* Deferred.await(entered)
+
+    const loop = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+    yield* Effect.yieldNow
+    expect(Exit.isSuccess(yield* run.assertNotBusy(chat.id).pipe(Effect.exit))).toBe(true)
+
+    yield* Deferred.succeed(release, undefined)
+    yield* Fiber.join(holder)
+    yield* llm.wait(1)
+    expect(Exit.isFailure(yield* run.assertNotBusy(chat.id).pipe(Effect.exit))).toBe(true)
+
+    yield* prompt.cancel(chat.id)
+    yield* Fiber.await(loop)
+  }),
+)
+
+blockingChatNoLLMServer.instance("prompt preparation does not hold the session mutation gate", () =>
+  Effect.gen(function* () {
+    const prompt = yield* SessionPrompt.Service
+    const run = yield* SessionRunState.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({})
+    const entered = yield* Deferred.make<void>()
+    const release = yield* Deferred.make<void>()
+    chatMessageBlocks.push({ entered, release })
+
+    const preparing = yield* prompt
+      .prompt({
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        noReply: true,
+        parts: [{ type: "text", text: "slow plugin" }],
+      })
+      .pipe(Effect.forkChild)
+    yield* Deferred.await(entered)
+    yield* run.withMutation(chat.id)(Effect.void).pipe(Effect.timeout("250 millis"))
+
+    yield* Deferred.succeed(release, undefined)
+    yield* Fiber.join(preparing)
   }),
 )
 

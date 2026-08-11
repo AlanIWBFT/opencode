@@ -184,6 +184,7 @@ function replayMessage(
     data,
     {
       id: `bootstrap:message:${message.info.id}`,
+      seq: message.info.seq,
       type: "message.updated",
       properties: {
         sessionID: message.info.sessionID,
@@ -202,6 +203,7 @@ function replayMessage(
       data,
       {
         id: `bootstrap:part:${part.id}`,
+        seq: part.seq,
         type: "message.part.updated",
         properties: {
           sessionID: part.sessionID,

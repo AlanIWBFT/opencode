@@ -16,6 +16,7 @@ import eventSourcedSessionInputMigration from "@opencode-ai/core/database/migrat
 import contextEpochAgentMigration from "@opencode-ai/core/database/migration/20260605042240_add_context_epoch_agent"
 import simplifyIntegrationCredentialsMigration from "@opencode-ai/core/database/migration/20260611192811_lush_chimera"
 import simplifySessionInputMigration from "@opencode-ai/core/database/migration/20260622202450_simplify_session_input"
+import { LocalDatabaseMigration } from "@opencode-ai/core/database/local-migration"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { EventV2 } from "@opencode-ai/core/event"
@@ -174,6 +175,404 @@ describe("DatabaseMigration", () => {
     ).rejects.toThrow("Database is not empty and has no session table")
   })
 
+  test("repairs and backfills local legacy message and part order", async () => {
+    await run(
+      Effect.gen(function* () {
+        const db = yield* makeDb
+        yield* db.run(sql`CREATE TABLE session (id text PRIMARY KEY)`)
+        yield* db.run(
+          sql`CREATE TABLE message (id text PRIMARY KEY, session_id text NOT NULL REFERENCES session(id) ON DELETE CASCADE, time_created integer NOT NULL, time_updated integer NOT NULL, data text NOT NULL)`,
+        )
+        yield* db.run(
+          sql`CREATE TABLE part (id text PRIMARY KEY, message_id text NOT NULL REFERENCES message(id) ON DELETE CASCADE, session_id text NOT NULL, time_created integer NOT NULL, time_updated integer NOT NULL, data text NOT NULL)`,
+        )
+        yield* db.run(
+          sql`CREATE TABLE event (id text PRIMARY KEY, aggregate_id text NOT NULL, seq integer NOT NULL, type text NOT NULL, data text NOT NULL)`,
+        )
+        yield* db.run(sql`INSERT INTO session (id) VALUES ('ses_a'), ('ses_b')`)
+        yield* db.run(
+          sql`INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES ('msg_a1', 'ses_a', 3, 3, '{"role":"assistant","parentID":"msg_a2"}'), ('msg_b1', 'ses_b', 1, 1, '{"role":"user"}'), ('msg_a2', 'ses_a', 2, 2, '{"role":"user"}'), ('msg_orphan', 'ses_a', 4, 4, '{"role":"assistant","parentID":"msg_missing"}'), ('msg_invalid_json', 'ses_a', 5, 5, '{'), ('msg_invalid_role', 'ses_a', 6, 6, '{}')`,
+        )
+        yield* db.run(
+          sql`INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES ('part_a1', 'msg_a1', 'ses_a', 3, 3, '{}'), ('part_b1', 'msg_b1', 'ses_b', 1, 1, '{}'), ('part_a2', 'msg_a2', 'ses_b', 2, 2, '{}'), ('part_orphan', 'msg_missing', 'ses_a', 4, 4, '{}'), ('part_deleted', 'msg_orphan', 'ses_a', 4, 4, '{}')`,
+        )
+        yield* db.run(sql`PRAGMA foreign_keys = ON`)
+
+        yield* LocalDatabaseMigration.apply(db)
+
+        expect(yield* db.all(sql`SELECT message_id AS id, seq FROM local_message_order ORDER BY session_id, seq`)).toEqual([
+          { id: "msg_a2", seq: -2 },
+          { id: "msg_a1", seq: -1 },
+          { id: "msg_b1", seq: -1 },
+        ])
+        expect(yield* db.all(sql`SELECT part_id AS id, seq FROM local_part_order ORDER BY session_id, seq`)).toEqual([
+          { id: "part_a1", seq: -2 },
+          { id: "part_a2", seq: -1 },
+          { id: "part_b1", seq: -1 },
+        ])
+        expect(yield* db.all(sql`SELECT id, session_id FROM part ORDER BY id`)).toEqual([
+          { id: "part_a1", session_id: "ses_a" },
+          { id: "part_a2", session_id: "ses_a" },
+          { id: "part_b1", session_id: "ses_b" },
+        ])
+        expect(yield* db.all(sql`SELECT reason FROM local_message_repair_log ORDER BY id`)).toEqual([
+          { reason: "parent_message_deleted" },
+          { reason: "assistant_parent_missing" },
+          { reason: "invalid_message_json" },
+          { reason: "invalid_message_role" },
+          { reason: "message_missing" },
+          { reason: "session_corrected" },
+        ])
+        expect(yield* db.all(sql`PRAGMA foreign_key_check`)).toEqual([])
+        expect(yield* db.all(sql`PRAGMA foreign_key_list(part)`)).toEqual([
+          expect.objectContaining({ table: "message", from: "message_id", to: "id", on_delete: "CASCADE" }),
+        ])
+        yield* db.run(
+          sql`INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES ('msg_a3', 'ses_a', 4, 4, '{"role":"user"}')`,
+        )
+        yield* db.run(
+          sql`INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES ('part_a3', 'msg_a3', 'ses_a', 4, 4, '{}')`,
+        )
+        yield* LocalDatabaseMigration.apply(db)
+        expect(yield* db.all(sql`SELECT message_id AS id, seq FROM local_message_order WHERE session_id = 'ses_a' ORDER BY seq`)).toEqual([
+          { id: "msg_a2", seq: -2 },
+          { id: "msg_a1", seq: -1 },
+          { id: "msg_a3", seq: 0 },
+        ])
+        expect(yield* db.get(sql`SELECT seq FROM local_part_order WHERE part_id = 'part_a3'`)).toEqual({ seq: 0 })
+        expect(yield* db.get(sql`SELECT count(*) AS count FROM local_migration`)).toEqual({ count: 1 })
+        expect(yield* db.get(sql`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'migration'`)).toBeUndefined()
+
+        yield* db.run(sql`DELETE FROM part WHERE id = 'part_a3'`)
+        yield* db.run(sql`DELETE FROM message WHERE id = 'msg_a3'`)
+        yield* LocalDatabaseMigration.apply(db)
+        expect(yield* db.get(sql`SELECT part_id FROM local_part_order WHERE part_id = 'part_a3'`)).toBeUndefined()
+        expect(yield* db.get(sql`SELECT message_id FROM local_message_order WHERE message_id = 'msg_a3'`)).toBeUndefined()
+      }),
+    )
+  })
+
+  test("uses row insertion order and removes invalid assistant parents", async () => {
+    await run(
+      Effect.gen(function* () {
+        const db = yield* makeDb
+        yield* db.run(sql`CREATE TABLE session (id text PRIMARY KEY)`)
+        yield* db.run(
+          sql`CREATE TABLE message (id text PRIMARY KEY, session_id text NOT NULL REFERENCES session(id) ON DELETE CASCADE, time_created integer NOT NULL, time_updated integer NOT NULL, data text NOT NULL)`,
+        )
+        yield* db.run(
+          sql`CREATE TABLE part (id text PRIMARY KEY, message_id text NOT NULL REFERENCES message(id) ON DELETE CASCADE, session_id text NOT NULL, time_created integer NOT NULL, time_updated integer NOT NULL, data text NOT NULL)`,
+        )
+        yield* db.run(
+          sql`CREATE TABLE event (id text PRIMARY KEY, aggregate_id text NOT NULL, seq integer NOT NULL, type text NOT NULL, data text NOT NULL)`,
+        )
+        yield* db.run(sql`INSERT INTO session (id) VALUES ('session')`)
+        yield* db.run(
+          sql`INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES ('msg_z', 'session', 1, 1, '{"role":"user"}'), ('msg_a', 'session', 1, 1, '{"role":"user"}'), ('msg_orphan', 'session', 2, 2, '{"role":"assistant","parentID":"msg_removed"}')`,
+        )
+        yield* db.run(
+          sql`INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES ('part_z', 'msg_a', 'session', 1, 1, '{}'), ('part_a', 'msg_a', 'session', 1, 1, '{}')`,
+        )
+
+        yield* LocalDatabaseMigration.apply(db)
+
+        expect(yield* db.all(sql`SELECT message_id AS id, seq FROM local_message_order ORDER BY seq`)).toEqual([
+          { id: "msg_z", seq: -2 },
+          { id: "msg_a", seq: -1 },
+        ])
+        expect(yield* db.all(sql`SELECT part_id AS id, seq FROM local_part_order ORDER BY seq`)).toEqual([
+          { id: "part_z", seq: -2 },
+          { id: "part_a", seq: -1 },
+        ])
+        expect(yield* db.get(sql`SELECT id FROM message WHERE id = 'msg_orphan'`)).toBeUndefined()
+      }),
+    )
+  })
+
+  test("removes cross-session, invalid-role, and cyclic assistant parents", async () => {
+    await run(
+      Effect.gen(function* () {
+        const db = yield* makeDb
+        yield* db.run(sql`CREATE TABLE session (id text PRIMARY KEY)`)
+        yield* db.run(
+          sql`CREATE TABLE message (id text PRIMARY KEY, session_id text NOT NULL, time_created integer NOT NULL, time_updated integer NOT NULL, data text NOT NULL)`,
+        )
+        yield* db.run(
+          sql`CREATE TABLE part (id text PRIMARY KEY, message_id text NOT NULL, session_id text NOT NULL, time_created integer NOT NULL, time_updated integer NOT NULL, data text NOT NULL)`,
+        )
+        yield* db.run(sql`INSERT INTO session (id) VALUES ('ses_a'), ('ses_b')`)
+        yield* db.run(sql`
+          INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES
+            ('user_a', 'ses_a', 1, 1, '{"role":"user"}'),
+            ('cross_session', 'ses_b', 2, 2, '{"role":"assistant","parentID":"user_a"}'),
+            ('cycle_a', 'ses_a', 3, 3, '{"role":"assistant","parentID":"cycle_b"}'),
+            ('cycle_b', 'ses_a', 4, 4, '{"role":"assistant","parentID":"cycle_a"}')
+        `)
+
+        yield* LocalDatabaseMigration.apply(db)
+
+        expect(yield* db.all(sql`SELECT id FROM message ORDER BY id`)).toEqual([{ id: "user_a" }])
+        expect(yield* db.all(sql`SELECT reason FROM local_message_repair_log ORDER BY id`)).toEqual([
+          { reason: "assistant_parent_session_mismatch" },
+          { reason: "assistant_parent_not_user" },
+          { reason: "assistant_parent_not_user" },
+        ])
+      }),
+    )
+  })
+
+  test("moves a legacy assistant after its parent", async () => {
+    await run(
+      Effect.gen(function* () {
+        const db = yield* makeDb
+        yield* db.run(sql`CREATE TABLE session (id text PRIMARY KEY)`)
+        yield* db.run(
+          sql`CREATE TABLE message (id text PRIMARY KEY, session_id text NOT NULL, time_created integer NOT NULL, time_updated integer NOT NULL, data text NOT NULL)`,
+        )
+        yield* db.run(
+          sql`CREATE TABLE part (id text PRIMARY KEY, message_id text NOT NULL, session_id text NOT NULL, time_created integer NOT NULL, time_updated integer NOT NULL, data text NOT NULL)`,
+        )
+        yield* db.run(
+          sql`CREATE TABLE event (id text PRIMARY KEY, aggregate_id text NOT NULL, seq integer NOT NULL, type text NOT NULL, data text NOT NULL)`,
+        )
+        yield* db.run(sql`INSERT INTO session (id) VALUES ('session')`)
+        yield* db.run(
+          sql`INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES ('child', 'session', 1, 1, '{"role":"assistant","parentID":"parent"}'), ('parent', 'session', 2, 2, '{"role":"user"}')`,
+        )
+
+        yield* LocalDatabaseMigration.apply(db)
+        expect(yield* db.all(sql`SELECT message_id AS id, seq FROM local_message_order ORDER BY seq`)).toEqual([
+          { id: "parent", seq: -2 },
+          { id: "child", seq: -1 },
+        ])
+      }),
+    )
+  })
+
+  test("reconciles a parent sidecar restored after its assistant", async () => {
+    await run(
+      Effect.gen(function* () {
+        const db = yield* makeDb
+        yield* db.run(sql`CREATE TABLE session (id text PRIMARY KEY)`)
+        yield* db.run(
+          sql`CREATE TABLE message (id text PRIMARY KEY, session_id text NOT NULL, time_created integer NOT NULL, time_updated integer NOT NULL, data text NOT NULL)`,
+        )
+        yield* db.run(
+          sql`CREATE TABLE part (id text PRIMARY KEY, message_id text NOT NULL, session_id text NOT NULL, time_created integer NOT NULL, time_updated integer NOT NULL, data text NOT NULL)`,
+        )
+        yield* db.run(sql`INSERT INTO session (id) VALUES ('session')`)
+        yield* db.run(
+          sql`INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES ('parent', 'session', 1, 1, '{"role":"user"}'), ('child', 'session', 2, 2, '{"role":"assistant","parentID":"parent"}')`,
+        )
+        yield* LocalDatabaseMigration.apply(db)
+        yield* db.run(sql`DELETE FROM local_message_order WHERE message_id = 'parent'`)
+
+        yield* LocalDatabaseMigration.apply(db)
+
+        expect(yield* db.all(sql`SELECT message_id AS id, seq FROM local_message_order ORDER BY seq`)).toEqual([
+          { id: "parent", seq: 0 },
+          { id: "child", seq: 1 },
+        ])
+      }),
+    )
+  })
+
+  test("rolls back local tables when final validation fails", async () => {
+    await run(
+      Effect.gen(function* () {
+        const db = yield* makeDb
+        yield* db.run(sql`PRAGMA foreign_keys = OFF`)
+        yield* db.run(sql`CREATE TABLE session (id text PRIMARY KEY)`)
+        yield* db.run(sql`CREATE TABLE owner (id text PRIMARY KEY)`)
+        yield* db.run(
+          sql`CREATE TABLE message (id text PRIMARY KEY, session_id text NOT NULL, owner_id text REFERENCES owner(id), time_created integer NOT NULL, time_updated integer NOT NULL, data text NOT NULL)`,
+        )
+        yield* db.run(
+          sql`CREATE TABLE part (id text PRIMARY KEY, message_id text NOT NULL, session_id text NOT NULL, time_created integer NOT NULL, time_updated integer NOT NULL, data text NOT NULL)`,
+        )
+        yield* db.run(sql`INSERT INTO session (id) VALUES ('session')`)
+        yield* db.run(
+          sql`INSERT INTO message (id, session_id, owner_id, time_created, time_updated, data) VALUES ('message', 'session', 'missing', 1, 1, '{"role":"user"}')`,
+        )
+        yield* db.run(sql`PRAGMA foreign_keys = ON`)
+
+        const exit = yield* LocalDatabaseMigration.apply(db).pipe(Effect.exit)
+
+        expect(exit._tag).toBe("Failure")
+        expect(
+          yield* db.get(sql`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'local_message_order'`),
+        ).toBeUndefined()
+        expect(yield* db.get(sql`SELECT id FROM local_migration WHERE id = '0001_message_order'`)).toBeUndefined()
+      }),
+    )
+  })
+
+  test("backfills legacy order independently of concurrent durable event order", async () => {
+    await run(
+      Effect.gen(function* () {
+        const db = yield* makeDb
+        yield* db.run(sql`CREATE TABLE session (id text PRIMARY KEY)`)
+        yield* db.run(
+          sql`CREATE TABLE message (id text PRIMARY KEY, session_id text NOT NULL, time_created integer NOT NULL, time_updated integer NOT NULL, data text NOT NULL)`,
+        )
+        yield* db.run(
+          sql`CREATE TABLE part (id text PRIMARY KEY, message_id text NOT NULL, session_id text NOT NULL, time_created integer NOT NULL, time_updated integer NOT NULL, data text NOT NULL)`,
+        )
+        yield* db.run(
+          sql`CREATE TABLE event (id text PRIMARY KEY, aggregate_id text NOT NULL, seq integer NOT NULL, type text NOT NULL, data text NOT NULL)`,
+        )
+        yield* db.run(sql`INSERT INTO session (id) VALUES ('session')`)
+        yield* db.run(
+          sql`INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES ('first_message', 'session', 1, 1, '{"role":"user"}'), ('second_message', 'session', 2, 2, '{"role":"user"}')`,
+        )
+        yield* db.run(
+          sql`INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES ('first', 'first_message', 'session', 1, 1, '{}'), ('second', 'first_message', 'session', 2, 2, '{}')`,
+        )
+        yield* db.run(
+          sql`INSERT INTO event (id, aggregate_id, seq, type, data) VALUES ('event_second_message', 'session', 1, 'message.updated.1', '{"info":{"id":"second_message"}}'), ('event_first_message', 'session', 2, 'message.updated.1', '{"info":{"id":"first_message"}}'), ('event_second_part', 'session', 3, 'message.part.updated.1', '{"part":{"id":"second"}}'), ('event_first_part', 'session', 4, 'message.part.updated.1', '{"part":{"id":"first"}}')`,
+        )
+
+        yield* LocalDatabaseMigration.apply(db)
+
+        expect(yield* db.all(sql`SELECT message_id AS id, seq FROM local_message_order ORDER BY seq`)).toEqual([
+          { id: "first_message", seq: -2 },
+          { id: "second_message", seq: -1 },
+        ])
+        expect(yield* db.all(sql`SELECT part_id AS id, seq FROM local_part_order ORDER BY seq`)).toEqual([
+          { id: "first", seq: -2 },
+          { id: "second", seq: -1 },
+        ])
+      }),
+    )
+  })
+
+  test("applies later local migrations without replaying legacy backfill", async () => {
+    await run(
+      Effect.gen(function* () {
+        const db = yield* makeDb
+        yield* db.run(sql`CREATE TABLE session (id text PRIMARY KEY)`)
+        yield* db.run(
+          sql`CREATE TABLE message (id text PRIMARY KEY, session_id text NOT NULL, time_created integer NOT NULL, time_updated integer NOT NULL, data text NOT NULL)`,
+        )
+        yield* db.run(
+          sql`CREATE TABLE part (id text PRIMARY KEY, message_id text NOT NULL, session_id text NOT NULL, time_created integer NOT NULL, time_updated integer NOT NULL, data text NOT NULL)`,
+        )
+        yield* db.run(sql`INSERT INTO session (id) VALUES ('session')`)
+        yield* db.run(
+          sql`INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES ('message', 'session', 1, 1, '{"role":"user"}')`,
+        )
+        yield* LocalDatabaseMigration.apply(db)
+        yield* db.run(
+          sql`INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES ('upstream', 'session', 2, 2, '{"role":"user"}')`,
+        )
+
+        const next = {
+          id: "0002_test",
+          up: (tx: Parameters<LocalDatabaseMigration.Migration["up"]>[0]) =>
+            tx.run(`CREATE TABLE local_test (id text PRIMARY KEY)`).pipe(Effect.asVoid),
+        }
+        yield* LocalDatabaseMigration.applyOnly(db, [next, next])
+
+        expect(yield* db.all(sql`SELECT id FROM local_migration ORDER BY id`)).toEqual([
+          { id: "0001_message_order" },
+          { id: "0002_test" },
+        ])
+        expect(yield* db.all(sql`SELECT message_id, seq FROM local_message_order ORDER BY seq`)).toEqual([
+          { message_id: "message", seq: -1 },
+          { message_id: "upstream", seq: 0 },
+        ])
+      }),
+    )
+  })
+
+  test("preserves mixed-era Session usage while repairing messages and parts", async () => {
+    await run(
+      Effect.gen(function* () {
+        const db = yield* makeDb
+        yield* db.run(sql`
+          CREATE TABLE session (
+            id text PRIMARY KEY,
+            cost real NOT NULL,
+            tokens_input integer NOT NULL,
+            tokens_output integer NOT NULL,
+            tokens_reasoning integer NOT NULL,
+            tokens_cache_read integer NOT NULL,
+            tokens_cache_write integer NOT NULL
+          )
+        `)
+        yield* db.run(
+          sql`CREATE TABLE message (id text PRIMARY KEY, session_id text NOT NULL, time_created integer NOT NULL, time_updated integer NOT NULL, data text NOT NULL)`,
+        )
+        yield* db.run(
+          sql`CREATE TABLE part (id text PRIMARY KEY, message_id text NOT NULL, session_id text NOT NULL, time_created integer NOT NULL, time_updated integer NOT NULL, data text NOT NULL)`,
+        )
+        yield* db.run(sql`
+          INSERT INTO session (
+            id, cost, tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write
+          ) VALUES
+            ('ses_a', 3, 20, 10, 4, 2, 1),
+            ('ses_b', 2, 5, 3, 1, 1, 0)
+        `)
+        yield* db.run(sql`
+          INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES
+            ('user_a', 'ses_a', 1, 1, '{"role":"user"}'),
+            ('assistant_a', 'ses_a', 2, 2, '{"role":"assistant","parentID":"user_a","cost":3,"tokens":{"input":20,"output":10,"reasoning":4,"cache":{"read":2,"write":1}}}'),
+            ('invalid', 'ses_a', 3, 3, '{}'),
+            ('user_b', 'ses_b', 4, 4, '{"role":"user"}'),
+            ('assistant_b', 'ses_b', 5, 5, '{"role":"assistant","parentID":"user_b","cost":2,"tokens":{"input":5,"output":3,"reasoning":1,"cache":{"read":1,"write":0}}}')
+        `)
+        const firstStep = JSON.stringify({
+          type: "step-finish",
+          reason: "tool-calls",
+          cost: 1,
+          tokens: { input: 10, output: 5, reasoning: 2, cache: { read: 1, write: 0 } },
+        })
+        const secondStep = JSON.stringify({
+          type: "step-finish",
+          reason: "stop",
+          cost: 2,
+          tokens: { input: 20, output: 10, reasoning: 4, cache: { read: 2, write: 1 } },
+        })
+        yield* db.run(sql`
+          INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES
+            ('first_step', 'assistant_a', 'ses_a', 1, 1, ${firstStep}),
+            ('second_step', 'assistant_a', 'ses_a', 2, 2, ${secondStep}),
+            ('moved', 'assistant_b', 'ses_a', 3, 3, '{"type":"text","text":"hello"}'),
+            ('deleted', 'invalid', 'ses_a', 4, 4, '{}')
+        `)
+
+        yield* LocalDatabaseMigration.apply(db)
+
+        expect(
+          yield* db.all(
+            sql`SELECT id, cost, tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write FROM session ORDER BY id`,
+          ),
+        ).toEqual([
+          {
+            id: "ses_a",
+            cost: 3,
+            tokens_input: 20,
+            tokens_output: 10,
+            tokens_reasoning: 4,
+            tokens_cache_read: 2,
+            tokens_cache_write: 1,
+          },
+          {
+            id: "ses_b",
+            cost: 2,
+            tokens_input: 5,
+            tokens_output: 3,
+            tokens_reasoning: 1,
+            tokens_cache_read: 1,
+            tokens_cache_write: 0,
+          },
+        ])
+        expect(yield* db.get(sql`SELECT session_id FROM part WHERE id = 'moved'`)).toEqual({ session_id: "ses_b" })
+        expect(yield* db.get(sql`SELECT id FROM message WHERE id = 'invalid'`)).toBeUndefined()
+      }),
+    )
+  })
+
   test("backfills existing Context Epoch rows to the build agent", async () => {
     await run(
       Effect.gen(function* () {
@@ -311,7 +710,7 @@ describe("DatabaseMigration", () => {
           sql`INSERT INTO session (id, project_id, workspace_id, slug, directory, title, version, time_created, time_updated) VALUES ('session', 'global', 'workspace', 'session', '/project', 'Before', 'test', 1, 1)`,
         )
         yield* db.run(
-          sql`INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES ('message', 'session', 1, 1, '{}')`,
+          sql`INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES ('message', 'session', 1, 1, '{"role":"user"}')`,
         )
         yield* db.run(
           sql`INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES ('part', 'message', 'session', 1, 1, '{}')`,
@@ -329,6 +728,7 @@ describe("DatabaseMigration", () => {
         yield* db.run(
           sql`INSERT INTO session_context_epoch (session_id, baseline, snapshot, baseline_seq) VALUES ('session', 'baseline', '{}', 9)`,
         )
+        yield* LocalDatabaseMigration.apply(db)
         yield* db.run(sql`DELETE FROM migration WHERE id = ${simplifySessionInputMigration.id}`)
         yield* DatabaseMigration.applyOnly(db, [simplifySessionInputMigration])
 

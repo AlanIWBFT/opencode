@@ -1,4 +1,13 @@
-import type { Event, Message, Part, PermissionRequest, QuestionRequest, ToolPart } from "@opencode-ai/sdk/v2"
+import type {
+  Event,
+  Message,
+  Part,
+  PermissionRequest,
+  QuestionRequest,
+  StoredMessage,
+  StoredPart,
+  ToolPart,
+} from "@opencode-ai/sdk/v2"
 import * as Locale from "@/util/locale"
 import {
   bootstrapSessionData,
@@ -23,7 +32,8 @@ type SessionMessage = {
 }
 
 type BootstrapChildMessage = SessionMessage & {
-  info: Message
+  info: StoredMessage
+  parts: StoredPart[]
 }
 
 type Frame = {
@@ -605,6 +615,7 @@ function bootstrapChildMessages(input: {
         detail: input.detail,
         event: {
           id: `bootstrap:message:${message.info.id}`,
+          seq: message.info.seq,
           type: "message.updated",
           properties: {
             sessionID: input.detail.sessionID,
@@ -621,6 +632,7 @@ function bootstrapChildMessages(input: {
           detail: input.detail,
           event: {
             id: `bootstrap:part:${part.id}`,
+            seq: part.seq,
             type: "message.part.updated",
             properties: {
               sessionID: input.detail.sessionID,

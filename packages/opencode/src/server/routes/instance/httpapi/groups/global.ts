@@ -40,7 +40,12 @@ const GlobalEventSchema = Schema.Struct({
   payload: Schema.Union([
     ...EventManifest.Latest.values()
       .map((definition) =>
-        Schema.Struct({ id: EventV2.ID, type: Schema.Literal(definition.type), properties: definition.data }),
+        Schema.Struct({
+          id: EventV2.ID,
+          ...(["message.updated", "message.part.updated"].includes(definition.type) ? { seq: Schema.Int } : {}),
+          type: Schema.Literal(definition.type),
+          properties: definition.data,
+        }),
       )
       .toArray(),
     InstanceDisposed,

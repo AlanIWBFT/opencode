@@ -7,6 +7,7 @@ import { Global } from "../global"
 import { Flag } from "../flag/flag"
 import { isAbsolute, join } from "path"
 import { DatabaseMigration } from "./migration"
+import { LocalDatabaseMigration } from "./local-migration"
 import { InstallationChannel } from "../installation/version"
 import { makeGlobalNode } from "../effect/app-node"
 
@@ -31,6 +32,7 @@ const layer = Layer.effect(
     yield* db.run("PRAGMA foreign_keys = ON")
     yield* db.run("PRAGMA wal_checkpoint(PASSIVE)")
     yield* DatabaseMigration.apply(db)
+    yield* LocalDatabaseMigration.apply(db)
 
     return { db }
   }).pipe(Effect.orDie),

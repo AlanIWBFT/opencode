@@ -130,6 +130,7 @@ function textDelta(sessionID: string, messageID: string, partID: string, delta: 
 function partUpdated(sessionID: string, messageID: string, partID: string, type: DeltaPartType): Event {
   return {
     id: `evt_${sessionID}_${messageID}_${partID}`,
+    seq: 1,
     type: "message.part.updated",
     properties: {
       sessionID,
@@ -158,6 +159,7 @@ function partUpdated(sessionID: string, messageID: string, partID: string, type:
 function toolUpdated(part: ToolPart): Event {
   return {
     id: `evt_${part.sessionID}_${part.messageID}_${part.id}_${part.state.status}`,
+    seq: 1,
     type: "message.part.updated",
     properties: {
       sessionID: part.sessionID,
@@ -171,6 +173,7 @@ function assistantMessage(sessionID: string, messageID: string, partID: string, 
   return {
     info: {
       id: messageID,
+      seq: 1,
       sessionID,
       role: "assistant",
       time: { created: Date.now() },
@@ -187,6 +190,7 @@ function assistantMessage(sessionID: string, messageID: string, partID: string, 
       type === "text"
         ? {
             id: partID,
+            seq: 1,
             sessionID,
             messageID,
             type: "text",
@@ -194,6 +198,7 @@ function assistantMessage(sessionID: string, messageID: string, partID: string, 
           }
         : {
             id: partID,
+            seq: 1,
             sessionID,
             messageID,
             type: "reasoning",
@@ -208,6 +213,7 @@ function assistantToolMessage(part: ToolPart) {
   return {
     info: {
       id: part.messageID,
+      seq: 1,
       sessionID: part.sessionID,
       role: "assistant",
       time: { created: Date.now() },
@@ -220,7 +226,7 @@ function assistantToolMessage(part: ToolPart) {
       cost: 0,
       tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
     },
-    parts: [part],
+    parts: [{ ...part, seq: 1 }],
   } satisfies SessionMessageResponse
 }
 

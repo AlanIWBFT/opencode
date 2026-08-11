@@ -5,7 +5,7 @@ import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { Deferred, Effect, Exit, Layer } from "effect"
 import { Session as SessionNs } from "@/session/session"
 import { MessageV2 } from "../../src/session/message-v2"
-import { MessageID, PartID, type SessionID } from "../../src/session/schema"
+import { MessageID, PartID, SessionID } from "../../src/session/schema"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { provideInstance, tmpdirScoped } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
@@ -16,6 +16,10 @@ import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { InstanceStore } from "@/project/instance-store"
 import { InstanceBootstrap } from "@/project/bootstrap"
+import { Location } from "@opencode-ai/core/location"
+import { AbsolutePath } from "@opencode-ai/core/schema"
+import { InstanceRef, WorkspaceRef } from "@/effect/instance-ref"
+import { WorkspaceV2 } from "@opencode-ai/core/workspace"
 
 const it = testEffect(
   AppNodeBuilder.build(
@@ -128,6 +132,39 @@ describe("session.created event", () => {
       })
 
       yield* session.remove(info.id)
+    }),
+  )
+
+  it.instance("injects batch instance location while preserving explicit item locations", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2Bridge.Service
+      const instance = yield* InstanceRef
+      if (!instance) throw new Error("Expected instance context")
+      const sessionID = SessionID.create()
+      const workspaceID = WorkspaceV2.ID.make("wrk_batch")
+      const explicit = Location.Ref.make({ directory: AbsolutePath.make("explicit") })
+
+      const result = yield* events
+        .publishBatch([
+          EventV2.publishItem(SessionV1.Event.MessageRemoved, {
+            sessionID,
+            messageID: MessageID.ascending(),
+          }),
+          EventV2.publishItem(
+            SessionV1.Event.MessageRemoved,
+            { sessionID, messageID: MessageID.ascending() },
+            { location: explicit },
+          ),
+        ])
+        .pipe(Effect.provideService(WorkspaceRef, workspaceID))
+      const implicit = result[0]?.location as Location.Info | undefined
+
+      expect(implicit).toMatchObject({
+        directory: AbsolutePath.make(instance.directory),
+        workspaceID,
+        project: { id: instance.project.id, directory: AbsolutePath.make(instance.worktree) },
+      })
+      expect(result[1]?.location).toBe(explicit)
     }),
   )
 })
@@ -267,6 +304,157 @@ describe("Session", () => {
 
       expect((yield* session.messages({ sessionID: beforeWrap.id })).map((msg) => msg.info.time.created)).toEqual([1])
       expect((yield* session.messages({ sessionID: afterWrap.id })).map((msg) => msg.info.time.created)).toEqual([1, 2])
+    }),
+  )
+
+  it.instance("forks at an exact boundary when IDs are not chronological", () =>
+    Effect.gen(function* () {
+      const session = yield* SessionNs.Service
+      const created = yield* Effect.acquireRelease(session.create({ title: "source" }), (info) =>
+        session.remove(info.id).pipe(Effect.ignore),
+      )
+      const before = yield* session.updateMessage({
+        id: MessageID.make("msg_z_before"),
+        sessionID: created.id,
+        role: "user",
+        time: { created: 100 },
+        agent: "test",
+        model: { providerID: "test", modelID: "test" },
+      } as SessionV1.User)
+      const boundary = yield* session.updateMessage({
+        ...before,
+        id: MessageID.make("msg_a_boundary"),
+        time: { created: 200 },
+      })
+      const fork = yield* Effect.acquireRelease(session.fork({ sessionID: created.id, messageID: boundary.id }), (info) =>
+        session.remove(info.id).pipe(Effect.ignore),
+      )
+
+      const messages = yield* session.messages({ sessionID: fork.id })
+      expect(messages).toHaveLength(1)
+      expect(messages[0]?.info.role).toBe("user")
+    }),
+  )
+
+  it.instance("commits a forked history before notifying its first message", () =>
+    Effect.gen(function* () {
+      const session = yield* SessionNs.Service
+      const events = yield* EventV2Bridge.Service
+      const created = yield* Effect.acquireRelease(session.create({ title: "source" }), (info) =>
+        session.remove(info.id).pipe(Effect.ignore),
+      )
+      const user = yield* session.updateMessage({
+        id: MessageID.ascending(),
+        sessionID: created.id,
+        role: "user",
+        time: { created: 100 },
+        agent: "test",
+        model: { providerID: "test", modelID: "test" },
+      } as SessionV1.User)
+      yield* session.updatePart({
+        id: PartID.ascending(),
+        sessionID: created.id,
+        messageID: user.id,
+        type: "text",
+        text: "hello",
+      })
+      const assistant = yield* session.updateMessage({
+        id: MessageID.ascending(),
+        sessionID: created.id,
+        role: "assistant",
+        parentID: user.id,
+        time: { created: 101 },
+        mode: "test",
+        agent: "test",
+        path: { cwd: created.directory, root: created.directory },
+        cost: 0,
+        tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        providerID: "test",
+        modelID: "test",
+      } as SessionV1.Assistant)
+      yield* session.updatePart({
+        id: PartID.ascending(),
+        sessionID: created.id,
+        messageID: assistant.id,
+        type: "text",
+        text: "world",
+      })
+      let observed: { count: number; location?: Location.Ref; seq?: number } | undefined
+      const unsubscribe = yield* events.listen((event) => {
+        if (event.type !== SessionV1.Event.MessageUpdated.type) return Effect.void
+        const data = event.data as typeof SessionV1.Event.MessageUpdated.data.Type
+        return data.sessionID === created.id || observed
+          ? Effect.void
+          : session.messages({ sessionID: data.sessionID }).pipe(
+              Effect.tap((messages) =>
+                Effect.sync(() => {
+                  observed = {
+                    count: messages.length,
+                    location: event.location,
+                    seq: SessionProjector.projectedSequence(event),
+                  }
+                }),
+              ),
+              Effect.asVoid,
+              Effect.orDie,
+            )
+      })
+      yield* Effect.addFinalizer(() => unsubscribe)
+
+      const forked = yield* Effect.acquireRelease(session.fork({ sessionID: created.id }), (info) =>
+        session.remove(info.id).pipe(Effect.ignore),
+      )
+      const cloned = yield* session.messages({ sessionID: forked.id })
+
+      expect(observed?.count).toBe(2)
+      expect(observed?.location?.directory).toBe(AbsolutePath.make(created.directory))
+      expect(observed?.seq).toBeNumber()
+      expect(cloned[1]?.info.role).toBe("assistant")
+      expect(cloned[1]?.info.role === "assistant" ? cloned[1].info.parentID : undefined).toBe(cloned[0]?.info.id)
+    }),
+  )
+
+  it.instance("leaves no partial fork history when batch projection fails", () =>
+    Effect.gen(function* () {
+      const session = yield* SessionNs.Service
+      const events = yield* EventV2Bridge.Service
+      const created = yield* Effect.acquireRelease(session.create({ title: "source" }), (info) =>
+        session.remove(info.id).pipe(Effect.ignore),
+      )
+      const message = yield* session.updateMessage({
+        id: MessageID.ascending(),
+        sessionID: created.id,
+        role: "user",
+        time: { created: 100 },
+        agent: "test",
+        model: { providerID: "test", modelID: "test" },
+      } as SessionV1.User)
+      yield* session.updatePart({
+        id: PartID.ascending(),
+        sessionID: created.id,
+        messageID: message.id,
+        type: "text",
+        text: "rollback",
+      })
+      let destination: SessionID | undefined
+      const unsubscribe = yield* events.listen((event) => {
+        if (event.type !== SessionV1.Event.Created.type) return Effect.void
+        const data = event.data as typeof SessionV1.Event.Created.data.Type
+        if (data.sessionID !== created.id) destination = data.sessionID
+        return Effect.void
+      })
+      yield* Effect.addFinalizer(() => unsubscribe)
+      yield* events.project(SessionV1.Event.PartUpdated, (event) =>
+        event.data.sessionID === created.id ? Effect.void : Effect.die("fork projection failed"),
+      )
+
+      const exit = yield* session.fork({ sessionID: created.id }).pipe(Effect.exit)
+      if (!destination) throw new Error("Expected destination Session")
+      const messages = yield* session.messages({ sessionID: destination })
+
+      expect(String(exit)).toContain("fork projection failed")
+      expect(messages).toEqual([])
+      yield* session.remove(destination)
     }),
   )
 

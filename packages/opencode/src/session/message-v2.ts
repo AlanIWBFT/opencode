@@ -13,8 +13,8 @@ import {
   Part,
   SubtaskPart,
   User,
-  WithParts,
 } from "@opencode-ai/core/v1/session"
+import type { WithParts } from "@opencode-ai/core/v1/session"
 
 import { NamedError } from "@opencode-ai/core/util/error"
 import { APICallError, convertToModelMessages, LoadAPIKeyError, type ModelMessage, type UIMessage } from "ai"
@@ -22,12 +22,13 @@ import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { NotFoundError } from "@/storage/storage"
 import { and } from "drizzle-orm"
+import { asc } from "drizzle-orm"
 import { desc } from "drizzle-orm"
 import { eq } from "drizzle-orm"
-import { inArray } from "drizzle-orm"
+import { inArray, isNull, ne, or } from "drizzle-orm"
 import { lt } from "drizzle-orm"
-import { or } from "drizzle-orm"
 import { MessageTable, PartTable, SessionTable } from "@opencode-ai/core/session/sql"
+import { LocalMessageOrder } from "@opencode-ai/core/database/local-message-order"
 import { ProviderError } from "@/provider/error"
 import { iife } from "@/util/iife"
 import { errorMessage } from "@/util/error"
@@ -61,8 +62,7 @@ export const Event = {
 }
 
 const Cursor = Schema.Struct({
-  id: MessageID,
-  time: Schema.Finite.check(Schema.isGreaterThanOrEqualTo(0)),
+  seq: Schema.Int,
 })
 type Cursor = typeof Cursor.Type
 
@@ -77,53 +77,77 @@ export const cursor = {
   },
 }
 
+export type StoredInfo = Info & { seq: number }
+export type StoredPart = Part & { seq: number }
+export type StoredWithParts = { info: StoredInfo; parts: StoredPart[] }
+type StoredCompactionPart = CompactionPart & { seq: number }
+type StoredSubtaskPart = SubtaskPart & { seq: number }
+
 const decodeAPIError = Schema.decodeUnknownSync(APIError.Schema)
 
-const info = (row: typeof MessageTable.$inferSelect): Info => {
+const info = (row: typeof MessageTable.$inferSelect, seq: number): StoredInfo => {
   const value = {
     ...row.data,
     id: row.id,
     sessionID: row.session_id,
-  } as Info
+    seq,
+  } as StoredInfo
   if (value.role !== "assistant" || !APIError.isInstance(value.error)) return value
   return { ...value, error: decodeAPIError(value.error) }
 }
 
-const part = (row: typeof PartTable.$inferSelect) =>
+const part = (row: typeof PartTable.$inferSelect, seq: number): Part =>
   ({
     ...row.data,
     id: row.id,
     sessionID: row.session_id,
     messageID: row.message_id,
-  }) as Part
+    seq,
+  }) as StoredPart
 
-const older = (row: Cursor) =>
-  or(lt(MessageTable.time_created, row.time), and(eq(MessageTable.time_created, row.time), lt(MessageTable.id, row.id)))
+const older = (row: Cursor) => lt(LocalMessageOrder.MessageOrderTable.seq, row.seq)
 
-function hydrate(db: Database.Interface["db"], rows: (typeof MessageTable.$inferSelect)[]) {
-  const ids = rows.map((row) => row.id)
+function hydrate(
+  db: Database.Interface["db"],
+  rows: Array<{ message: typeof MessageTable.$inferSelect; seq: number }>,
+) {
+  const ids = rows.map((row) => row.message.id)
   const partByMessage = new Map<string, Part[]>()
   return Effect.gen(function* () {
     if (ids.length > 0) {
       const partRows = yield* db
-        .select()
+        .select({
+          part: PartTable,
+          seq: LocalMessageOrder.PartOrderTable.seq,
+          orderMessageID: LocalMessageOrder.PartOrderTable.message_id,
+          orderSessionID: LocalMessageOrder.PartOrderTable.session_id,
+        })
         .from(PartTable)
+        .leftJoin(LocalMessageOrder.PartOrderTable, eq(LocalMessageOrder.PartOrderTable.part_id, PartTable.id))
         .where(inArray(PartTable.message_id, ids))
-        .orderBy(PartTable.message_id, PartTable.id)
+        .orderBy(PartTable.message_id, LocalMessageOrder.PartOrderTable.seq)
         .all()
         .pipe(Effect.orDie)
       for (const row of partRows) {
-        const next = part(row)
-        const list = partByMessage.get(row.message_id)
+        if (
+          row.seq === null ||
+          row.orderMessageID !== row.part.message_id ||
+          row.orderSessionID !== row.part.session_id
+        )
+          return yield* Effect.die(`Part sequence invalid: ${row.part.id}`)
+        const next = part(row.part, row.seq)
+        const list = partByMessage.get(row.part.message_id)
         if (list) list.push(next)
-        else partByMessage.set(row.message_id, [next])
+        else partByMessage.set(row.part.message_id, [next])
       }
     }
 
-    return rows.map((row) => ({
-      info: info(row),
-      parts: partByMessage.get(row.id) ?? [],
-    }))
+    return rows.map((row) => {
+      return {
+        info: info(row.message, row.seq),
+        parts: partByMessage.get(row.message.id) ?? [],
+      }
+    })
   })
 }
 
@@ -438,51 +462,93 @@ export const page = Effect.fn("MessageV2.page")(function* (input: {
   before?: string
 }) {
   const { db } = yield* Database.Service
-  const before = input.before ? cursor.decode(input.before) : undefined
-  const where = before
-    ? and(eq(MessageTable.session_id, input.sessionID), older(before))
-    : eq(MessageTable.session_id, input.sessionID)
-  const rows = yield* db
-    .select()
-    .from(MessageTable)
-    .where(where)
-    .orderBy(desc(MessageTable.time_created), desc(MessageTable.id))
-    .limit(input.limit + 1)
-    .all()
-    .pipe(Effect.orDie)
-  if (rows.length === 0) {
-    const row = yield* db
-      .select({ id: SessionTable.id })
+  yield* validateCoverage(db, input.sessionID)
+  return yield* readPage(db, input)
+})
+
+function validateCoverage(db: Database.Interface["db"], sessionID: SessionID) {
+  return Effect.gen(function* () {
+    const missing = yield* db
+      .select({ id: MessageTable.id })
+      .from(MessageTable)
+      .leftJoin(LocalMessageOrder.MessageOrderTable, eq(LocalMessageOrder.MessageOrderTable.message_id, MessageTable.id))
+      .where(
+        and(
+          eq(MessageTable.session_id, sessionID),
+          or(
+            isNull(LocalMessageOrder.MessageOrderTable.message_id),
+            ne(LocalMessageOrder.MessageOrderTable.session_id, MessageTable.session_id),
+          ),
+        ),
+      )
+      .limit(1)
+      .get()
+      .pipe(Effect.orDie)
+    if (missing) return yield* Effect.die(`Message sequence missing: ${missing.id}`)
+  })
+}
+
+function readPage(
+  db: Database.Interface["db"],
+  input: { sessionID: SessionID; limit: number; before?: string },
+) {
+  return Effect.gen(function* () {
+    const before = input.before ? cursor.decode(input.before) : undefined
+    const where = before
+      ? and(eq(MessageTable.session_id, input.sessionID), older(before))
+      : eq(MessageTable.session_id, input.sessionID)
+    const rows = yield* db
+      .select({ message: MessageTable, seq: LocalMessageOrder.MessageOrderTable.seq })
+      .from(MessageTable)
+      .innerJoin(LocalMessageOrder.MessageOrderTable, eq(LocalMessageOrder.MessageOrderTable.message_id, MessageTable.id))
+      .where(where)
+      .orderBy(desc(LocalMessageOrder.MessageOrderTable.seq))
+      .limit(input.limit + 1)
+      .all()
+      .pipe(Effect.orDie)
+    if (rows.length === 0) {
+      const row = yield* db
+        .select({ id: SessionTable.id })
       .from(SessionTable)
       .where(eq(SessionTable.id, input.sessionID))
       .get()
       .pipe(Effect.orDie)
-    if (!row) return yield* new NotFoundError({ message: `Session not found: ${input.sessionID}` })
-    return {
-      items: [] as WithParts[],
-      more: false,
+      if (!row) return yield* new NotFoundError({ message: `Session not found: ${input.sessionID}` })
+      return {
+        items: [] as StoredWithParts[],
+        more: false,
+      }
     }
-  }
 
-  const more = rows.length > input.limit
-  const slice = more ? rows.slice(0, input.limit) : rows
-  const items = yield* hydrate(db, slice)
-  items.reverse()
-  const tail = slice.at(-1)
-  return {
-    items,
-    more,
-    cursor: more && tail ? cursor.encode({ id: tail.id, time: tail.time_created }) : undefined,
-  }
-})
+    const more = rows.length > input.limit
+    const slice = more ? rows.slice(0, input.limit) : rows
+    const items = yield* hydrate(db, slice)
+    items.reverse()
+    const tail = slice.at(-1)
+    return {
+      items,
+      more,
+      cursor: more && tail ? cursor.encode({ seq: tail.seq }) : undefined,
+    }
+  })
+}
+
+export function pages(sessionID: SessionID) {
+  return Effect.gen(function* () {
+    const { db } = yield* Database.Service
+    yield* validateCoverage(db, sessionID)
+    return (input: { limit: number; before?: string }) => readPage(db, { sessionID, ...input })
+  })
+}
 
 export function stream(sessionID: SessionID) {
   const size = 50
   return Effect.gen(function* () {
+    const nextPage = yield* pages(sessionID)
     const result = [] as WithParts[]
     let before: string | undefined
     while (true) {
-      const next = yield* page({ sessionID, limit: size, before }).pipe(
+      const next = yield* nextPage({ limit: size, before }).pipe(
         Effect.catchIf(NotFoundError.isInstance, () =>
           Effect.succeed({ items: [] as WithParts[], more: false, cursor: undefined }),
         ),
@@ -503,33 +569,50 @@ export function parts(messageID: MessageID) {
   return Effect.gen(function* () {
     const { db } = yield* Database.Service
     const rows = yield* db
-      .select()
+      .select({
+        part: PartTable,
+        seq: LocalMessageOrder.PartOrderTable.seq,
+        orderMessageID: LocalMessageOrder.PartOrderTable.message_id,
+        orderSessionID: LocalMessageOrder.PartOrderTable.session_id,
+      })
       .from(PartTable)
+      .leftJoin(LocalMessageOrder.PartOrderTable, eq(LocalMessageOrder.PartOrderTable.part_id, PartTable.id))
       .where(eq(PartTable.message_id, messageID))
-      .orderBy(PartTable.id)
+      .orderBy(asc(LocalMessageOrder.PartOrderTable.seq))
       .all()
       .pipe(Effect.orDie)
-    return rows.map(part)
+    return rows.map((row) => {
+      if (row.seq === null || row.orderMessageID !== row.part.message_id || row.orderSessionID !== row.part.session_id)
+        throw new Error(`Part sequence invalid: ${row.part.id}`)
+      return part(row.part, row.seq)
+    })
   })
 }
 
 export const get = Effect.fn("MessageV2.get")(function* (input: { sessionID: SessionID; messageID: MessageID }) {
   const { db } = yield* Database.Service
   const row = yield* db
-    .select()
+    .select({
+      message: MessageTable,
+      seq: LocalMessageOrder.MessageOrderTable.seq,
+      orderSessionID: LocalMessageOrder.MessageOrderTable.session_id,
+    })
     .from(MessageTable)
+    .leftJoin(LocalMessageOrder.MessageOrderTable, eq(LocalMessageOrder.MessageOrderTable.message_id, MessageTable.id))
     .where(and(eq(MessageTable.id, input.messageID), eq(MessageTable.session_id, input.sessionID)))
     .get()
     .pipe(Effect.orDie)
   if (!row) return yield* new NotFoundError({ message: `Message not found: ${input.messageID}` })
+  if (row.seq === null || row.orderSessionID !== row.message.session_id)
+    return yield* Effect.die(`Message sequence invalid: ${input.messageID}`)
   return {
-    info: info(row),
+    info: info(row.message, row.seq),
     parts: yield* parts(input.messageID),
   }
 })
 
-export function filterCompacted(msgs: Iterable<WithParts>) {
-  const result = [] as WithParts[]
+export function filterCompacted<T extends WithParts>(msgs: Iterable<T>) {
+  const result = [] as T[]
   const completed = new Set<string>()
   let retain: MessageID | undefined
   for (const msg of msgs) {
@@ -585,32 +668,33 @@ export const filterCompactedEffect = Effect.fnUntraced(function* (sessionID: Ses
   return filterCompacted(yield* stream(sessionID))
 })
 
-// filterCompacted reorders messages for model consumption
-// ([compaction-user, summary, ...retained tail..., continue-user]), so array
-// position is not chronological. IDs are only a deterministic tie-breaker
-// because imported messages do not necessarily have monotonic IDs.
+// filterCompacted reorders history for model consumption, so use durable sequence.
 export function latest(msgs: WithParts[]) {
-  let user: User | undefined
-  let assistant: Assistant | undefined
-  let finished: Assistant | undefined
-  for (const msg of msgs) {
-    const info = msg.info
-    if (info.role === "user" && isAfter(info, user)) user = info
-    if (info.role === "assistant" && isAfter(info, assistant)) assistant = info
-    if (info.role === "assistant" && info.finish && isAfter(info, finished)) finished = info
-  }
+  const chronological = msgs.toSorted((a, b) => order(a.info) - order(b.info))
+  const user = chronological.findLast((msg): msg is WithParts & { info: User } => msg.info.role === "user")?.info
+  const assistant = chronological.findLast(
+    (msg): msg is WithParts & { info: Assistant } => msg.info.role === "assistant",
+  )?.info
+  const finished = chronological.findLast(
+    (msg): msg is WithParts & { info: Assistant } => msg.info.role === "assistant" && !!msg.info.finish,
+  )?.info
   const tasks = msgs.flatMap((m) =>
-    finished && !isAfter(m.info, finished)
+    finished && order(m.info) <= order(finished)
       ? []
-      : m.parts.filter((p): p is CompactionPart | SubtaskPart => p.type === "compaction" || p.type === "subtask"),
+      : m.parts.filter(
+          (p): p is StoredCompactionPart | StoredSubtaskPart => p.type === "compaction" || p.type === "subtask",
+        ),
   )
   return { user, assistant, finished, tasks }
 }
 
-function isAfter(info: Info, other?: Info) {
-  if (!other) return true
-  if (info.time.created !== other.time.created) return info.time.created > other.time.created
-  return info.id > other.id
+export function compareOrder(a: Info, b: Info) {
+  return order(a) - order(b)
+}
+
+function order(info: Info) {
+  if (!("seq" in info) || typeof info.seq !== "number") throw new Error(`Message sequence missing: ${info.id}`)
+  return info.seq
 }
 
 export function fromError(

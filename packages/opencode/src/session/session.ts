@@ -10,6 +10,8 @@ import type { ProviderMetadata, Usage } from "@opencode-ai/llm"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
 import { Database } from "@opencode-ai/core/database/database"
 import { EventV2Bridge } from "@/event-v2-bridge"
+import { EventV2 } from "@opencode-ai/core/event"
+import { LocalMessageOrder } from "@opencode-ai/core/database/local-message-order"
 import { SessionV2 } from "@opencode-ai/core/session"
 import * as SessionExecutionLocal from "@opencode-ai/core/session/execution/local"
 import { locationServiceMapLayer } from "@opencode-ai/core/location-services"
@@ -451,7 +453,8 @@ export interface Interface {
     sessionID: SessionID
     revert: Info["revert"]
     summary: Info["summary"]
-  }) => Effect.Effect<void>
+    expected?: { event: number; message: number; part: number }
+  }) => Effect.Effect<void, BusyError>
   readonly clearRevert: (sessionID: SessionID) => Effect.Effect<void>
   readonly setSummary: (input: { sessionID: SessionID; summary: Info["summary"] }) => Effect.Effect<void>
   readonly setShare: (input: { sessionID: SessionID; share: Info["share"] }) => Effect.Effect<void>
@@ -701,9 +704,13 @@ const layer: Layer.Layer<
     })
 
     const fork = Effect.fn("Session.fork")(function* (input: { sessionID: SessionID; messageID?: MessageID }) {
+      const started = performance.now()
       const ctx = yield* InstanceState.context
       const original = yield* get(input.sessionID)
       const title = getForkedTitle(original.title)
+      const msgs = yield* messages({ sessionID: input.sessionID })
+      const boundary = input.messageID ? msgs.findIndex((msg) => msg.info.id === input.messageID) : msgs.length
+      if (boundary < 0) return yield* new NotFoundError({ message: `Message not found: ${input.messageID}` })
       const session = yield* createNext({
         directory: ctx.directory,
         path: sessionPath(ctx.worktree, ctx.directory),
@@ -711,39 +718,55 @@ const layer: Layer.Layer<
         title,
         metadata: structuredClone(original.metadata),
       })
-      const msgs = yield* messages({ sessionID: input.sessionID })
-      const idMap = new Map<string, MessageID>()
-      const target = input.messageID ? msgs.findIndex((msg) => msg.info.id === input.messageID) : msgs.length
-
-      for (const msg of msgs.slice(0, target < 0 ? msgs.length : target)) {
-        const newID = MessageID.ascending()
-        idMap.set(msg.info.id, newID)
-
-        const parentID = msg.info.role === "assistant" && msg.info.parentID ? idMap.get(msg.info.parentID) : undefined
-        const cloned = yield* updateMessage({
+      const selected = msgs.slice(0, boundary)
+      const idMap = new Map(selected.map((msg) => [msg.info.id, MessageID.ascending()]))
+      const items = selected.flatMap((msg) => {
+        const messageID = idMap.get(msg.info.id)
+        if (!messageID) throw new Error(`Missing forked message ID for ${msg.info.id}`)
+        const parentID = msg.info.role === "assistant" ? idMap.get(msg.info.parentID) : undefined
+        if (msg.info.role === "assistant" && !parentID) {
+          throw new Error(`Missing forked parent ${msg.info.parentID} for ${msg.info.id}`)
+        }
+        const info = {
           ...msg.info,
           sessionID: session.id,
-          id: newID,
-          ...(parentID && { parentID }),
-        })
-
-        for (const part of msg.parts) {
-          const p: SessionV1.Part = {
-            ...part,
-            id: PartID.ascending(),
-            messageID: cloned.id,
-            sessionID: session.id,
-          }
-          if (p.type === "compaction" && p.tail_start_id) {
-            p.tail_start_id = idMap.get(p.tail_start_id)
-          }
-          yield* updatePart(p)
+          id: messageID,
+          ...(parentID ? { parentID } : {}),
         }
-      }
+        return [
+          EventV2.publishItem(SessionV1.Event.MessageUpdated, { sessionID: session.id, info }),
+          ...msg.parts.map((part) => {
+            const cloned = {
+              ...part,
+              id: PartID.ascending(),
+              messageID,
+              sessionID: session.id,
+              ...(part.type === "compaction" && part.tail_start_id
+                ? { tail_start_id: idMap.get(part.tail_start_id) }
+                : {}),
+            } as SessionV1.Part
+            return EventV2.publishItem(SessionV1.Event.PartUpdated, {
+              sessionID: session.id,
+              part: structuredClone(cloned),
+              time: Date.now(),
+            })
+          }),
+        ]
+      })
+      yield* events.publishBatch(items, { projector: "session.fork" })
+      yield* Effect.logInfo("fork completed", {
+        sourceSessionID: input.sessionID,
+        destinationSessionID: session.id,
+        sourceMessages: msgs.length,
+        copiedMessages: selected.length,
+        copiedParts: items.length - selected.length,
+        events: items.length,
+        totalMs: Math.round(performance.now() - started),
+      })
       return session
     })
 
-    const patch = (sessionID: SessionID, info: Patch) =>
+    const patch = (sessionID: SessionID, info: Patch, options?: Parameters<EventV2.Interface["publish"]>[2]) =>
       Effect.gen(function* () {
         const current = yield* get(sessionID)
         const next = {
@@ -755,7 +778,7 @@ const layer: Layer.Layer<
           revert: info.revert === null ? undefined : (info.revert ?? current.revert),
           permission: info.permission === null ? undefined : (info.permission ?? current.permission),
         } as Info
-        yield* events.publish(SessionV1.Event.Updated, { sessionID, info: next })
+        yield* events.publish(SessionV1.Event.Updated, { sessionID, info: next }, options)
       })
 
     const touch = Effect.fn("Session.touch")(function* (sessionID: SessionID) {
@@ -800,12 +823,43 @@ const layer: Layer.Layer<
       sessionID: SessionID
       revert: Info["revert"]
       summary: Info["summary"]
+      expected?: { event: number; message: number; part: number }
     }) {
-      yield* patch(input.sessionID, {
-        summary: input.summary,
-        time: { updated: Date.now() },
-        revert: input.revert,
-      }).pipe(Effect.orDie)
+      const expected = input.expected
+      yield* patch(
+        input.sessionID,
+        {
+          summary: input.summary,
+          time: { updated: Date.now() },
+          revert: input.revert,
+        },
+        expected
+          ? {
+              commit: (event) =>
+                Effect.gen(function* () {
+                  const row = yield* db
+                    .select({
+                      message: LocalMessageOrder.SessionOrderTable.message_seq,
+                      part: LocalMessageOrder.SessionOrderTable.part_seq,
+                    })
+                    .from(LocalMessageOrder.SessionOrderTable)
+                    .where(eq(LocalMessageOrder.SessionOrderTable.session_id, input.sessionID))
+                    .get()
+                    .pipe(Effect.orDie)
+                  if (
+                    event !== expected.event ||
+                    (row?.message ?? 0) !== expected.message ||
+                    (row?.part ?? 0) !== expected.part
+                  ) {
+                    return yield* Effect.die(new BusyError({ sessionID: input.sessionID }))
+                  }
+                }),
+            }
+          : undefined,
+      ).pipe(
+        Effect.catch(Effect.die),
+        Effect.catchDefect((error) => (error instanceof BusyError ? Effect.fail(error) : Effect.die(error))),
+      )
     })
 
     const clearRevert = Effect.fn("Session.clearRevert")(function* (sessionID: SessionID) {
@@ -843,21 +897,19 @@ const layer: Layer.Layer<
           Effect.provideService(Database.Service, database),
         )).items
       }
-
+      const page = yield* MessageV2.pages(input.sessionID).pipe(Effect.provideService(Database.Service, database))
       const size = 50
       const result = [] as SessionV1.WithParts[]
       let before: string | undefined
       while (true) {
-        const page = yield* MessageV2.page({ sessionID: input.sessionID, limit: size, before }).pipe(
-          Effect.provideService(Database.Service, database),
-        )
-        if (page.items.length === 0) break
-        for (let i = page.items.length - 1; i >= 0; i--) {
-          const item = page.items[i]
+        const next = yield* page({ limit: size, before })
+        if (next.items.length === 0) break
+        for (let i = next.items.length - 1; i >= 0; i--) {
+          const item = next.items[i]
           if (item) result.push(item)
         }
-        if (!page.more || !page.cursor) break
-        before = page.cursor
+        if (!next.more || !next.cursor) break
+        before = next.cursor
       }
       return result.reverse()
     })
@@ -898,19 +950,18 @@ const layer: Layer.Layer<
 
     /** Finds the first message matching the predicate, searching newest-first. */
     const findMessage: Interface["findMessage"] = Effect.fn("Session.findMessage")(function* (sessionID, predicate) {
+      const page = yield* MessageV2.pages(sessionID).pipe(Effect.provideService(Database.Service, database))
       const size = 50
       let before: string | undefined
       while (true) {
-        const page = yield* MessageV2.page({ sessionID, limit: size, before }).pipe(
-          Effect.provideService(Database.Service, database),
-        )
-        if (page.items.length === 0) break
-        for (let i = page.items.length - 1; i >= 0; i--) {
-          const item = page.items[i]
+        const next = yield* page({ limit: size, before })
+        if (next.items.length === 0) break
+        for (let i = next.items.length - 1; i >= 0; i--) {
+          const item = next.items[i]
           if (item && predicate(item)) return Option.some(item)
         }
-        if (!page.more || !page.cursor) break
-        before = page.cursor
+        if (!next.more || !next.cursor) break
+        before = next.cursor
       }
       return Option.none<SessionV1.WithParts>()
     })

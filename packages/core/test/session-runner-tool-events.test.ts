@@ -26,11 +26,13 @@ const capture = () => {
         })
         return event
       }),
+    publishBatch: () => Effect.succeed([]),
     subscribe: () => Stream.empty,
     all: () => Stream.empty,
     durable: () => Stream.empty,
     listen: () => Effect.succeed(Effect.void),
     project: () => Effect.void,
+    projectBatch: () => Effect.void,
     replay: () => Effect.void,
     replayAll: () => Effect.succeed(undefined),
     remove: () => Effect.void,

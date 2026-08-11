@@ -151,6 +151,7 @@ describe("run interactive runtime", () => {
         {
           info: {
             id: "msg-user-1",
+            seq: 1,
             sessionID: "ses-1",
             role: "user",
             time: {
@@ -166,6 +167,7 @@ describe("run interactive runtime", () => {
           parts: [
             {
               id: "part-user-1",
+              seq: 2,
               sessionID: "ses-1",
               messageID: "msg-user-1",
               type: "text",
