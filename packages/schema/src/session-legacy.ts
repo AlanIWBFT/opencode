@@ -72,7 +72,10 @@ function providerContext(data: Record<string, unknown>) {
   if (!isRecord(context)) return rest
   return {
     ...rest,
-    native: { messages: Array.isArray(context.messages) ? context.messages.map(media) : context.messages },
+    native: {
+      messages: Array.isArray(context.messages) ? context.messages.map(media) : context.messages,
+      ...(context.provenance === undefined ? {} : { openchamberNativeIdentity: context.provenance }),
+    },
   }
 }
 

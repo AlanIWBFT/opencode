@@ -12,8 +12,13 @@ import { Provider } from "@opencode/core/provider"
 import { Variant } from "@opencode/core/variant"
 import { ModelResolver } from "@opencode/core/model-resolver"
 import { AISDK } from "@opencode/core/aisdk"
+import { AppNodeBuilder } from "@opencode/core/effect/app-node-builder"
+import { Location } from "@opencode/core/location"
+import { Project } from "@opencode/core/project"
+import { AbsolutePath } from "@opencode/core/schema"
 import { Npm } from "@opencode/util/npm"
-import { it } from "./lib/effect"
+import { it, testEffect } from "./lib/effect"
+import { offlineModels } from "./fixture/models"
 
 interface ModelOptions {
   readonly providerID?: Provider.ID
@@ -82,6 +87,46 @@ function withConfigEnv<A, E, R>(env: Record<string, string>, effect: () => Effec
 }
 
 describe("ModelResolver", () => {
+  const integrated = testEffect(
+    AppNodeBuilder.build(ModelResolver.node, [
+      offlineModels,
+      Location.node.replace(
+        Layer.succeed(Location.Service, {
+          directory: AbsolutePath.make("/fixture"),
+          project: {
+            id: Project.ID.global,
+            directory: AbsolutePath.make("/fixture"),
+            canonical: AbsolutePath.make("/fixture"),
+          },
+        }),
+      ),
+    ]),
+  )
+  integrated.effect("defaults official OpenAI Responses to native compaction and honors explicit summary", () =>
+    Effect.gen(function* () {
+      const resolver = yield* ModelResolver.Service
+      const base = {
+        providerID: Provider.ID.openai,
+        settings: { apiKey: "fixture", baseURL: "https://fixture.example/v1" },
+      }
+      const native = yield* resolver.resolveModel(model("@opencode/ai/providers/openai/responses", base))
+      expect(native.compaction).toEqual({ type: "native" })
+      const summary = yield* resolver.resolveModel(
+        model("@opencode/ai/providers/openai/responses", {
+          ...base,
+          settings: { ...base.settings, compaction: { type: "summary" } },
+        }),
+      )
+      expect(summary.compaction).toEqual({ type: "summary" })
+      const chat = yield* resolver.resolveModel(model("@opencode/ai/providers/openai/chat", base))
+      expect(chat.compaction).toBeUndefined()
+      const custom = yield* resolver.resolveModel(
+        model("@opencode/ai/providers/openai/responses", { ...base, providerID: Provider.ID.make("custom") }),
+      )
+      expect(custom.compaction).toBeUndefined()
+    }),
+  )
+
   it.effect("constructs native Azure requests with deployment IDs and projected resource URLs", () =>
     Effect.gen(function* () {
       const responses = yield* ModelResolver.fromCatalogModel(

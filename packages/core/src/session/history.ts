@@ -1,7 +1,7 @@
-import { and, asc, desc, eq, gte, lt, or, sql } from "drizzle-orm"
+import { and, asc, desc, eq, gte, lt, sql } from "drizzle-orm"
 import { Message } from "@opencode/ai"
 import { Effect, Option, Schema } from "effect"
-import type { Model } from "@opencode/schema/model"
+import { SessionNativeIdentity } from "./native-identity.js"
 import { SessionLegacy } from "@opencode/schema/session-legacy"
 import { Database } from "../database/database.js"
 import { MessageDecodeError } from "./error.js"
@@ -22,7 +22,7 @@ const decodeSync = Schema.decodeUnknownSync(SessionMessage.Info)
  * windows do for model-neutral readers (`latest`), never for the original transcript
  * (`local`), and only when the target model can replay them.
  */
-export type Boundary = "latest" | "local" | Model.Ref
+export type Boundary = "latest" | "local" | SessionNativeIdentity.Target
 
 /** A completed provider compaction, which replays `native.messages` instead of a summary. */
 export const isNativeCompaction = (
@@ -35,14 +35,15 @@ export const NativeWindow = Schema.toCodecJson(Schema.Array(Message))
 const decodeNativeWindow = Schema.decodeUnknownOption(NativeWindow)
 const decodesWindow = (messages: unknown) => Option.isSome(decodeNativeWindow(messages))
 
-// Like other native data, a window only replays on the model that made it. One that no longer decodes, for example
-// a malformed one from a compaction hook, is skipped the same way instead of failing the session.
+// Local identities permit same-deployment OpenAI model changes. Upstream windows without one retain model matching.
+// A malformed window is skipped instead of failing the session.
 const replayable = (message: SessionMessage.Info, boundary: Boundary) =>
   !isNativeCompaction(message) ||
   boundary === "latest" ||
   (boundary !== "local" &&
-    message.model?.providerID === boundary.providerID &&
-    message.model.id === boundary.id &&
+    (message.native[SessionNativeIdentity.metadataKey] !== undefined
+      ? SessionNativeIdentity.compatible(SessionNativeIdentity.read(message.native), boundary.identity)
+      : message.model?.providerID === boundary.providerID && message.model.id === boundary.id) &&
     decodesWindow(message.native.messages))
 
 const latestCompaction = Effect.fnUntraced(function* (
@@ -51,6 +52,26 @@ const latestCompaction = Effect.fnUntraced(function* (
   boundary: Boundary,
   before?: number,
 ) {
+  // Complete the V1 data conversion once a location-scoped model is selected.
+  // Never infer an OpenAI endpoint from another provider/protocol or rebind an installed provenance.
+  const identity = typeof boundary === "string" ? undefined : boundary.identity
+  if (identity?.provider === "openai" && identity.protocol === "openai-responses") {
+    yield* db
+      .update(SessionMessageTable)
+      .set({
+        data: sql`json_set(${SessionMessageTable.data}, case when json_type(${SessionMessageTable.data}, '$.providerContext') = 'object' then '$.providerContext.provenance' else '$.native.openchamberNativeIdentity' end, json(${JSON.stringify(identity)}))`,
+      })
+      .where(
+        and(
+          eq(SessionMessageTable.session_id, sessionID),
+          eq(SessionMessageTable.type, "compaction"),
+          sql`coalesce(json_extract(${SessionMessageTable.data}, '$.native.openchamberNativeIdentity.endpoint'), json_extract(${SessionMessageTable.data}, '$.providerContext.provenance.endpoint')) = ${SessionNativeIdentity.legacyEndpoint}`,
+          sql`coalesce(json_extract(${SessionMessageTable.data}, '$.native.openchamberNativeIdentity.providerID'), json_extract(${SessionMessageTable.data}, '$.providerContext.provenance.providerID')) = ${identity.providerID}`,
+        ),
+      )
+      .run()
+      .pipe(Effect.orDie)
+  }
   return yield* db
     .select({ seq: SessionMessageTable.seq })
     .from(SessionMessageTable)
@@ -60,18 +81,10 @@ const latestCompaction = Effect.fnUntraced(function* (
         eq(SessionMessageTable.type, "compaction"),
         sql`json_extract(${SessionMessageTable.data}, '$.status') = 'completed'`,
         before === undefined ? undefined : lt(SessionMessageTable.seq, before),
-        boundary === "latest"
-          ? undefined
-          : or(
-              // Rows written before v2.1 hold the window in `providerContext`.
-              sql`coalesce(json_extract(${SessionMessageTable.data}, '$.native.messages'), json_extract(${SessionMessageTable.data}, '$.providerContext')) is null`,
-              boundary === "local"
-                ? undefined
-                : and(
-                    sql`json_extract(${SessionMessageTable.data}, '$.model.providerID') = ${boundary.providerID}`,
-                    sql`json_extract(${SessionMessageTable.data}, '$.model.id') = ${boundary.id}`,
-                  ),
-            ),
+        // Compatibility and payload validation share the decode path below, including old row shapes.
+        boundary === "local"
+          ? sql`coalesce(json_extract(${SessionMessageTable.data}, '$.native.messages'), json_extract(${SessionMessageTable.data}, '$.providerContext')) is null`
+          : undefined,
       ),
     )
     .orderBy(desc(SessionMessageTable.seq))
