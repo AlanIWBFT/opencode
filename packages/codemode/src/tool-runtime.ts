@@ -35,7 +35,11 @@ type ServicesOf<Tools, Depth extends ReadonlyArray<unknown>> = Depth["length"] e
     ? R
     : Tools extends {
           readonly _tag: "CodeModeTool"
-          readonly run: (input: unknown) => Effect.Effect<unknown, unknown, infer R>
+          readonly run: (input: unknown, call?: { readonly index: number; readonly name: string }) => Effect.Effect<
+            unknown,
+            unknown,
+            infer R
+          >
         }
       ? R
       : Tools extends object
@@ -783,7 +787,7 @@ export const make = <R>(
         if (isDefinition(tool)) {
           return yield* observeEnd(
             Effect.gen(function* () {
-              const raw = yield* runHost(Effect.suspend(() => tool.run(describedInput)))
+              const raw = yield* runHost(Effect.suspend(() => tool.run(describedInput, currentCall)))
               const result = yield* Effect.try({
                 try: () => decodeToolOutput(tool, raw),
                 catch: () => new ToolRuntimeError("InvalidToolOutput", `Invalid output from tool '${name}'.`),

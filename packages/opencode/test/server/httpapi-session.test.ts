@@ -301,6 +301,21 @@ describe("session HttpApi", () => {
         expect(abort.status).toBe(200)
         expect(yield* responseJson(abort)).toBe(true)
 
+        const stop = yield* request(pathFor(SessionPaths.stop, { sessionID: missingSession }), {
+          headers: { ...headers, "content-type": "application/json" },
+          method: "POST",
+          body: JSON.stringify({ scope: "session-tree" }),
+        })
+        expect(stop.status).toBe(404)
+        expect(yield* responseJson(stop)).toEqual(missingSessionBody)
+
+        const invalidStop = yield* request(pathFor(SessionPaths.stop, { sessionID: missingSession }), {
+          headers: { ...headers, "content-type": "application/json" },
+          method: "POST",
+          body: JSON.stringify({ scope: "unknown" }),
+        })
+        expect(invalidStop.status).toBe(400)
+
         const session = yield* createSession({ title: "missing message" })
         const missingMessage = MessageID.ascending()
         const message = yield* request(

@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test"
 import { CODE_MODE_TOOL, CodeModeTool, Parameters, describeCatalog } from "@/tool/code-mode"
 import type { Tool as MCPToolDef } from "@modelcontextprotocol/sdk/types.js"
 import type { PermissionV1 } from "@opencode-ai/core/v1/permission"
+import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Agent } from "@/agent/agent"
 import { MCP } from "@/mcp"
 import { Permission } from "@/permission"
@@ -42,6 +43,7 @@ function harness(input: {
   servers: string[]
   permission?: PermissionV1.Rule[]
   trigger?: Plugin.Interface["trigger"]
+  parts?: SessionV1.ToolPart[]
 }) {
   return Layer.mergeAll(
     Layer.mock(Plugin.Service, {
@@ -55,6 +57,13 @@ function harness(input: {
     }),
     Layer.mock(Session.Service, {
       get: () => Effect.succeed({ permission: [] } as any),
+      updatePart: (part) =>
+        Effect.sync(() => {
+          const index = input.parts?.findIndex((item) => item.id === part.id) ?? -1
+          if (index === -1) input.parts?.push(part as SessionV1.ToolPart)
+          else input.parts![index] = part as SessionV1.ToolPart
+          return part
+        }),
     }),
     Layer.mock(MCP.Service, {
       tools: () => Effect.succeed(input.mcpTools),
@@ -72,12 +81,13 @@ function build(
   servers?: string[],
   permission?: PermissionV1.Rule[],
   trigger?: Plugin.Interface["trigger"],
+  parts?: SessionV1.ToolPart[],
 ) {
   const names = serverNames(mcpTools, servers)
   return Effect.runPromise(
     CodeModeTool.pipe(
       Effect.flatMap(Tool.init),
-      Effect.provide(harness({ mcpTools, servers: names, permission, trigger })),
+      Effect.provide(harness({ mcpTools, servers: names, permission, trigger, parts })),
     ),
   )
 }
@@ -139,7 +149,9 @@ describe("code mode execute", () => {
   test("the static base description carries no catalog; the registry appends it", async () => {
     const tool = await build({ github_list_issues: mcpTool("list_issues", () => "") })
     expect(tool.id).toBe(CODE_MODE_TOOL)
-    expect(tool.description).toBe("Run a confined orchestration script with access to connected MCP tools.")
+    expect(tool.description).toBe(
+      "Run a confined orchestration script with access to available OpenCode and MCP tools.",
+    )
     expect(tool.description).not.toContain("Available tools")
     expect(tool.description).not.toContain("list_issues")
   })
@@ -254,6 +266,266 @@ describe("code mode execute", () => {
     const output = await Effect.runPromise(tool.execute({ code: "return 1 + 2" }, ctx))
     expect(output.output).toBe("3")
     expect(output.metadata.toolCalls).toEqual([])
+  })
+
+  test("calls a native OpenCode tool and projects its structured result", async () => {
+    const parts: SessionV1.ToolPart[] = []
+    const tool = await build({}, undefined, undefined, undefined, parts)
+    const updates: Array<{ metadata?: { toolCalls?: Array<{ title?: string; metadata?: Record<string, unknown> }> } }> =
+      []
+    const parameters = Schema.Struct({ value: Schema.String })
+    const native: Tool.Def<typeof parameters> = {
+      id: "lookup",
+      description: "Look up a value",
+      parameters,
+      codeMode: { concurrency: "parallel" },
+      execute: (input, childCtx) =>
+        childCtx
+          .metadata({ title: "Looking up", metadata: { source: "native" } })
+          .pipe(Effect.as({ title: "lookup", output: input.value.toUpperCase(), metadata: { source: "native" } })),
+    }
+    const output = await Effect.runPromise(
+      tool.execute(
+        { code: "return await tools.$opencode.lookup({ value: 'hello' })" },
+        {
+          ...ctx,
+          extra: { codeModeTools: [native] },
+          metadata: (update) => Effect.sync(() => void updates.push(update)),
+        },
+      ),
+    )
+    expect(output.output).toBe("HELLO")
+    expect(parts).toHaveLength(1)
+    expect(parts[0]).toMatchObject({
+      tool: "lookup",
+      state: {
+        status: "completed",
+        input: { value: "hello" },
+        output: "HELLO",
+        title: "lookup",
+        metadata: { source: "native" },
+      },
+      metadata: { codeMode: { parentCallID: "call_code_mode", runtimeCallID: "0" } },
+    })
+    expect(updates.some((update) => update.metadata?.toolCalls?.[0]?.title === "Looking up")).toBe(true)
+    expect(updates.some((update) => update.metadata?.toolCalls?.[0]?.metadata?.source === "native")).toBe(true)
+  })
+
+  test("keeps projected tool identity after an internal catalog search", async () => {
+    const parts: SessionV1.ToolPart[] = []
+    const parameters = Schema.Struct({ value: Schema.String })
+    const native: Tool.Def<typeof parameters> = {
+      id: "lookup",
+      description: "Look up a value",
+      parameters,
+      codeMode: { concurrency: "parallel" },
+      execute: (input) => Effect.succeed({ title: "lookup", output: input.value, metadata: {} }),
+    }
+    const tool = await build({}, undefined, undefined, undefined, parts)
+    const output = await Effect.runPromise(
+      tool.execute(
+        {
+          code: "await tools.$codemode.search({ query: 'lookup' }); return await tools.$opencode.lookup({ value: 'ok' })",
+        },
+        { ...ctx, extra: { codeModeTools: [native] } },
+      ),
+    )
+
+    expect(output.output).toBe("ok")
+    expect(parts).toHaveLength(1)
+    expect(parts[0]).toMatchObject({
+      tool: "lookup",
+      state: { status: "completed", output: "ok" },
+      metadata: { codeMode: { runtimeCallID: "1" } },
+    })
+  })
+
+  test("runs registered native cleanup when execution is cancelled", async () => {
+    const parts: SessionV1.ToolPart[] = []
+    const tool = await build({}, undefined, undefined, undefined, parts)
+    const controller = new AbortController()
+    let ready = () => {}
+    const registered = new Promise<void>((resolve) => (ready = resolve))
+    let cleaned = false
+    const parameters = Schema.Struct({})
+    const launch: Tool.Def<typeof parameters> = {
+      id: "launch",
+      description: "Launch a resource",
+      parameters,
+      codeMode: { concurrency: "parallel" },
+      execute: (_input, childCtx) =>
+        Effect.sync(() => {
+          childCtx.registerCleanup?.(Effect.sync(() => void (cleaned = true)))
+          ready()
+          return { title: "launch", output: "started", metadata: {} }
+        }),
+    }
+    const block: Tool.Def<typeof parameters> = {
+      id: "block",
+      description: "Block forever",
+      parameters,
+      codeMode: { concurrency: "parallel" },
+      execute: () => Effect.never,
+    }
+    const running = Effect.runPromise(
+      tool.execute(
+        { code: "await tools.$opencode.launch({}); return await tools.$opencode.block({})" },
+        { ...ctx, abort: controller.signal, extra: { codeModeTools: [launch, block] } },
+      ),
+    )
+    await registered
+    controller.abort()
+
+    expect((await running).output).toBe("Execution cancelled.")
+    expect(cleaned).toBe(true)
+    expect(parts.find((part) => part.tool === "block")?.state.status).toBe("error")
+  })
+
+  test("projects only stable exec metadata into the sandbox", async () => {
+    const tool = await build({})
+    const parameters = Schema.Struct({})
+    const native: Tool.Def<typeof parameters> = {
+      id: "exec_command",
+      description: "Execute",
+      parameters,
+      codeMode: { concurrency: "parallel" },
+      execute: () =>
+        Effect.succeed({
+          title: "exec",
+          output: "partial",
+          metadata: {
+            execID: 7,
+            laneID: 3,
+            processRunning: true,
+            output: "full transcript must stay outside the sandbox",
+            interactions: [{ type: "root" }],
+          },
+        }),
+    }
+    const output = await Effect.runPromise(
+      tool.execute(
+        { code: "return await tools.$opencode.exec_command({})" },
+        { ...ctx, extra: { codeModeTools: [native] } },
+      ),
+    )
+
+    expect(JSON.parse(output.output)).toEqual({ output: "partial", execID: 7, laneID: 3, running: true })
+    expect(output.output).not.toContain("full transcript")
+  })
+
+  test("limits the number of native tool calls in one execution", async () => {
+    const tool = await build({})
+    const parameters = Schema.Struct({})
+    const native: Tool.Def<typeof parameters> = {
+      id: "count",
+      description: "Count one call",
+      parameters,
+      codeMode: { concurrency: "parallel" },
+      execute: () => Effect.succeed({ title: "count", output: "ok", metadata: {} }),
+    }
+    const error = await failure(
+      tool.execute(
+        { code: "for (let i = 0; i < 65; i++) await tools.$opencode.count({}); return 'done'" },
+        { ...ctx, extra: { codeModeTools: [native] } },
+      ),
+    )
+
+    expect(error.message).toContain("tool-call limit of 64")
+  })
+
+  test("serializes native tools in the same concurrency group", async () => {
+    const tool = await build({})
+    let release = () => {}
+    let signalStarted = () => {}
+    const gate = new Promise<void>((resolve) => (release = resolve))
+    const started = new Promise<void>((resolve) => (signalStarted = resolve))
+    let secondStarted = false
+    const parameters = Schema.Struct({})
+    const first: Tool.Def<typeof parameters> = {
+      id: "first",
+      description: "First serial tool",
+      parameters,
+      codeMode: { concurrency: "serial", group: "shared" },
+      execute: () =>
+        Effect.promise(async () => {
+          signalStarted()
+          await gate
+          return { title: "first", output: "first", metadata: {} }
+        }),
+    }
+    const second: Tool.Def<typeof parameters> = {
+      id: "second",
+      description: "Second serial tool",
+      parameters,
+      codeMode: { concurrency: "serial", group: "shared" },
+      execute: () =>
+        Effect.sync(() => {
+          secondStarted = true
+          return { title: "second", output: "second", metadata: {} }
+        }),
+    }
+    const running = Effect.runPromise(
+      tool.execute(
+        {
+          code: "return await Promise.all([tools.$opencode.first({}), tools.$opencode.second({})])",
+        },
+        { ...ctx, extra: { codeModeTools: [first, second] } },
+      ),
+    )
+    await started
+    expect(secondStarted).toBe(false)
+    release()
+    expect(JSON.parse((await running).output)).toEqual(["first", "second"])
+  })
+
+  test("serializes matching dynamic concurrency keys without blocking other keys", async () => {
+    const tool = await build({})
+    let release = () => {}
+    let signalFirst = () => {}
+    let signalOther = () => {}
+    const gate = new Promise<void>((resolve) => (release = resolve))
+    const firstStarted = new Promise<void>((resolve) => (signalFirst = resolve))
+    const otherStarted = new Promise<void>((resolve) => (signalOther = resolve))
+    let matchingCalls = 0
+    let repeatedStarted = false
+    const parameters = Schema.Struct({ exec_id: Schema.Number })
+    const control: Tool.Def<typeof parameters> = {
+      id: "control",
+      description: "Execution control",
+      parameters,
+      codeMode: {
+        concurrency: "serial",
+        group: "exec-session",
+        key: (input) => `exec-session:${(input as { exec_id: number }).exec_id}`,
+      },
+      execute: (input) =>
+        Effect.promise(async () => {
+          if (input.exec_id === 2) {
+            signalOther()
+            return { title: "control", output: "other", metadata: {} }
+          }
+          matchingCalls++
+          if (matchingCalls > 1) {
+            repeatedStarted = true
+            return { title: "control", output: "repeated", metadata: {} }
+          }
+          signalFirst()
+          await gate
+          return { title: "control", output: "first", metadata: {} }
+        }),
+    }
+    const running = Effect.runPromise(
+      tool.execute(
+        {
+          code: "return await Promise.all([tools.$opencode.control({ exec_id: 1 }), tools.$opencode.control({ exec_id: 1 }), tools.$opencode.control({ exec_id: 2 })])",
+        },
+        { ...ctx, extra: { codeModeTools: [control] } },
+      ),
+    )
+    await Promise.all([firstStarted, otherStarted])
+    expect(repeatedStarted).toBe(false)
+    release()
+    expect(JSON.parse((await running).output)).toEqual(["first", "repeated", "other"])
   })
 
   test("Object.keys(tools) enumerates the MCP server and CodeMode namespaces", async () => {
@@ -414,10 +686,10 @@ describe("code mode execute", () => {
 
     expect(out.output).toBe("done")
     expect(events.map((e) => [e.name, e.input.tool, e.input.callID])).toEqual([
-      ["tool.execute.before", "a_tool", "call_code_mode/1"],
-      ["tool.execute.after", "a_tool", "call_code_mode/1"],
-      ["tool.execute.before", "b_tool", "call_code_mode/2"],
-      ["tool.execute.after", "b_tool", "call_code_mode/2"],
+      ["tool.execute.before", "a_tool", "call_code_mode/code-mode/0"],
+      ["tool.execute.after", "a_tool", "call_code_mode/code-mode/0"],
+      ["tool.execute.before", "b_tool", "call_code_mode/code-mode/1"],
+      ["tool.execute.after", "b_tool", "call_code_mode/code-mode/1"],
     ])
     const [before, after] = events
     expect(before!.input.sessionID).toBe(ctx.sessionID)
@@ -463,7 +735,10 @@ describe("code mode execute", () => {
   })
 
   test("streams live per-call metadata as a call starts and finishes", async () => {
-    const snapshots: Array<{ toolCalls: { tool: string; status: string; input?: Record<string, unknown> }[] }> = []
+    const snapshots: Array<{
+      codeMode?: { projected: true }
+      toolCalls: { tool: string; status: string; input?: Record<string, unknown> }[]
+    }> = []
     const recordingCtx: Tool.Context = {
       ...ctx,
       metadata: (val: any) => Effect.sync(() => void snapshots.push(val.metadata)),
@@ -475,15 +750,20 @@ describe("code mode execute", () => {
     )
 
     expect(snapshots).toContainEqual({
+      codeMode: { projected: true },
       toolCalls: [{ tool: "greeter.hello", status: "running", input: { name: "Ada" } }],
     })
     expect(snapshots).toContainEqual({
+      codeMode: { projected: true },
       toolCalls: [{ tool: "greeter.hello", status: "completed", input: { name: "Ada" } }],
     })
   })
 
   test("marks a failed child call as error in the live metadata", async () => {
-    const snapshots: Array<{ toolCalls: { tool: string; status: string; input?: Record<string, unknown> }[] }> = []
+    const snapshots: Array<{
+      codeMode?: { projected: true }
+      toolCalls: { tool: string; status: string; input?: Record<string, unknown> }[]
+    }> = []
     const recordingCtx: Tool.Context = {
       ...ctx,
       metadata: (val: any) => Effect.sync(() => void snapshots.push(val.metadata)),
@@ -499,7 +779,10 @@ describe("code mode execute", () => {
       ),
     )
 
-    expect(snapshots).toContainEqual({ toolCalls: [{ tool: "bad.tool", status: "error", input: { reason: "test" } }] })
+    expect(snapshots).toContainEqual({
+      codeMode: { projected: true },
+      toolCalls: [{ tool: "bad.tool", status: "error", input: { reason: "test" } }],
+    })
   })
 
   test("accumulates stripped media as execute attachments the sandbox never sees", async () => {

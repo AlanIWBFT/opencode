@@ -109,11 +109,12 @@ it.instance(
   },
 )
 
-it.instance("explore agent denies edit and write", () =>
+it.instance("explore agent allows Code Mode but denies edit and write", () =>
   Effect.gen(function* () {
     const explore = yield* load((svc) => svc.get("explore"))
     expect(explore).toBeDefined()
     expect(explore?.mode).toBe("subagent")
+    expect(evalPerm(explore, "execute")).toBe("allow")
     expect(evalPerm(explore, "edit")).toBe("deny")
     expect(evalPerm(explore, "write")).toBe("deny")
     expect(evalPerm(explore, "todowrite")).toBe("deny")

@@ -57,6 +57,7 @@ import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { LocationServiceMap, locationServiceMapLayer } from "@opencode-ai/core/location-services"
+import { ExecSession } from "@/tool/exec-session"
 
 const summary = Layer.succeed(
   SessionSummary.Service,
@@ -206,6 +207,7 @@ const promptRoot = LayerNode.group([
   SystemPrompt.node,
   CrossSpawnSpawner.node,
   RuntimeFlags.node,
+  ExecSession.node,
 ])
 
 function makePrompt(input?: { mcpInstructions?: MCP.ServerInstructions[]; processor?: "blocking" }) {
@@ -255,6 +257,423 @@ const withMcpInstructions = testEffect(
 )
 const unix = process.platform !== "win32" ? it.instance : it.instance.skip
 const unixNoLLMServer = process.platform !== "win32" ? noLLMServer.instance : noLLMServer.instance.skip
+
+it.instance("cancel leaves detached exec sessions running until explicit stop", () =>
+  Effect.gen(function* () {
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const execSessions = yield* ExecSession.Service
+    const test = yield* TestInstance
+    const chat = yield* sessions.create({ title: "Detached exec" })
+    const invocation: ExecSession.Invocation = {
+      sessionID: chat.id,
+      messageID: MessageID.ascending(),
+      display: "root",
+      metadata: () => Effect.void,
+    }
+    const env = Object.fromEntries(
+      Object.entries(process.env).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
+    )
+    const launched = yield* execSessions.launch({
+      command: "wait",
+      shell: process.execPath,
+      args: ["-e", "setInterval(() => {}, 50)"],
+      cwd: test.directory,
+      env,
+      yieldTimeMs: 0,
+      invocation,
+    })
+    expect(launched.running).toBe(true)
+
+    yield* prompt.cancel(chat.id)
+    const afterCancel = yield* execSessions.write({
+      sessionID: launched.sessionID!,
+      yieldTimeMs: 0,
+      invocation: { ...invocation, display: "poll" },
+    })
+    expect(afterCancel.running).toBe(true)
+
+    const stopped = yield* prompt.stop({ sessionID: chat.id, scope: "session-tree" })
+    expect(stopped).toEqual({ sessions: 1, matched: 1, terminated: 1, failed: 0 })
+  }),
+)
+
+it.instance("persists natural exit after the launching tool call is interrupted", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const execSessions = yield* ExecSession.Service
+    const test = yield* TestInstance
+    const chat = yield* sessions.create({ title: "Interrupted launch watcher" })
+    const parent = yield* user(chat.id, "run briefly")
+    const message = yield* sessions.updateMessage({
+      id: MessageID.ascending(),
+      role: "assistant",
+      parentID: parent.id,
+      sessionID: chat.id,
+      mode: "build",
+      agent: "build",
+      cost: 0,
+      path: { cwd: test.directory, root: test.directory },
+      tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      modelID: ref.modelID,
+      providerID: ref.providerID,
+      time: { created: Date.now() },
+    } satisfies SessionV1.Assistant)
+    const part = yield* sessions.updatePart({
+      id: PartID.ascending(),
+      messageID: message.id,
+      sessionID: chat.id,
+      type: "tool",
+      tool: "exec_command",
+      callID: "call_interrupted_launch",
+      state: {
+        status: "running",
+        input: { cmd: "exit later" },
+        title: "exit later",
+        metadata: { processRunning: true },
+        time: { start: Date.now() },
+      },
+    } satisfies SessionV1.ToolPart)
+    const launched = yield* Deferred.make<number>()
+    const env = Object.fromEntries(
+      Object.entries(process.env).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
+    )
+    const fiber = yield* execSessions
+      .launch({
+        command: "exit later",
+        shell: process.execPath,
+        args: ["-e", "setTimeout(() => process.exit(0), 300)"],
+        cwd: test.directory,
+        env,
+        yieldTimeMs: 30_000,
+        invocation: {
+          sessionID: chat.id,
+          messageID: message.id,
+          callID: part.callID,
+          display: "root",
+          metadata: () => Effect.void,
+        },
+        onSession: (sessionID) => Deferred.succeed(launched, sessionID).pipe(Effect.asVoid),
+      })
+      .pipe(Effect.forkScoped)
+    yield* Deferred.await(launched)
+    yield* Fiber.interrupt(fiber)
+
+    const updated = yield* pollWithTimeout(
+      Effect.gen(function* () {
+        const current = yield* sessions.getPart({ sessionID: chat.id, messageID: message.id, partID: part.id })
+        if (current?.type !== "tool" || current.state.status === "pending") return
+        return current.state.metadata?.processRunning === false ? current : undefined
+      }),
+      "interrupted launch watcher did not persist natural exit",
+    )
+    expect(updated.state.status).toBe("running")
+    if (updated.state.status === "pending") return
+    expect(updated.state.metadata?.exitCode).toBe(0)
+  }),
+)
+
+it.instance("reverted branch stop preserves exec sessions before the boundary", () =>
+  Effect.gen(function* () {
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const execSessions = yield* ExecSession.Service
+    const test = yield* TestInstance
+    const chat = yield* sessions.create({ title: "Revert scope" })
+    const retained = yield* user(chat.id, "retained")
+    const boundary = yield* user(chat.id, "revert this")
+    const env = Object.fromEntries(
+      Object.entries(process.env).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
+    )
+    const launch = (messageID: MessageID) =>
+      execSessions.launch({
+        command: "wait",
+        shell: process.execPath,
+        args: ["-e", "setInterval(() => {}, 50)"],
+        cwd: test.directory,
+        env,
+        yieldTimeMs: 0,
+        invocation: {
+          sessionID: chat.id,
+          messageID,
+          display: "root",
+          metadata: () => Effect.void,
+        },
+      })
+    const retainedExec = yield* launch(retained.id)
+    const hiddenExec = yield* launch(boundary.id)
+
+    const stopped = yield* prompt.stop({ sessionID: chat.id, scope: "reverted-branch", messageID: boundary.id })
+    expect(stopped).toEqual({ sessions: 1, matched: 1, terminated: 1, failed: 0 })
+    const retainedResult = yield* execSessions.write({
+      sessionID: retainedExec.sessionID!,
+      yieldTimeMs: 0,
+      invocation: {
+        sessionID: chat.id,
+        messageID: retained.id,
+        display: "poll",
+        metadata: () => Effect.void,
+      },
+    })
+    const hiddenResult = yield* execSessions.write({
+      sessionID: hiddenExec.sessionID!,
+      yieldTimeMs: 0,
+      invocation: {
+        sessionID: chat.id,
+        messageID: boundary.id,
+        display: "poll",
+        metadata: () => Effect.void,
+      },
+    })
+    expect(retainedResult.running).toBe(true)
+    expect(hiddenResult.running).toBe(false)
+    yield* execSessions.terminate({
+      sessionID: retainedExec.sessionID!,
+      invocation: {
+        sessionID: chat.id,
+        messageID: retained.id,
+        display: "terminate",
+        metadata: () => Effect.void,
+      },
+    })
+  }),
+)
+
+it.instance("reverted branch stop preserves an unrelated existing child session", () =>
+  Effect.gen(function* () {
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const execSessions = yield* ExecSession.Service
+    const test = yield* TestInstance
+    const chat = yield* sessions.create({ title: "Unrelated child scope" })
+    const sibling = yield* sessions.create({ parentID: chat.id, title: "Independent child" })
+    const siblingMessage = yield* user(sibling.id, "independent work")
+    yield* Effect.sleep("2 millis")
+    yield* user(chat.id, "retained")
+    const boundary = yield* user(chat.id, "revert this")
+    const env = Object.fromEntries(
+      Object.entries(process.env).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
+    )
+    const launch = (sessionID: SessionID, messageID: MessageID) =>
+      execSessions.launch({
+        command: "wait",
+        shell: process.execPath,
+        args: ["-e", "setInterval(() => {}, 50)"],
+        cwd: test.directory,
+        env,
+        yieldTimeMs: 0,
+        invocation: { sessionID, messageID, display: "root", metadata: () => Effect.void },
+      })
+    const siblingExec = yield* launch(sibling.id, siblingMessage.id)
+    const hiddenExec = yield* launch(chat.id, boundary.id)
+
+    const stopped = yield* prompt.stop({ sessionID: chat.id, scope: "reverted-branch", messageID: boundary.id })
+    expect(stopped).toEqual({ sessions: 1, matched: 1, terminated: 1, failed: 0 })
+    const siblingResult = yield* execSessions.write({
+      sessionID: siblingExec.sessionID!,
+      yieldTimeMs: 0,
+      invocation: { sessionID: sibling.id, messageID: siblingMessage.id, display: "poll", metadata: () => Effect.void },
+    })
+    const hiddenResult = yield* execSessions.write({
+      sessionID: hiddenExec.sessionID!,
+      yieldTimeMs: 0,
+      invocation: { sessionID: chat.id, messageID: boundary.id, display: "poll", metadata: () => Effect.void },
+    })
+    expect(siblingResult.running).toBe(true)
+    expect(hiddenResult.running).toBe(false)
+    yield* execSessions.terminate({
+      sessionID: siblingExec.sessionID!,
+      invocation: { sessionID: sibling.id, messageID: siblingMessage.id, display: "terminate", metadata: () => Effect.void },
+    })
+  }),
+)
+
+it.instance("reverted branch stop preserves earlier exec when first resuming an existing child", () =>
+  Effect.gen(function* () {
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const execSessions = yield* ExecSession.Service
+    const test = yield* TestInstance
+    const chat = yield* sessions.create({ title: "First child resume scope" })
+    const child = yield* sessions.create({ parentID: chat.id, title: "Existing child" })
+    const childRetained = yield* user(child.id, "child retained")
+    yield* Effect.sleep("2 millis")
+    yield* user(chat.id, "retained root")
+    const boundary = yield* user(chat.id, "resume existing task")
+    const assistant = yield* sessions.updateMessage({
+      id: MessageID.ascending(),
+      role: "assistant",
+      parentID: boundary.id,
+      sessionID: chat.id,
+      mode: "build",
+      agent: "build",
+      cost: 0,
+      path: { cwd: test.directory, root: test.directory },
+      tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      modelID: ref.modelID,
+      providerID: ref.providerID,
+      time: { created: Date.now() },
+    } satisfies SessionV1.Assistant)
+    const taskStart = Date.now()
+    yield* sessions.updatePart({
+      id: PartID.ascending(),
+      messageID: assistant.id,
+      sessionID: chat.id,
+      type: "tool",
+      tool: "task",
+      callID: "call_first_resume",
+      state: {
+        status: "completed",
+        input: { task_id: child.id },
+        output: "running",
+        title: "resume existing task",
+        metadata: { sessionId: child.id },
+        time: { start: taskStart, end: taskStart },
+      },
+    } satisfies SessionV1.ToolPart)
+    yield* Effect.sleep("2 millis")
+    const childHidden = yield* user(child.id, "child hidden continuation")
+    const env = Object.fromEntries(
+      Object.entries(process.env).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
+    )
+    const launch = (messageID: MessageID) =>
+      execSessions.launch({
+        command: "wait",
+        shell: process.execPath,
+        args: ["-e", "setInterval(() => {}, 50)"],
+        cwd: test.directory,
+        env,
+        yieldTimeMs: 0,
+        invocation: { sessionID: child.id, messageID, display: "root", metadata: () => Effect.void },
+      })
+    const retainedExec = yield* launch(childRetained.id)
+    const hiddenExec = yield* launch(childHidden.id)
+
+    const stopped = yield* prompt.stop({ sessionID: chat.id, scope: "reverted-branch", messageID: boundary.id })
+    expect(stopped).toEqual({ sessions: 2, matched: 1, terminated: 1, failed: 0 })
+    const retainedResult = yield* execSessions.write({
+      sessionID: retainedExec.sessionID!,
+      yieldTimeMs: 0,
+      invocation: { sessionID: child.id, messageID: childRetained.id, display: "poll", metadata: () => Effect.void },
+    })
+    const hiddenResult = yield* execSessions.write({
+      sessionID: hiddenExec.sessionID!,
+      yieldTimeMs: 0,
+      invocation: { sessionID: child.id, messageID: childHidden.id, display: "poll", metadata: () => Effect.void },
+    })
+    expect(retainedResult.running).toBe(true)
+    expect(hiddenResult.running).toBe(false)
+    yield* execSessions.terminate({
+      sessionID: retainedExec.sessionID!,
+      invocation: { sessionID: child.id, messageID: childRetained.id, display: "terminate", metadata: () => Effect.void },
+    })
+  }),
+)
+
+it.instance("reverted branch stop preserves earlier exec in a resumed child session", () =>
+  Effect.gen(function* () {
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const execSessions = yield* ExecSession.Service
+    const test = yield* TestInstance
+    const chat = yield* sessions.create({ title: "Resumed child scope" })
+    const child = yield* sessions.create({ parentID: chat.id, title: "Child" })
+    const retained = yield* user(chat.id, "retained task")
+    const retainedAssistant = yield* sessions.updateMessage({
+      id: MessageID.ascending(),
+      role: "assistant",
+      parentID: retained.id,
+      sessionID: chat.id,
+      mode: "build",
+      agent: "build",
+      cost: 0,
+      path: { cwd: test.directory, root: test.directory },
+      tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      modelID: ref.modelID,
+      providerID: ref.providerID,
+      time: { created: Date.now() },
+    } satisfies SessionV1.Assistant)
+    const retainedTaskStart = Date.now()
+    yield* sessions.updatePart({
+      id: PartID.ascending(),
+      messageID: retainedAssistant.id,
+      sessionID: chat.id,
+      type: "tool",
+      tool: "task",
+      callID: "call_retained_task",
+      state: {
+        status: "completed",
+        input: {},
+        output: "done",
+        title: "retained task",
+        metadata: { sessionId: child.id },
+        time: { start: retainedTaskStart, end: retainedTaskStart },
+      },
+    } satisfies SessionV1.ToolPart)
+    const childRetained = yield* user(child.id, "child retained")
+    yield* Effect.sleep("2 millis")
+    const boundary = yield* user(chat.id, "resume task")
+    const hiddenAssistant = yield* sessions.updateMessage({
+      ...retainedAssistant,
+      id: MessageID.ascending(),
+      parentID: boundary.id,
+      time: { created: Date.now() },
+    })
+    const hiddenTaskStart = Date.now()
+    yield* sessions.updatePart({
+      id: PartID.ascending(),
+      messageID: hiddenAssistant.id,
+      sessionID: chat.id,
+      type: "tool",
+      tool: "task",
+      callID: "call_hidden_task",
+      state: {
+        status: "completed",
+        input: {},
+        output: "running",
+        title: "resume task",
+        metadata: { sessionId: child.id },
+        time: { start: hiddenTaskStart, end: hiddenTaskStart },
+      },
+    } satisfies SessionV1.ToolPart)
+    yield* Effect.sleep("2 millis")
+    const childHidden = yield* user(child.id, "child hidden")
+    const env = Object.fromEntries(
+      Object.entries(process.env).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
+    )
+    const launch = (messageID: MessageID) =>
+      execSessions.launch({
+        command: "wait",
+        shell: process.execPath,
+        args: ["-e", "setInterval(() => {}, 50)"],
+        cwd: test.directory,
+        env,
+        yieldTimeMs: 0,
+        invocation: { sessionID: child.id, messageID, display: "root", metadata: () => Effect.void },
+      })
+    const retainedExec = yield* launch(childRetained.id)
+    const hiddenExec = yield* launch(childHidden.id)
+
+    const stopped = yield* prompt.stop({ sessionID: chat.id, scope: "reverted-branch", messageID: boundary.id })
+    expect(stopped).toEqual({ sessions: 2, matched: 1, terminated: 1, failed: 0 })
+    const retainedResult = yield* execSessions.write({
+      sessionID: retainedExec.sessionID!,
+      yieldTimeMs: 0,
+      invocation: { sessionID: child.id, messageID: childRetained.id, display: "poll", metadata: () => Effect.void },
+    })
+    const hiddenResult = yield* execSessions.write({
+      sessionID: hiddenExec.sessionID!,
+      yieldTimeMs: 0,
+      invocation: { sessionID: child.id, messageID: childHidden.id, display: "poll", metadata: () => Effect.void },
+    })
+    expect(retainedResult.running).toBe(true)
+    expect(hiddenResult.running).toBe(false)
+    yield* execSessions.terminate({
+      sessionID: retainedExec.sessionID!,
+      invocation: { sessionID: child.id, messageID: childRetained.id, display: "terminate", metadata: () => Effect.void },
+    })
+  }),
+)
 
 // Config that registers a custom "test" provider with a "test-model" model
 // so provider model lookup succeeds inside the loop.

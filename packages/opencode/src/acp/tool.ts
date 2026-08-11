@@ -41,6 +41,10 @@ export function toToolKind(toolName: string): ToolKind {
   switch (tool) {
     case "bash":
     case "shell":
+    case "exec_command":
+    case "poll_exec":
+    case "write_stdin":
+    case "terminate_exec":
       return "execute"
 
     case "webfetch":
@@ -75,7 +79,8 @@ export function toLocations(toolName: string, input: ToolInput, cwd?: string): T
 
   switch (tool) {
     case "bash":
-    case "shell": {
+    case "shell":
+    case "exec_command": {
       const workdir = shellWorkdir(input, cwd)
       return workdir ? [{ path: workdir }] : []
     }
@@ -101,8 +106,7 @@ export function toLocations(toolName: string, input: ToolInput, cwd?: string): T
 }
 
 export function completedToolContent(toolName: string, state: CompletedToolState): ToolCallContent[] {
-  const text =
-    toolName.toLocaleLowerCase() === "read" ? (readDisplayText(state.metadata) ?? state.output) : state.output
+  const text = completedToolOutput(toolName, state)
   const content: ToolCallContent[] = [
     {
       type: "content",
@@ -189,12 +193,14 @@ export function completedToolUpdate(input: {
   readonly state: CompletedToolState & { readonly title?: string }
   readonly cwd?: string
 }): ToolCallUpdate {
+  const output = completedToolOutput(input.toolName, input.state)
+  const rawOutput = input.toolName.toLocaleLowerCase() === "exec_command" ? output : input.state.output
   return {
     toolCallId: input.toolCallId,
     status: "completed",
     ...(input.state.title ? { title: input.state.title } : {}),
     content: completedToolContent(input.toolName, input.state),
-    rawOutput: completedToolRawOutput(input.state),
+    rawOutput: completedToolRawOutput(input.state, rawOutput),
   }
 }
 
@@ -227,9 +233,9 @@ export function errorToolUpdate(input: {
   }
 }
 
-export function completedToolRawOutput(state: CompletedToolState) {
+export function completedToolRawOutput(state: CompletedToolState, output = state.output) {
   return {
-    output: state.output,
+    output,
     ...(state.metadata !== undefined ? { metadata: state.metadata } : {}),
     ...(state.attachments?.length ? { attachments: state.attachments } : {}),
   }
@@ -258,6 +264,13 @@ export function extractImageAttachments(attachments: ReadonlyArray<ToolAttachmen
 export function shellOutputSnapshot(state: { readonly metadata?: unknown }) {
   if (!state.metadata || typeof state.metadata !== "object") return undefined
   return stringValue((state.metadata as Record<string, unknown>).output)
+}
+
+function completedToolOutput(toolName: string, state: CompletedToolState) {
+  const tool = toolName.toLocaleLowerCase()
+  if (tool === "read") return readDisplayText(state.metadata) ?? state.output
+  if (tool === "exec_command") return shellOutputSnapshot(state) ?? state.output
+  return state.output
 }
 
 // For shell tools, surface the actual command as the title so it stays visible
@@ -293,7 +306,7 @@ function shellCommand(input: ToolInput) {
 
 function isShell(toolName: string) {
   const tool = toolName.toLocaleLowerCase()
-  return tool === "bash" || tool === "shell"
+  return tool === "bash" || tool === "shell" || tool === "exec_command"
 }
 
 export const mapToolKind = toToolKind

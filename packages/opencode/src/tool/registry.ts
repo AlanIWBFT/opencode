@@ -16,6 +16,8 @@ import { WebFetchTool } from "./webfetch"
 import { WriteTool } from "./write"
 import { InvalidTool } from "./invalid"
 import { SkillTool } from "./skill"
+import { ExecCommandTool, PollExecTool, TerminateExecTool, WriteStdinTool } from "./unified-exec"
+import { ExecSession } from "./exec-session"
 import * as Tool from "./tool"
 import { Config } from "@/config/config"
 import { type ToolContext as PluginToolContext, type ToolDefinition } from "@opencode-ai/plugin"
@@ -84,7 +86,15 @@ export interface Interface {
     modelID: ModelV2.ID
     agent: Agent.Info
     permission?: PermissionV1.Ruleset
+    tools?: Record<string, boolean>
   }) => Effect.Effect<Tool.Def[]>
+  readonly resolve: (model: {
+    providerID: ProviderV2.ID
+    modelID: ModelV2.ID
+    agent: Agent.Info
+    permission?: PermissionV1.Ruleset
+    tools?: Record<string, boolean>
+  }) => Effect.Effect<{ direct: Tool.Def[]; nested: Tool.Def[] }>
 }
 
 export const planEnabled = (client: string) => clients.includes(client)
@@ -111,6 +121,14 @@ const layer = Layer.effect(
     const webfetch = yield* WebFetchTool
     const websearch = yield* WebSearchTool
     const shell = yield* ShellTool
+    const execTools = flags.experimentalUnifiedExecTool
+      ? yield* Effect.all({
+          execCommand: ExecCommandTool,
+          pollExec: PollExecTool,
+          writeStdin: WriteStdinTool,
+          terminateExec: TerminateExecTool,
+        })
+      : undefined
     const globtool = yield* GlobTool
     const writetool = yield* WriteTool
     const edit = yield* EditTool
@@ -229,26 +247,38 @@ const layer = Layer.effect(
           plan: Tool.init(plan),
           ...(codeModeTool ? { execute: Tool.init(codeModeTool) } : {}),
         })
+        const execDefs: Tool.Def[] = []
+        if (execTools) {
+          execDefs.push(yield* Tool.init(execTools.execCommand))
+          execDefs.push(yield* Tool.init(execTools.pollExec))
+          execDefs.push(yield* Tool.init(execTools.writeStdin))
+          execDefs.push(yield* Tool.init(execTools.terminateExec))
+        }
 
         return {
           custom,
           builtin: [
             tool.invalid,
             ...(questionEnabled ? [tool.question] : []),
-            tool.shell,
-            tool.read,
-            tool.glob,
-            tool.grep,
-            tool.edit,
-            tool.write,
+            ...(execTools ? [] : [nested(tool.shell, "serial", "shell")]),
+            ...execDefs.map((item) =>
+              item.id === "exec_command"
+                ? nested(item, "parallel")
+                : nested(item, "serial", "exec-session", undefined, execSessionConcurrencyKey),
+            ),
+            nested(tool.read, "parallel"),
+            nested(tool.glob, "parallel"),
+            nested(tool.grep, "parallel"),
+            nested(tool.edit, "serial", "filesystem-write"),
+            nested(tool.write, "serial", "filesystem-write"),
             tool.task,
-            tool.fetch,
+            nested(tool.fetch, "parallel", "network", 4),
             tool.todo,
-            tool.search,
+            nested(tool.search, "parallel", "network", 4),
             tool.skill,
-            tool.patch,
+            nested(tool.patch, "serial", "filesystem-write"),
             ...(tool.execute ? [tool.execute] : []),
-            ...(flags.experimentalLspTool ? [tool.lsp] : []),
+            ...(flags.experimentalLspTool ? [nested(tool.lsp, "parallel", "lsp", 4)] : []),
             ...(planOn ? [tool.plan] : []),
           ],
           task: tool.task,
@@ -281,18 +311,22 @@ const layer = Layer.effect(
       return ["Available agent types and the tools they have access to:", description].join("\n")
     })
 
-    const describeCodeMode = Effect.fn("ToolRegistry.describeCodeMode")(function* (input: {
-      agent: Agent.Info
-      permission?: PermissionV1.Ruleset
-    }) {
+    const describeCodeMode = Effect.fn("ToolRegistry.describeCodeMode")(function* (
+      input: { agent: Agent.Info; permission?: PermissionV1.Ruleset; tools?: Record<string, boolean> },
+      native: Tool.Def[],
+    ) {
       if (!codeMode) return
       const ruleset = Permission.merge(input.agent.permission, input.permission ?? [])
-      const tools = Permission.visibleTools(yield* mcp.tools(), ruleset)
-      if (Object.keys(tools).length === 0) return
-      return codeMode.describeCatalog(tools, Object.keys(yield* mcp.clients()).map(McpCatalog.sanitize))
+      const tools = Object.fromEntries(
+        Object.entries(Permission.visibleTools(yield* mcp.tools(), ruleset)).filter(
+          ([name]) => input.tools?.[name] !== false,
+        ),
+      )
+      if (Object.keys(tools).length === 0 && native.length === 0) return
+      return codeMode.describeCatalog(tools, Object.keys(yield* mcp.clients()).map(McpCatalog.sanitize), native)
     })
 
-    const tools: Interface["tools"] = Effect.fn("ToolRegistry.tools")(function* (input) {
+    const resolve: Interface["resolve"] = Effect.fn("ToolRegistry.resolve")(function* (input) {
       const filtered = (yield* all()).filter((tool) => {
         if (tool.id === WebSearchTool.id) {
           return webSearchEnabled(input.providerID, { exa: flags.enableExa, parallel: flags.enableParallel })
@@ -306,13 +340,8 @@ const layer = Layer.effect(
         return true
       })
 
-      const codeModeDescription = filtered.some((tool) => tool.id === "execute")
-        ? yield* describeCodeMode(input)
-        : undefined
-      const visible = filtered.filter((tool) => tool.id !== "execute" || codeModeDescription)
-
-      return yield* Effect.forEach(
-        visible,
+      const resolved = yield* Effect.forEach(
+        filtered,
         Effect.fnUntraced(function* (tool: Tool.Def) {
           const output = {
             description: tool.description,
@@ -326,21 +355,47 @@ const layer = Layer.effect(
               : undefined
           return {
             id: tool.id,
-            description: [
-              output.description,
-              tool.id === TaskTool.id ? yield* describeTask(input.agent) : undefined,
-              tool.id === "execute" ? codeModeDescription : undefined,
-            ]
+            description: [output.description, tool.id === TaskTool.id ? yield* describeTask(input.agent) : undefined]
               .filter(Boolean)
               .join("\n"),
             parameters: output.parameters,
             jsonSchema,
+            codeMode: tool.codeMode,
             execute: tool.execute,
             formatValidationError: tool.formatValidationError,
           }
         }),
         { concurrency: "unbounded" },
       )
+      const ruleset = Permission.merge(input.agent.permission, input.permission ?? [])
+      const disabled = Permission.disabled(
+        resolved.map((tool) => tool.id),
+        ruleset,
+      )
+      const codeModeAllowed = flags.experimentalCodeMode && input.tools?.execute !== false && !disabled.has("execute")
+      const nested = codeModeAllowed
+        ? resolved.filter((tool) => tool.codeMode && input.tools?.[tool.id] !== false && !disabled.has(tool.id))
+        : []
+      const codeModeDescription =
+        codeModeAllowed && resolved.some((tool) => tool.id === "execute")
+          ? yield* describeCodeMode(input, nested)
+          : undefined
+      const useCodeMode = codeModeDescription !== undefined
+      const visible = resolved
+        .filter((tool) => tool.id !== "execute" || codeModeDescription)
+        .map((tool) =>
+          tool.id === "execute" ? { ...tool, description: `${tool.description}\n${codeModeDescription}` } : tool,
+        )
+      return {
+        direct: useCodeMode
+          ? visible.filter((tool) => tool.id === "execute" || !tool.codeMode)
+          : visible.filter((tool) => input.tools?.[tool.id] !== false && !disabled.has(tool.id)),
+        nested,
+      }
+    })
+
+    const tools: Interface["tools"] = Effect.fn("ToolRegistry.tools")(function* (input) {
+      return (yield* resolve(input)).direct
     })
 
     const named: Interface["named"] = Effect.fn("ToolRegistry.named")(function* () {
@@ -348,12 +403,28 @@ const layer = Layer.effect(
       return { task: s.task, read: s.read }
     })
 
-    return Service.of({ ids, all, named, tools })
+    return Service.of({ ids, all, named, tools, resolve })
   }),
 )
 
 function isZodType(value: unknown): value is z.ZodType {
   return typeof value === "object" && value !== null && "_zod" in value
+}
+
+function nested<T extends Tool.Def>(
+  tool: T,
+  concurrency: Tool.CodeModeOptions["concurrency"],
+  group?: string,
+  maxConcurrency?: number,
+  key?: Tool.CodeModeOptions["key"],
+): T {
+  return { ...tool, codeMode: { concurrency, group, maxConcurrency, ...(key ? { key } : {}) } }
+}
+
+function execSessionConcurrencyKey(input: unknown) {
+  if (!input || typeof input !== "object") return "exec-session:unknown"
+  const id = (input as { exec_id?: unknown }).exec_id
+  return typeof id === "number" && Number.isSafeInteger(id) ? `exec-session:${id}` : "exec-session:unknown"
 }
 
 function isPluginTool(value: unknown): value is ToolDefinition {
@@ -453,6 +524,7 @@ export const node = LayerNode.make({
     MCP.node,
     Database.node,
     Ripgrep.node,
+    ExecSession.node,
   ],
 })
 

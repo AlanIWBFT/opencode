@@ -25,6 +25,7 @@ import { isRecord } from "@/util/record"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Database } from "@opencode-ai/core/database/database"
 import { Usage, type LLMEvent } from "@opencode-ai/llm"
+import { ExecSession } from "@/tool/exec-session"
 
 const DOOM_LOOP_THRESHOLD = 3
 export type Result = "compact" | "stop" | "continue"
@@ -94,6 +95,7 @@ const layer = Layer.effect(
     const image = yield* Image.Service
     const events = yield* EventV2Bridge.Service
     const database = yield* Database.Service
+    const execSession = yield* ExecSession.Service
 
     const create = Effect.fn("SessionProcessor.create")(function* (input: Input) {
       // Pre-capture snapshot before the LLM stream starts. The AI SDK
@@ -168,13 +170,40 @@ const layer = Layer.effect(
       ) {
         const match = yield* readToolCall(toolCallID)
         if (!match || match.part.state.status !== "running") return
+        const execCommitted = yield* execSession.commitOriginal({
+          sessionID: match.part.sessionID,
+          messageID: match.part.messageID,
+          callID: match.part.callID,
+          update: (part, metadata) =>
+            part.state.status !== "running"
+              ? part
+              : {
+                  ...part,
+                  state: {
+                    status: "completed",
+                    input: part.state.input,
+                    output: output.output,
+                    metadata: { ...output.metadata, ...metadata },
+                    title: output.title,
+                    time: { start: part.state.time.start, end: Date.now() },
+                    attachments: output.attachments,
+                  },
+                },
+        })
+        if (execCommitted) {
+          yield* settleToolCall(toolCallID)
+          return
+        }
         yield* session.updatePart({
           ...match.part,
           state: {
             status: "completed",
             input: match.part.state.input,
             output: output.output,
-            metadata: output.metadata,
+            metadata:
+              isRecord(match.part.state.metadata) && match.part.state.metadata.processRunning === false
+                ? { ...output.metadata, ...match.part.state.metadata }
+                : output.metadata,
             title: output.title,
             time: { start: match.part.state.time.start, end: Date.now() },
             attachments: output.attachments,
@@ -766,6 +795,7 @@ export const node = LayerNode.make({
     Image.node,
     EventV2Bridge.node,
     Database.node,
+    ExecSession.node,
   ],
 })
 

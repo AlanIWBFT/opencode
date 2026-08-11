@@ -481,6 +481,23 @@ test("disabled - disables edit/write/apply_patch when edit denied", () => {
   expect(result.has("bash")).toBe(false)
 })
 
+test("disabled - maps unified exec tools to bash permission", () => {
+  const allowed = Permission.disabled(
+    ["exec_command", "poll_exec", "write_stdin", "terminate_exec"],
+    [
+      { permission: "*", pattern: "*", action: "deny" },
+      { permission: "bash", pattern: "*", action: "allow" },
+    ],
+  )
+  const denied = Permission.disabled(
+    ["exec_command", "poll_exec", "write_stdin", "terminate_exec"],
+    [{ permission: "bash", pattern: "*", action: "deny" }],
+  )
+
+  expect(allowed).toEqual(new Set())
+  expect(denied).toEqual(new Set(["exec_command", "poll_exec", "write_stdin", "terminate_exec"]))
+})
+
 test("disabled - does not disable when partially denied", () => {
   const result = Permission.disabled(
     ["bash"],

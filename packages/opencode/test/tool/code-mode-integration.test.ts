@@ -147,7 +147,10 @@ async function buildTool() {
       output: (text: string) => Effect.succeed({ content: text, truncated: false as const }),
     }),
     Layer.mock(Agent.Service, { get: () => Effect.succeed({ name: "build", permission: [] } as any) }),
-    Layer.mock(Session.Service, { get: () => Effect.succeed({ permission: [] } as any) }),
+    Layer.mock(Session.Service, {
+      get: () => Effect.succeed({ permission: [] } as any),
+      updatePart: (part) => Effect.succeed(part),
+    }),
     Layer.mock(MCP.Service, {
       tools: () => Effect.succeed(mcpTools),
       clients: () => Effect.succeed({ [SERVER]: {} as any }),
@@ -313,7 +316,10 @@ describe("code mode integration (real MCP server)", () => {
   })
 
   test("streams running/completed metadata for child calls over a real transport", async () => {
-    const snapshots: Array<{ toolCalls: { tool: string; status: string; input?: Record<string, unknown> }[] }> = []
+    const snapshots: Array<{
+      codeMode?: { projected: true }
+      toolCalls: { tool: string; status: string; input?: Record<string, unknown> }[]
+    }> = []
     const recordingCtx: Tool.Context = {
       ...ctx,
       metadata: (val: any) => Effect.sync(() => void snapshots.push(val.metadata)),
@@ -322,9 +328,11 @@ describe("code mode integration (real MCP server)", () => {
       tool.execute({ code: "await tools.fixtures.add({ a: 1, b: 2 }); return 'done'" }, recordingCtx),
     )
     expect(snapshots).toContainEqual({
+      codeMode: { projected: true },
       toolCalls: [{ tool: "fixtures.add", status: "running", input: { a: 1, b: 2 } }],
     })
     expect(snapshots).toContainEqual({
+      codeMode: { projected: true },
       toolCalls: [{ tool: "fixtures.add", status: "completed", input: { a: 1, b: 2 } }],
     })
   })

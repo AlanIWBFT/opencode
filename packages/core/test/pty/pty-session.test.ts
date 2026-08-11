@@ -90,6 +90,21 @@ const waitForOutput = (output: Queue.Queue<string>, text: string) =>
     }),
   )
 
+const waitUntilReadContains = (id: PtyID, text: string, cursor?: number) =>
+  Effect.gen(function* () {
+    const pty = yield* Pty.Service
+    while (true) {
+      const snapshot = yield* pty.read(id, { cursor })
+      if (snapshot.output.includes(text)) return snapshot
+      yield* Effect.sleep("50 millis")
+    }
+  }).pipe(
+    Effect.timeoutOrElse({
+      duration: "5 seconds",
+      orElse: () => Effect.fail(new Error(`timeout waiting for read output containing ${JSON.stringify(text)}`)),
+    }),
+  )
+
 describe("pty", () => {
   it.live("returns typed not found errors for missing sessions", () =>
     Effect.gen(function* () {
@@ -102,6 +117,7 @@ describe("pty", () => {
         yield* pty.remove(id).pipe(Effect.exit),
         yield* pty.write(id, "input").pipe(Effect.exit),
         yield* pty.attach(id, { onData: () => {}, onEnd: () => {} }).pipe(Effect.asVoid, Effect.exit),
+        yield* pty.read(id).pipe(Effect.asVoid, Effect.exit),
       ]) {
         expect(Exit.isFailure(result)).toBe(true)
         if (Exit.isFailure(result))
@@ -150,6 +166,24 @@ describe("pty", () => {
       const tail = yield* attachCollecting(info.id, -1)
       expect(tail.attachment.replay).toBe("")
       expect(tail.attachment.cursor).toBe(replayed.attachment.cursor)
+    }),
+  )
+
+  ptyTest("reads retained output snapshots by cursor", () =>
+    Effect.gen(function* () {
+      const pty = yield* Pty.Service
+      const info = yield* createPty("cat")
+      yield* pty.write(info.id, "AAA\n")
+
+      const first = yield* waitUntilReadContains(info.id, "AAA")
+      expect(first.output).toContain("AAA")
+      expect(first.cursor).toBeGreaterThan(0)
+      expect(first.status).toBe("running")
+
+      yield* pty.write(info.id, "BBB\n")
+      const second = yield* waitUntilReadContains(info.id, "BBB", first.cursor)
+      expect(second.output).not.toContain("AAA")
+      expect(second.output).toContain("BBB")
     }),
   )
 

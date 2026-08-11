@@ -886,6 +886,91 @@ it.live("session.processor effect tests complete AI SDK tool calls when native f
   ),
 )
 
+it.live("session.processor effect tests preserve terminal metadata written while a tool completes", () =>
+  provideTmpdirServer(
+    ({ dir, llm }) =>
+      Effect.gen(function* () {
+        const execution = defer<void>()
+        const { processors, session, provider } = yield* boot()
+
+        yield* llm.tool("lookup", { query: "weather" })
+
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "tool metadata race")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({
+          assistantMessage: msg,
+          sessionID: chat.id,
+          model: mdl,
+        })
+
+        const process = yield* handle
+          .process({
+            user: {
+              id: parent.id,
+              sessionID: chat.id,
+              role: "user",
+              time: parent.time,
+              agent: parent.agent,
+              model: { providerID: ref.providerID, modelID: ref.modelID },
+            } satisfies SessionV1.User,
+            sessionID: chat.id,
+            model: mdl,
+            agent: agent(),
+            system: [],
+            messages: [{ role: "user", content: "tool metadata race" }],
+            tools: {
+              lookup: tool({
+                description: "Look up information",
+                inputSchema: z.object({ query: z.string() }),
+                execute: async () => {
+                  await execution.promise
+                  return {
+                    title: "Weather lookup",
+                    output: "result",
+                    metadata: { processRunning: true, source: "tool-result" },
+                  }
+                },
+              }),
+            },
+          })
+          .pipe(Effect.forkScoped)
+
+        yield* waitFor(
+          Effect.gen(function* () {
+            const messages = yield* session.messages({ sessionID: chat.id }).pipe(Effect.orDie)
+            const current = messages.find((message) => message.info.id === msg.id)
+            return current?.parts.some((part) => part.type === "tool" && part.state.status === "running")
+              ? true
+              : undefined
+          }),
+          "tool did not enter running state",
+        )
+        yield* handle.updateToolCall("call_1", (part) =>
+          part.state.status === "running"
+            ? {
+                ...part,
+                state: {
+                  ...part.state,
+                  metadata: { ...part.state.metadata, processRunning: false, exitCode: 0 },
+                },
+              }
+            : part,
+        )
+        yield* Effect.sync(() => execution.resolve())
+        expect(yield* Fiber.join(process)).toBe("continue")
+
+        const parts = yield* MessageV2.parts(msg.id)
+        const call = parts.find((part): part is SessionV1.ToolPart => part.type === "tool")
+        expect(call?.state.status).toBe("completed")
+        if (call?.state.status !== "completed") return
+        expect(call.state.metadata).toEqual({ processRunning: false, exitCode: 0, source: "tool-result" })
+      }),
+    { config: (url) => providerCfg(url) },
+  ),
+)
+
 it.live("session.processor effect tests mark pending tools as aborted on cleanup", () =>
   provideTmpdirServer(
     ({ dir, llm }) =>

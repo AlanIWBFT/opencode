@@ -57,6 +57,8 @@ import { SessionReminders } from "./reminders"
 import { SessionTools } from "./tools"
 import { LLMEvent } from "@opencode-ai/llm"
 import { Todo } from "./todo"
+import { ExecSession } from "@/tool/exec-session"
+import { BackgroundJob } from "@/background/job"
 
 // @ts-ignore
 globalThis.AI_SDK_LOG_WARNINGS = false
@@ -102,6 +104,7 @@ function isOrphanedInterruptedTool(part: SessionV1.ToolPart) {
 
 export interface Interface {
   readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
+  readonly stop: (input: StopInput) => Effect.Effect<StopResult, Session.NotFound>
   readonly prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error>
   readonly loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts>
   readonly shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError>
@@ -143,6 +146,8 @@ const layer = Layer.effect(
     const database = yield* Database.Service
     const { db } = database
     const todo = yield* Todo.Service
+    const execSession = yield* ExecSession.Service
+    const background = yield* BackgroundJob.Service
     const ops = Effect.fn("SessionPrompt.ops")(function* () {
       return {
         cancel: (sessionID: SessionID) => cancel(sessionID),
@@ -154,6 +159,195 @@ const layer = Layer.effect(
     const cancel = Effect.fn("SessionPrompt.cancel")(function* (sessionID: SessionID) {
       yield* Effect.logInfo("cancel", { "session.id": sessionID })
       yield* state.cancel(sessionID)
+    })
+
+    const collectSessionTree = Effect.fnUntraced(function* (sessionID: SessionID) {
+      const result: Session.Info[] = []
+      const pending = [sessionID]
+      while (pending.length > 0) {
+        const parentID = pending.shift()
+        if (!parentID) continue
+        const children = yield* sessions.children(parentID)
+        result.push(...children)
+        pending.push(...children.map((child) => child.id))
+      }
+      return result
+    })
+
+    const taskReferences = (messages: SessionV1.WithParts[]) => {
+      const result = new Map<SessionID, number>()
+      for (const message of messages) {
+        for (const part of message.parts) {
+          if (part.type !== "tool" || part.tool !== TaskTool.id || part.state.status === "pending") continue
+          const metadata = part.state.metadata
+          if (!metadata || typeof metadata !== "object") continue
+          const value = (metadata as { sessionId?: unknown }).sessionId
+          if (typeof value !== "string") continue
+          const sessionID = SessionID.make(value)
+          result.set(sessionID, Math.min(result.get(sessionID) ?? Number.POSITIVE_INFINITY, part.state.time.start))
+        }
+      }
+      return result
+    }
+
+    const stop = Effect.fn("SessionPrompt.stop")(function* (input: StopInput) {
+      yield* sessions.get(input.sessionID)
+      if (input.scope === "session-tree") {
+        yield* state.cancel(input.sessionID)
+        const descendants = yield* collectSessionTree(input.sessionID)
+        yield* Effect.forEach(descendants, (child) => state.cancel(child.id), {
+          concurrency: "unbounded",
+          discard: true,
+        })
+        const result = yield* execSession.stop([
+          { sessionID: input.sessionID },
+          ...descendants.map((child) => ({ sessionID: child.id })),
+        ])
+        yield* markOrphanedExecParts([
+          { sessionID: input.sessionID },
+          ...descendants.map((child) => ({ sessionID: child.id })),
+        ])
+        return { sessions: descendants.length + 1, ...result }
+      }
+
+      const messages = yield* sessions.messages({ sessionID: input.sessionID })
+      const boundary = messages.findIndex((message) => message.info.id === input.messageID)
+      if (boundary < 0) return { sessions: 0, matched: 0, terminated: 0, failed: 0 }
+
+      yield* state.interrupt(input.sessionID)
+      yield* background.cancel(input.sessionID)
+      const descendants = yield* collectSessionTree(input.sessionID)
+      const childrenByParent = new Map<SessionID, Session.Info[]>()
+      for (const child of descendants) {
+        if (!child.parentID) continue
+        const children = childrenByParent.get(child.parentID) ?? []
+        children.push(child)
+        childrenByParent.set(child.parentID, children)
+      }
+      const selected = new Map<SessionID, ReadonlySet<MessageID> | undefined>([
+        [input.sessionID, new Set(messages.slice(boundary).map((message) => message.info.id))],
+      ])
+      const addFullTree = (sessionID: SessionID) => {
+        if (selected.get(sessionID) === undefined && selected.has(sessionID)) return
+        selected.set(sessionID, undefined)
+        for (const child of childrenByParent.get(sessionID) ?? []) addFullTree(child.id)
+      }
+      const selectBranch: (
+        parentID: SessionID,
+        retainedMessages: SessionV1.WithParts[],
+        hiddenMessages: SessionV1.WithParts[],
+      ) => Effect.Effect<void, Session.NotFound> = Effect.fnUntraced(function* (
+        parentID: SessionID,
+        retainedMessages: SessionV1.WithParts[],
+        hiddenMessages: SessionV1.WithParts[],
+      ) {
+        const retained = taskReferences(retainedMessages)
+        const hidden = taskReferences(hiddenMessages)
+        const hiddenStart = hiddenMessages[0]?.info.time.created
+        for (const child of childrenByParent.get(parentID) ?? []) {
+          const cutoff = hidden.get(child.id)
+          if (!retained.has(child.id)) {
+            if (cutoff === undefined) {
+              if (hiddenStart !== undefined && child.time.created >= hiddenStart) addFullTree(child.id)
+              continue
+            }
+            if (hiddenStart === undefined || child.time.created >= hiddenStart) {
+              addFullTree(child.id)
+              continue
+            }
+          }
+          if (cutoff === undefined) continue
+          const childMessages = yield* sessions.messages({ sessionID: child.id })
+          const childBoundary = childMessages.findIndex((message) => message.info.time.created >= cutoff)
+          const retainedChild = childBoundary < 0 ? childMessages : childMessages.slice(0, childBoundary)
+          const hiddenChild = childBoundary < 0 ? [] : childMessages.slice(childBoundary)
+          selected.set(child.id, new Set(hiddenChild.map((message) => message.info.id)))
+          yield* selectBranch(child.id, retainedChild, hiddenChild)
+        }
+      })
+      yield* selectBranch(input.sessionID, messages.slice(0, boundary), messages.slice(boundary))
+      const selectedSessions = Array.from(selected.keys()).filter((sessionID) => sessionID !== input.sessionID)
+      yield* Effect.forEach(selectedSessions, (sessionID) => background.cancel(sessionID), {
+        concurrency: "unbounded",
+        discard: true,
+      })
+      yield* Effect.forEach(selectedSessions, (sessionID) => state.interrupt(sessionID), {
+        concurrency: "unbounded",
+        discard: true,
+      })
+      const targets = Array.from(selected, ([sessionID, messageIDs]) => ({ sessionID, messageIDs }))
+      const result = yield* execSession.stop(targets)
+      yield* markOrphanedExecParts(targets)
+      return { sessions: selectedSessions.length + 1, ...result }
+    })
+
+    const markOrphanedExecParts = Effect.fn("SessionPrompt.markOrphanedExecParts")(function* (
+      targets: readonly ExecSession.StopTarget[],
+    ) {
+      yield* Effect.forEach(
+        targets,
+        Effect.fnUntraced(function* (target) {
+          const messages = yield* sessions.messages({ sessionID: target.sessionID })
+          yield* Effect.forEach(
+            messages,
+            Effect.fnUntraced(function* (message) {
+              if (target.messageIDs && !target.messageIDs.has(message.info.id)) return
+              yield* Effect.forEach(
+                message.parts,
+                Effect.fnUntraced(function* (part) {
+                  if (
+                    part.type !== "tool" ||
+                    part.tool !== "exec_command" ||
+                    part.state.status === "pending" ||
+                    part.state.metadata?.processRunning !== true
+                  )
+                    return
+                  const input = {
+                    sessionID: part.sessionID,
+                    messageID: part.messageID,
+                    callID: part.callID,
+                  }
+                  const committed = yield* execSession.commitOriginal({
+                    ...input,
+                    update: (current, metadata) =>
+                      metadata.processRunning || current.state.status === "pending"
+                        ? current
+                        : {
+                            ...current,
+                            state: {
+                              ...current.state,
+                              metadata: { ...current.state.metadata, ...metadata },
+                            },
+                          },
+                  })
+                  if (committed) return
+                  const current = yield* sessions.getPart({ ...input, partID: part.id })
+                  if (
+                    current?.type !== "tool" ||
+                    current.state.status === "pending" ||
+                    current.state.metadata?.processRunning !== true
+                  )
+                    return
+                  yield* sessions.updatePart({
+                    ...current,
+                    state: {
+                      ...current.state,
+                      metadata: {
+                        ...current.state.metadata,
+                        processRunning: false,
+                        terminationRequested: true,
+                      },
+                    },
+                  })
+                }),
+                { concurrency: "unbounded", discard: true },
+              )
+            }),
+            { concurrency: "unbounded", discard: true },
+          )
+        }),
+        { concurrency: "unbounded", discard: true },
+      )
     })
 
     const resolvePromptParts = Effect.fn("SessionPrompt.resolvePromptParts")(function* (template: string) {
@@ -1521,6 +1715,7 @@ const layer = Layer.effect(
 
     return Service.of({
       cancel,
+      stop,
       prompt,
       loop,
       shell,
@@ -1558,6 +1753,27 @@ export const PromptInput = Schema.Struct({
   ),
 })
 export type PromptInput = Schema.Schema.Type<typeof PromptInput>
+
+export const StopInput = Schema.Union([
+  Schema.Struct({
+    sessionID: SessionID,
+    scope: Schema.Literal("session-tree"),
+  }),
+  Schema.Struct({
+    sessionID: SessionID,
+    scope: Schema.Literal("reverted-branch"),
+    messageID: MessageID,
+  }),
+]).annotate({ discriminator: "scope" })
+export type StopInput = Schema.Schema.Type<typeof StopInput>
+
+export const StopResult = Schema.Struct({
+  sessions: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  matched: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  terminated: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  failed: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+})
+export type StopResult = Schema.Schema.Type<typeof StopResult>
 
 export class LoopInput extends Schema.Class<LoopInput>("SessionPrompt.LoopInput")({
   sessionID: SessionID,
@@ -1665,6 +1881,8 @@ export const node = LayerNode.make({
     RuntimeFlags.node,
     Database.node,
     Todo.node,
+    ExecSession.node,
+    BackgroundJob.node,
   ],
 })
 

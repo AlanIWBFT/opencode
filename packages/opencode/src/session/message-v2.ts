@@ -293,6 +293,11 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
             type: "step-start",
           })
         if (part.type === "tool") {
+          if (
+            typeof part.metadata?.codeMode?.parentCallID === "string" &&
+            typeof part.metadata.codeMode.runtimeCallID === "string"
+          )
+            continue
           toolNames.add(part.tool)
           if (part.state.status === "completed") {
             const outputText = part.state.time.compacted

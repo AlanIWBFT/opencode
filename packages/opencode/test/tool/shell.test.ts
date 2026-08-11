@@ -8,6 +8,7 @@ import path from "path"
 import { Config } from "@/config/config"
 import { Shell } from "@opencode-ai/core/shell"
 import { ShellTool } from "../../src/tool/shell"
+import { ShellPrompt } from "@/tool/shell/prompt"
 import { Filesystem } from "@/util/filesystem"
 import { provideInstance, testInstanceStoreLayer, tmpdirScoped } from "../fixture/fixture"
 import { Agent } from "../../src/agent/agent"
@@ -219,6 +220,25 @@ describe("tool.shell", () => {
   )
 })
 
+describe("tool.shell PowerShell prompt", () => {
+  it.live("describes the PowerShell execution prelude", () =>
+    Effect.sync(() => {
+      const description = ShellPrompt.render(
+        "pwsh",
+        "win32",
+        { maxLines: 1_000, maxBytes: 1_000_000 },
+        120_000,
+      ).description
+      expect(description).toContain("PowerShell profiles are not loaded")
+      expect(description).toContain("Console input and output use UTF-8")
+      expect(description).toContain("parses the complete command before running it")
+      expect(description).toContain("A final failing native program's exit code is propagated")
+      expect(description).toContain("Recycle Bin")
+      expect(description).toContain("only to FileSystem provider items")
+    }),
+  )
+})
+
 describe("tool.shell PowerShell stdin", () => {
   for (const item of ps) {
     it.live(`does not pass the user command in argv [${item.label}]`, () =>
@@ -236,7 +256,11 @@ describe("tool.shell PowerShell stdin", () => {
               ctx,
             )
             expect(result.metadata.exit).toBe(0)
+            expect(result.output).not.toBe("(no output)")
             expect(result.output).not.toContain(marker)
+            expect(result.output).not.toContain("-NoLogo")
+            expect(result.output).toContain("-NoProfile")
+            expect(result.output).toContain("-NonInteractive")
             expect(result.output).not.toContain("PS ")
           }),
         ),
@@ -264,6 +288,101 @@ describe("tool.shell PowerShell stdin", () => {
       ),
     )
 
+    it.live(`preserves UTF-8 command text and output [${item.label}]`, () =>
+      withShell(
+        item,
+        runIn(
+          projectRoot,
+          Effect.gen(function* () {
+            const unicode = String.fromCodePoint(0x5de5, 0x4f5c, 0x1f642)
+            const shell = yield* initShell()
+            const result = yield* shell.execute(
+              {
+                command: `Write-Output '${unicode}-output'`,
+              },
+              ctx,
+            )
+            expect(result.metadata.exit).toBe(0)
+            expect(result.output).toContain(`${unicode}-output`)
+          }),
+        ),
+      ),
+    )
+
+    it.live(`preserves single quotes and single-quoted here-strings [${item.label}]`, () =>
+      withShell(
+        item,
+        runIn(
+          projectRoot,
+          Effect.gen(function* () {
+            const shell = yield* initShell()
+            const result = yield* shell.execute(
+              {
+                command: [
+                  "$value = 'single''quote'",
+                  "$here = @'",
+                  "here's value",
+                  "'@",
+                  'Write-Output "$value|$here"',
+                ].join("\n"),
+              },
+              ctx,
+            )
+            expect(result.metadata.exit).toBe(0)
+            expect(result.output).toContain("single'quote|here's value")
+          }),
+        ),
+      ),
+    )
+
+    it.live(`preserves PowerShell script-start semantics [${item.label}]`, () =>
+      withShell(
+        item,
+        runIn(
+          projectRoot,
+          Effect.gen(function* () {
+            const shell = yield* initShell()
+            const result = yield* shell.execute(
+              {
+                command: [
+                  "using namespace System.Text",
+                  "using module Microsoft.PowerShell.Management",
+                  "param([string] $Value = 'default-value')",
+                  "$builder = [StringBuilder]::new()",
+                  "$null = $builder.Append($Value)",
+                  "$builder.ToString()",
+                ].join("\n"),
+              },
+              ctx,
+            )
+            expect(result.metadata.exit).toBe(0)
+            expect(result.output).toContain("default-value")
+          }),
+        ),
+      ),
+    )
+
+    it.live(`preserves successful early returns [${item.label}]`, () =>
+      withShell(
+        item,
+        runIn(
+          projectRoot,
+          Effect.gen(function* () {
+            const shell = yield* initShell()
+            const result = yield* shell.execute(
+              {
+                command: "Write-Output before-return\nreturn\nWrite-Output after-return",
+              },
+              ctx,
+            )
+            expect(result.metadata.exit).toBe(0)
+            expect(result.output).toContain("before-return")
+            expect(result.output).not.toContain("after-return")
+          }),
+        ),
+      ),
+    )
+
     it.live(`propagates native process exit codes from stdin [${item.label}]`, () =>
       withShell(
         item,
@@ -278,6 +397,26 @@ describe("tool.shell PowerShell stdin", () => {
               ctx,
             )
             expect(result.metadata.exit).toBe(7)
+          }),
+        ),
+      ),
+    )
+
+    it.live(`uses the command body's final result after a native failure [${item.label}]`, () =>
+      withShell(
+        item,
+        runIn(
+          projectRoot,
+          Effect.gen(function* () {
+            const shell = yield* initShell()
+            const result = yield* shell.execute(
+              {
+                command: `& ${bin} -e 'process.exit(7)'; Write-Output recovered`,
+              },
+              ctx,
+            )
+            expect(result.metadata.exit).toBe(0)
+            expect(result.output).toContain("recovered")
           }),
         ),
       ),
@@ -364,7 +503,7 @@ if (Test-Path -LiteralPath ${psquote(hidden)}) { 'exists' } else { 'missing' }`,
               })
               expect(result.metadata.exit).toBe(0)
               expect(result.output).toContain("missing")
-              expect(result.output).not.toContain("opencode blocked deletion")
+              expect(result.output).not.toContain("Deletion could not be completed safely")
             }),
           )
         }),
@@ -407,8 +546,14 @@ if (Test-Path -LiteralPath ${psquote(file)}) { 'exists' } else { 'missing' }`,
                 command: `Remove-Item -LiteralPath ${psquote(path.join(tmp, "missing.txt"))}`,
               })
               expect(result.metadata.exit).not.toBe(0)
-              expect(result.output).toContain("opencode blocked deletion")
-              expect(result.output).toContain("Do not retry with permanent deletion or bypass commands; ask the user.")
+              expect(result.output).toContain("Deletion could not be completed safely")
+              expect(result.output).toContain("Cause: System.Management.Automation.ItemNotFoundException")
+              expect(result.output).toContain(
+                "The target was not deleted. Filesystem deletion is only performed through the Recycle Bin.",
+              )
+              expect(result.output).toContain(
+                "Do not bypass this safeguard or retry with permanent deletion; ask the user how to proceed.",
+              )
             }),
           )
         }),
@@ -436,9 +581,15 @@ try {
 }`,
                 })
                 expect(result.metadata.exit).not.toBe(0)
-                expect(result.output).toContain("opencode blocked deletion")
-                expect(result.output).toMatch(/Cause: System\.IO\.IOException: .+ The target was not deleted/s)
-                expect(result.output).toContain("Do not retry with permanent deletion or bypass commands; ask the user.")
+                expect(result.output).toContain("Deletion could not be completed safely")
+                expect(result.output).toContain("the Recycle Bin operation failed for the file")
+                expect(result.output).toMatch(/Cause: System\.IO\.IOException:/)
+                expect(result.output.replace(/\s+/g, "")).toContain(
+                  "Thetargetwasnotdeleted.FilesystemdeletionisonlyperformedthroughtheRecycleBin.",
+                )
+                expect(result.output.replace(/\s+/g, "")).toContain(
+                  "Donotbypassthissafeguardorretrywithpermanentdeletion;asktheuserhowtoproceed.",
+                )
               }),
             )
           }),
@@ -458,7 +609,31 @@ try {
             })
             expect(result.metadata.exit).toBe(0)
             expect(result.output).toContain("missing")
-            expect(result.output).not.toContain("opencode blocked deletion")
+            expect(result.output).not.toContain("Deletion could not be completed safely")
+          }),
+        ),
+      ),
+    )
+
+    it.live(`respects ErrorAction for missing non-filesystem Remove-Item targets [${item.label}]`, () =>
+      withShell(
+        item,
+        runIn(
+          projectRoot,
+          Effect.gen(function* () {
+            const silent = yield* run({
+              command: "Remove-Item Variable:OPENCODE_MISSING_VARIABLE -ErrorAction SilentlyContinue",
+            })
+            expect(silent.metadata.exit).not.toBe(0)
+            expect(silent.output).toBe("(no output)")
+            expect(silent.output).not.toContain("Deletion could not be completed safely")
+
+            const ignored = yield* run({
+              command: "Remove-Item Variable:OPENCODE_MISSING_VARIABLE -ErrorAction Ignore",
+            })
+            expect(ignored.metadata.exit).not.toBe(0)
+            expect(ignored.output).toBe("(no output)")
+            expect(ignored.output).not.toContain("Deletion could not be completed safely")
           }),
         ),
       ),
@@ -707,11 +882,12 @@ describe("tool.shell permissions", () => {
     }
 
     for (const item of ps) {
-      it.live(`asks for external_directory permission for drive-relative PowerShell paths [${item.label}]`, () =>
+      it.live(`resolves same-drive PowerShell paths from the lane cwd [${item.label}]`, () =>
         withShell(
           item,
           Effect.gen(function* () {
             const tmp = yield* tmpdirScoped()
+            const drive = path.parse(tmp).root.slice(0, 2)
             yield* runIn(
               tmp,
               Effect.gen(function* () {
@@ -720,7 +896,7 @@ describe("tool.shell permissions", () => {
                 expect(
                   yield* fail(
                     {
-                      command: 'Get-Content "C:../outside.txt"',
+                      command: `Get-Content "${drive}../outside.txt"`,
                     },
                     capture(requests, err),
                   ),
@@ -728,6 +904,35 @@ describe("tool.shell permissions", () => {
                 expect(requests[0]?.permission).toBe("external_directory")
                 if (requests[0]?.permission !== "external_directory") return
                 expect(requests[0].patterns).toContain(glob(path.join(path.dirname(tmp), "*")))
+              }),
+            )
+          }),
+        ),
+      )
+
+      it.live(`uses the drive root for cross-drive PowerShell paths [${item.label}]`, () =>
+        withShell(
+          item,
+          Effect.gen(function* () {
+            const tmp = yield* tmpdirScoped()
+            const cwdDrive = path.parse(tmp).root.slice(0, 2).toUpperCase()
+            const drive = cwdDrive === "C:" ? "Z:" : "C:"
+            yield* runIn(
+              tmp,
+              Effect.gen(function* () {
+                const err = new Error("stop after permission")
+                const requests: Array<Omit<PermissionV1.Request, "id" | "sessionID" | "tool">> = []
+                expect(
+                  yield* fail(
+                    {
+                      command: `Get-Content "${drive}../outside.txt"`,
+                    },
+                    capture(requests, err),
+                  ),
+                ).toMatchObject({ message: err.message })
+                expect(requests[0]?.permission).toBe("external_directory")
+                if (requests[0]?.permission !== "external_directory") return
+                expect(requests[0].patterns).toContain(glob(`${drive}\\*`))
               }),
             )
           }),

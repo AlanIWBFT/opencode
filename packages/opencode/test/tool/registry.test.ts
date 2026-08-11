@@ -16,10 +16,14 @@ import { InstanceState } from "@/effect/instance-state"
 
 import { ToolJsonSchema } from "@/tool/json-schema"
 import { MessageID, SessionID } from "@/session/schema"
+import { Session } from "@/session/session"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderV2 } from "@opencode-ai/core/provider"
+import { ProjectV2 } from "@opencode-ai/core/project"
 import { ModelV2 } from "@opencode-ai/core/model"
+import { Shell } from "@opencode-ai/core/shell"
 import { MCP } from "@/mcp"
+import { Permission } from "@/permission"
 import type { Tool as MCPToolDef } from "@modelcontextprotocol/sdk/types.js"
 
 const configLayer = TestConfig.layer({
@@ -53,10 +57,30 @@ const brokenPluginLayer = Layer.succeed(
 const root = LayerNode.group([ToolRegistry.node, Agent.node])
 const replacements = [
   [Config.node, configLayer],
-  [RuntimeFlags.node, RuntimeFlags.layer()],
+  [RuntimeFlags.node, RuntimeFlags.layer({ experimentalCodeMode: false })],
 ] as const
 
 const it = testEffect(LayerNode.compile(root, replacements))
+const withMockSession = testEffect(
+  LayerNode.compile(root, [
+    ...replacements,
+    [
+      Session.node,
+      Layer.mock(Session.Service, {
+        get: (id: SessionID) =>
+          Effect.succeed({
+            id,
+            slug: "mock-session",
+            projectID: ProjectV2.ID.make("mock-project"),
+            directory: "",
+            title: "Mock session",
+            version: "0.0.0",
+            time: { created: Date.now(), updated: Date.now() },
+          }),
+      }),
+    ],
+  ]),
+)
 const withCodeMode = testEffect(
   LayerNode.compile(root, [
     [Config.node, configLayer],
@@ -118,6 +142,46 @@ describe("tool.registry", () => {
     }),
   )
 
+  withMockSession.instance("reuses a TTY exec lane when a later command omits tty", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+      const agents = yield* Agent.Service
+      const agent = yield* agents.defaultInfo()
+      const tools = yield* registry.tools({
+        providerID: ProviderV2.ID.opencode,
+        modelID: ModelV2.ID.make("test"),
+        agent,
+      })
+      const exec = tools.find((tool) => tool.id === "exec_command")
+      if (!exec) throw new Error("exec_command not found")
+      const shell = Shell.acceptable()
+      const command = Shell.ps(shell)
+        ? "Write-Output reused"
+        : Shell.name(shell) === "cmd"
+          ? "echo reused"
+          : "printf reused"
+      const ctx: Tool.Context = {
+        sessionID: SessionID.make("ses_registry_tty"),
+        messageID: MessageID.make("msg_registry_tty"),
+        agent: agent.name,
+        abort: new AbortController().signal,
+        messages: [],
+        metadata: () => Effect.void,
+        ask: () => Effect.void,
+      }
+
+      const first = yield* exec.execute({ cmd: command, lane_id: 1, tty: true }, ctx)
+      const second = yield* exec.execute(
+        { cmd: command, lane_id: 1 },
+        { ...ctx, messageID: MessageID.make("msg_registry_tty_reuse") },
+      )
+
+      expect(first.metadata.shellReused).toBe(false)
+      expect(second.metadata.execError).toBeUndefined()
+      expect(second.metadata.shellReused).toBe(true)
+    }),
+  )
+
   withCodeMode.instance("exposes execute when code mode is enabled", () =>
     Effect.gen(function* () {
       const registry = yield* ToolRegistry.Service
@@ -136,17 +200,182 @@ describe("tool.registry", () => {
     }),
   )
 
-  withEmptyCodeMode.instance("does not expose execute when code mode has no visible tools", () =>
+  withEmptyCodeMode.instance("exposes execute with native tools when code mode has no MCP tools", () =>
     Effect.gen(function* () {
       const registry = yield* ToolRegistry.Service
       const agents = yield* Agent.Service
-      const tools = yield* registry.tools({
+      const input = {
+        providerID: ProviderV2.ID.opencode,
+        modelID: ModelV2.ID.make("test"),
+        agent: yield* agents.defaultInfo(),
+      }
+      const tools = yield* registry.tools(input)
+      const resolved = yield* registry.resolve(input)
+
+      expect(tools.map((tool) => tool.id)).toContain("execute")
+      expect(tools.map((tool) => tool.id)).not.toContain("read")
+      expect(resolved.nested.map((tool) => tool.id)).toEqual(
+        expect.arrayContaining(["read", "glob", "grep", "webfetch", "websearch", "edit", "write"]),
+      )
+      expect(resolved.nested.find((tool) => tool.id === "webfetch")?.codeMode).toEqual({
+        concurrency: "parallel",
+        group: "network",
+        maxConcurrency: 4,
+      })
+    }),
+  )
+
+  withEmptyCodeMode.instance("recommends persistent slots for serial and parallel commands", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+      const agents = yield* Agent.Service
+      const resolved = yield* registry.resolve({
         providerID: ProviderV2.ID.opencode,
         modelID: ModelV2.ID.make("test"),
         agent: yield* agents.defaultInfo(),
       })
+      const exec = resolved.nested.find((tool) => tool.id === "exec_command")
+      if (!exec) throw new Error("exec_command not found")
+      const controls = resolved.nested.filter((tool) =>
+        ["poll_exec", "write_stdin", "terminate_exec"].includes(tool.id),
+      )
 
-      expect(tools.map((tool) => tool.id)).not.toContain("execute")
+      expect(exec.description).toContain(
+        "Every command runs in a persistent slot. Use lane_id=0 for ordinary sequential work",
+      )
+      expect(exec.description).toContain("Use different numeric slots for commands that must run concurrently")
+      expect(exec.description).toContain("not process-attributed output")
+      expect(exec.description).toContain("Keep long-running work in the foreground")
+      expect(exec.description).toContain("its output may interleave with a later execution in the same slot")
+      expect(controls.map((tool) => tool.codeMode?.key?.({ exec_id: 7 }))).toEqual([
+        "exec-session:7",
+        "exec-session:7",
+        "exec-session:7",
+      ])
+    }),
+  )
+
+  withEmptyCodeMode.instance("omits hard-denied native tools from the code mode catalog", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+      const agents = yield* Agent.Service
+      const resolved = yield* registry.resolve({
+        providerID: ProviderV2.ID.opencode,
+        modelID: ModelV2.ID.make("test"),
+        agent: yield* agents.defaultInfo(),
+        permission: [{ permission: "read", pattern: "*", action: "deny" }],
+      })
+      const execute = resolved.direct.find((tool) => tool.id === "execute")
+
+      expect(resolved.nested.map((tool) => tool.id)).not.toContain("read")
+      expect(execute?.description).not.toContain("tools.$opencode.read")
+    }),
+  )
+
+  withEmptyCodeMode.instance("gives the explore agent a read-only Code Mode catalog", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+      const agents = yield* Agent.Service
+      const explore = yield* agents.get("explore")
+      if (!explore) throw new Error("explore agent not found")
+
+      const resolved = yield* registry.resolve({
+        providerID: ProviderV2.ID.opencode,
+        modelID: ModelV2.ID.make("test"),
+        agent: explore,
+      })
+      const nested = resolved.nested.map((tool) => tool.id)
+
+      expect(resolved.direct.map((tool) => tool.id)).toContain("execute")
+      expect(nested).toEqual(expect.arrayContaining(["read", "glob", "grep", "exec_command"]))
+      expect(nested).not.toContain("edit")
+      expect(nested).not.toContain("write")
+    }),
+  )
+
+  withEmptyCodeMode.instance("falls back to direct tools when execute is denied", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+      const agent = {
+        name: "direct-only",
+        mode: "subagent" as const,
+        options: {},
+        permission: Permission.fromConfig({
+          "*": "deny",
+          execute: "deny",
+          read: "allow",
+          glob: "allow",
+          grep: "allow",
+          bash: "allow",
+        }),
+      } satisfies Agent.Info
+
+      const resolved = yield* registry.resolve({
+        providerID: ProviderV2.ID.opencode,
+        modelID: ModelV2.ID.make("test"),
+        agent,
+      })
+      const direct = resolved.direct.map((tool) => tool.id)
+
+      expect(direct).toEqual(expect.arrayContaining(["read", "glob", "grep", "exec_command"]))
+      expect(direct).not.toContain("execute")
+      expect(direct).not.toContain("edit")
+      expect(resolved.nested).toEqual([])
+    }),
+  )
+
+  withEmptyCodeMode.instance("falls back to direct tools when execute is disabled for the message", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+      const agents = yield* Agent.Service
+      const resolved = yield* registry.resolve({
+        providerID: ProviderV2.ID.opencode,
+        modelID: ModelV2.ID.make("test"),
+        agent: yield* agents.defaultInfo(),
+        tools: { execute: false },
+      })
+      const direct = resolved.direct.map((tool) => tool.id)
+
+      expect(direct).toEqual(expect.arrayContaining(["read", "glob", "grep"]))
+      expect(direct).not.toContain("execute")
+      expect(resolved.nested).toEqual([])
+    }),
+  )
+
+  withCodeMode.instance("omits message-disabled MCP tools from Code Mode", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+      const agents = yield* Agent.Service
+      const resolved = yield* registry.resolve({
+        providerID: ProviderV2.ID.opencode,
+        modelID: ModelV2.ID.make("test"),
+        agent: yield* agents.defaultInfo(),
+        tools: { weather_current: false },
+      })
+      const execute = resolved.direct.find((tool) => tool.id === "execute")
+
+      expect(execute?.description).not.toContain("tools.weather.current")
+    }),
+  )
+
+  withEmptyCodeMode.instance("omits message-disabled tools from the Code Mode catalog", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+      const agents = yield* Agent.Service
+      const resolved = yield* registry.resolve({
+        providerID: ProviderV2.ID.opencode,
+        modelID: ModelV2.ID.make("test"),
+        agent: yield* agents.defaultInfo(),
+        tools: { read: false, exec_command: false },
+      })
+      const nested = resolved.nested.map((tool) => tool.id)
+      const execute = resolved.direct.find((tool) => tool.id === "execute")
+
+      expect(nested).not.toContain("read")
+      expect(nested).not.toContain("exec_command")
+      expect(nested).toContain("glob")
+      expect(execute?.description).not.toContain("tools.$opencode.read")
+      expect(execute?.description).not.toContain("tools.$opencode.exec_command")
     }),
   )
 

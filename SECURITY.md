@@ -16,6 +16,8 @@ OpenCode is an AI-powered coding assistant that runs locally on your machine. It
 
 OpenCode does **not** sandbox the agent. The permission system exists as a UX feature to help users stay aware of what actions the agent is taking - it prompts for confirmation before executing commands, writing files, etc. However, it is not designed to provide security isolation.
 
+In particular, `external_directory` checks around shell tools are not filesystem confinement. Explicit external working directories are gated, and statically recognizable path arguments may produce additional permission prompts, but shell syntax, variables, redirections, scripts, child programs, and runtime-generated paths cannot be intercepted reliably. Once a shell command is allowed, it runs with the host user's filesystem authority.
+
 If you need true isolation, run OpenCode inside a Docker container or VM.
 
 ### Server Mode

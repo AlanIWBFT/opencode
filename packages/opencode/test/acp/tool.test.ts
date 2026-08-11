@@ -16,6 +16,10 @@ describe("acp tool conversion", () => {
   test("maps OpenCode tool ids to ACP tool kinds", () => {
     expect(toToolKind("bash")).toBe("execute")
     expect(toToolKind("shell")).toBe("execute")
+    expect(toToolKind("exec_command")).toBe("execute")
+    expect(toToolKind("poll_exec")).toBe("execute")
+    expect(toToolKind("write_stdin")).toBe("execute")
+    expect(toToolKind("terminate_exec")).toBe("execute")
     expect(toToolKind("webfetch")).toBe("fetch")
     expect(toToolKind("edit")).toBe("edit")
     expect(toToolKind("apply_patch")).toBe("edit")
@@ -46,6 +50,9 @@ describe("acp tool conversion", () => {
       { path: resolve("/workspace", "subdir") },
     ])
     expect(toLocations("bash", { command: "pwd", workdir: "/abs/dir" }, "/workspace")).toEqual([{ path: "/abs/dir" }])
+    expect(toLocations("exec_command", { cmd: "pwd", workdir: "subdir" }, "/workspace")).toEqual([
+      { path: resolve("/workspace", "subdir") },
+    ])
     expect(toLocations("bash", { command: "printf hello" })).toEqual([])
     expect(toLocations("read", { path: "/tmp/missing-file-path.ts" })).toEqual([])
   })
@@ -294,5 +301,31 @@ describe("acp tool conversion", () => {
     expect(shellOutputSnapshot({ metadata: { output: "line 1\nline 2" } })).toBe("line 1\nline 2")
     expect(shellOutputSnapshot({ metadata: { output: 42 } })).toBeUndefined()
     expect(shellOutputSnapshot({ metadata: undefined })).toBeUndefined()
+  })
+
+  test("uses the final unified exec transcript for completed updates", () => {
+    expect(
+      completedToolUpdate({
+        toolCallId: "tool-exec",
+        toolName: "exec_command",
+        state: {
+          status: "completed",
+          input: { cmd: "echo ready" },
+          output: "initial chunk",
+          metadata: { output: "initial chunk\nfinal output" },
+        },
+      }),
+    ).toMatchObject({
+      content: [
+        {
+          type: "content",
+          content: { type: "text", text: "initial chunk\nfinal output" },
+        },
+      ],
+      rawOutput: {
+        output: "initial chunk\nfinal output",
+        metadata: { output: "initial chunk\nfinal output" },
+      },
+    })
   })
 })
