@@ -204,8 +204,18 @@ const layer = Layer.effect(
       const real = (m: SessionV1.WithParts) =>
         m.info.role === "user" && !m.parts.every((p) => "synthetic" in p && p.synthetic)
       const idx = input.history.findIndex(real)
-      if (idx === -1) return
-      if (input.history.filter(real).length !== 1) return
+      if (idx === -1) {
+        yield* Effect.logWarning("skipping title generation: no user message", { "session.id": input.session.id })
+        return
+      }
+      const userCount = input.history.filter(real).length
+      if (userCount !== 1) {
+        yield* Effect.logWarning("skipping title generation: session has multiple user messages", {
+          "session.id": input.session.id,
+          userCount,
+        })
+        return
+      }
 
       const context = input.history.slice(0, idx + 1)
       const firstUser = context[idx]
@@ -216,7 +226,12 @@ const layer = Layer.effect(
       const onlySubtasks = subtasks.length > 0 && firstUser.parts.every((p) => p.type === "subtask")
 
       const ag = yield* agents.get("title")
-      if (!ag) return
+      if (!ag) {
+        yield* Effect.logWarning("skipping title generation: title agent unavailable", {
+          "session.id": input.session.id,
+        })
+        return
+      }
       const mdl = ag.model
         ? yield* provider.getModel(ag.model.providerID, ag.model.modelID)
         : ((yield* provider.getSmallModel(input.providerID)) ??
@@ -247,11 +262,21 @@ const layer = Layer.effect(
         .split("\n")
         .map((line) => line.trim())
         .find((line) => line.length > 0)
-      if (!cleaned) return
+      if (!cleaned) {
+        yield* Effect.logWarning("skipping title generation: model returned no text", {
+          "session.id": input.session.id,
+          providerID: mdl.providerID,
+          modelID: mdl.id,
+        })
+        return
+      }
       const t = cleaned.length > 100 ? cleaned.substring(0, 97) + "..." : cleaned
-      yield* sessions
-        .setTitle({ sessionID: input.session.id, title: t })
-        .pipe(Effect.catchCause((cause) => Effect.logError("failed to generate title", { error: Cause.squash(cause) })))
+      yield* sessions.setTitle({ sessionID: input.session.id, title: t })
+      yield* Effect.logInfo("generated session title", {
+        "session.id": input.session.id,
+        providerID: mdl.providerID,
+        modelID: mdl.id,
+      })
     })
 
     const handleSubtask = Effect.fn("SessionPrompt.handleSubtask")(function* (input: {
@@ -1140,7 +1165,17 @@ const layer = Layer.effect(
               modelID: lastUser.model.modelID,
               providerID: lastUser.model.providerID,
               history: msgs,
-            }).pipe(Effect.ignore, Effect.forkIn(scope))
+            }).pipe(
+              Effect.catchCause((cause) =>
+                Effect.logError("failed to generate title", {
+                  "session.id": sessionID,
+                  providerID: lastUser.model.providerID,
+                  modelID: lastUser.model.modelID,
+                  error: Cause.pretty(cause),
+                }),
+              ),
+              Effect.forkIn(scope),
+            )
 
           const model = yield* getModel(lastUser.model.providerID, lastUser.model.modelID, sessionID)
           const task = tasks.pop()

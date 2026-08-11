@@ -171,6 +171,51 @@ describe("plugin.openai.ws-pool", () => {
     fetch.close()
   })
 
+  test("resolves websocket fetch before the first response event", async () => {
+    let release: () => void = () => {}
+    const released = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    let received: () => void = () => {}
+    const requestReceived = new Promise<void>((resolve) => {
+      received = resolve
+    })
+    await using server = await createWebSocketServer((socket) => {
+      socket.once("message", async () => {
+        received()
+        await released
+        socket.send(JSON.stringify({ type: "response.completed", response: { id: "resp_late" } }))
+      })
+    })
+    const fetch = OpenAIWebSocketPool.createWebSocketFetch({
+      url: server.url,
+    })
+
+    const pending = fetch(server.url, streamRequest())
+    await requestReceived
+    const settled = await Promise.race([pending.then(() => true), sleep(150).then(() => false)])
+
+    expect(settled).toBe(true)
+    release()
+    expect(await (await pending).text()).toContain("data: [DONE]")
+    fetch.close()
+  })
+
+  test("extends provider header timeout for websocket streams", async () => {
+    await using server = await createWebSocketServer(() => {})
+    const fetch = OpenAIWebSocketPool.createWebSocketFetch({
+      url: server.url,
+      connectTimeout: 15_000,
+    })
+
+    expect(fetch.providerHeaderTimeout(server.url, streamRequest(), 10_000)).toBeGreaterThan(15_000)
+    expect(fetch.providerHeaderTimeout(server.url, streamRequest({ [TITLE_HEADER]: "true" }), 10_000)).toBe(10_000)
+    expect(fetch.providerHeaderTimeout(server.url, { method: "POST", body: JSON.stringify({ stream: true }) }, 10_000)).toBe(
+      10_000,
+    )
+    fetch.close()
+  })
+
   test("rotates a socket that exceeds max connection age", async () => {
     let connections = 0
     await using server = await createWebSocketServer((socket) => {
@@ -570,14 +615,16 @@ describe("plugin.openai.ws-pool", () => {
       streamRetries: 1,
     })
 
-    await new Promise((resolve) => setTimeout(resolve, 250))
+    await sleep(250)
     const first = await fetch(server.url, streamRequest())
     expect((await readTextError(first.text())).message).toContain("idle timeout waiting for websocket")
-    await new Promise((resolve) => setTimeout(resolve, 300))
+    await sleep(300)
 
     const second = await fetch(server.url, streamRequest())
+    expect((await readTextError(second.text())).message).toContain("idle timeout waiting for websocket")
+    const third = await fetch(server.url, streamRequest())
 
-    expect(await second.text()).toBe("http")
+    expect(await third.text()).toBe("http")
     expect(connections).toBe(2)
     expect(server.httpRequests).toHaveLength(1)
     fetch.close()
@@ -906,4 +953,8 @@ async function waitFor(predicate: () => boolean, message: string) {
     if (Date.now() - started > 1_000) throw new Error(message)
     await new Promise((resolve) => setTimeout(resolve, 1))
   }
+}
+
+function sleep(ms: number) {
+  return new Promise<void>((resolve) => setTimeout(resolve, ms))
 }

@@ -419,6 +419,9 @@ const layer = Layer.effect(
           }
 
           case "provider-error":
+            if (value.classification === "context-overflow") {
+              throw new SessionV1.ContextOverflowError({ message: value.message })
+            }
             throw new Error(value.message)
 
           case "step-start":
@@ -550,6 +553,52 @@ const layer = Layer.effect(
         }
       })
 
+      const finishOpenContent = Effect.fn("SessionProcessor.finishOpenContent")(function* () {
+        if (ctx.currentText) {
+          const end = Date.now()
+          ctx.currentText.time = { start: ctx.currentText.time?.start ?? end, end }
+          yield* session.updatePart(ctx.currentText)
+          ctx.currentText = undefined
+        }
+
+        for (const part of Object.values(ctx.reasoningMap)) {
+          const end = Date.now()
+          yield* session.updatePart({
+            ...part,
+            time: { start: part.time.start ?? end, end },
+          })
+        }
+        ctx.reasoningMap = {}
+      })
+
+      const finishRetryAttempt = Effect.fn("SessionProcessor.finishRetryAttempt")(function* () {
+        yield* finishOpenContent()
+
+        for (const toolCallID of Object.keys(ctx.toolcalls)) {
+          const match = yield* readToolCall(toolCallID)
+          if (!match) {
+            yield* settleToolCall(toolCallID)
+            continue
+          }
+          const part = match.part
+          if (part.state.status === "pending" || part.state.status === "running") {
+            const end = Date.now()
+            const metadata = "metadata" in part.state && isRecord(part.state.metadata) ? part.state.metadata : {}
+            yield* session.updatePart({
+              ...part,
+              state: {
+                status: "error",
+                input: part.state.input,
+                error: "Provider retry interrupted this tool call; its outcome may be unknown.",
+                metadata: { ...metadata, outcomeUnknown: true },
+                time: { start: part.state.status === "running" ? part.state.time.start : end, end },
+              },
+            })
+          }
+          yield* settleToolCall(toolCallID)
+        }
+      })
+
       const cleanup = Effect.fn("SessionProcessor.cleanup")(function* () {
         if (ctx.snapshot) {
           const patch = yield* snapshot.patch(ctx.snapshot)
@@ -566,21 +615,7 @@ const layer = Layer.effect(
           ctx.snapshot = undefined
         }
 
-        if (ctx.currentText) {
-          const end = Date.now()
-          ctx.currentText.time = { start: ctx.currentText.time?.start ?? end, end }
-          yield* session.updatePart(ctx.currentText)
-          ctx.currentText = undefined
-        }
-
-        for (const part of Object.values(ctx.reasoningMap)) {
-          const end = Date.now()
-          yield* session.updatePart({
-            ...part,
-            time: { start: part.time.start ?? end, end },
-          })
-        }
-        ctx.reasoningMap = {}
+        yield* finishOpenContent()
 
         yield* Effect.forEach(
           Object.values(ctx.toolcalls),
@@ -648,8 +683,6 @@ const layer = Layer.effect(
 
         return yield* Effect.gen(function* () {
           yield* Effect.gen(function* () {
-            ctx.currentText = undefined
-            ctx.reasoningMap = {}
             yield* status.set(ctx.sessionID, { type: "busy" })
             const stream = llm.stream(streamInput)
 
@@ -671,19 +704,26 @@ const layer = Layer.effect(
               (cause) => !Cause.hasInterruptsOnly(cause),
               (cause) => Effect.fail(Cause.squash(cause)),
             ),
+            // Product decision: automatic retries may replay partial output and tool calls.
+            // Agents can usually detect and repair non-idempotent changes from later tool
+            // errors; interrupting a recoverable session wastes more user time. Errors with
+            // a semantic "never" retry policy instead surface their recovery action.
             Effect.retry(
               SessionRetry.policy({
                 provider: input.model.providerID,
                 parse,
-                set: (info) => {
-                  return status.set(ctx.sessionID, {
-                    type: "retry",
-                    attempt: info.attempt,
-                    message: info.message,
-                    action: info.action,
-                    next: info.next,
-                  })
-                },
+                set: (info) =>
+                  Effect.gen(function* () {
+                    yield* finishRetryAttempt()
+                    yield* status.set(ctx.sessionID, {
+                      type: "retry",
+                      attempt: info.attempt,
+                      message: info.message,
+                      action: info.action,
+                      resolution: info.resolution,
+                      next: info.next,
+                    })
+                  }),
               }),
             ),
             Effect.catch(halt),

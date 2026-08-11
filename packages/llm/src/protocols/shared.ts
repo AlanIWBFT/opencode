@@ -222,8 +222,14 @@ export const toolResultText = (part: ToolResultPart) => {
   return encodeJson(part.result.value)
 }
 
-export const errorText = (error: unknown) => {
-  if (error instanceof Error) return error.message
+export const errorText = (error: unknown): string => {
+  if (error instanceof Error) {
+    const cause = "cause" in error && error.cause !== error ? error.cause : undefined
+    const causeText = cause === undefined ? undefined : errorText(cause)
+    if (causeText && causeText !== "Unknown stream error" && causeText !== error.message)
+      return `${error.message}: ${causeText}`
+    return error.message
+  }
   if (typeof error === "string") return error
   if (typeof error === "number" || typeof error === "boolean" || typeof error === "bigint") return String(error)
   if (error === null) return "null"

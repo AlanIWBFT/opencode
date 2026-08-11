@@ -135,13 +135,14 @@ export const httpJson = <Body, Frame>(input: HttpJsonInput<Body, Frame>): HttpJs
           Effect.map((response) =>
             prepared.framing.frame(
               response.stream.pipe(
-                Stream.mapError((error) =>
-                  ProviderShared.eventError(
+                Stream.mapError((error) => {
+                  const detail = ProviderShared.errorText(error)
+                  return ProviderShared.eventError(
                     `${request.model.provider}/${request.model.route.id}`,
-                    `Failed to read ${request.model.provider}/${request.model.route.id} stream`,
-                    ProviderShared.errorText(error),
-                  ),
-                ),
+                    `Failed to read ${request.model.provider}/${request.model.route.id} stream: ${detail}`,
+                    detail,
+                  )
+                }),
               ),
             ),
           ),

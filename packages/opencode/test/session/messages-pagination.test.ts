@@ -11,6 +11,9 @@ import { NotFoundError } from "@/storage/storage"
 import { testEffect } from "../lib/effect"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
+import { Database } from "@opencode-ai/core/database/database"
+import { MessageTable } from "@opencode-ai/core/session/sql"
+import { eq } from "drizzle-orm"
 
 const it = testEffect(LayerNode.compile(LayerNode.group([SessionNs.node, MessageV2.node, SessionProjector.node])))
 
@@ -535,6 +538,47 @@ describe("MessageV2.get", () => {
         expect(result.info.role).toBe("assistant")
         expect(result.parts).toHaveLength(1)
         expect((result.parts[0] as SessionV1.TextPart).text).toBe("response")
+      }),
+    ),
+  )
+
+  it.instance("normalizes legacy API errors during hydration", () =>
+    withSession(({ sessionID }) =>
+      Effect.gen(function* () {
+        const uid = yield* addUser(sessionID, "hello")
+        const aid = yield* addAssistant(sessionID, uid)
+        const { db } = yield* Database.Service
+        const row = yield* db.select().from(MessageTable).where(eq(MessageTable.id, aid)).get().pipe(Effect.orDie)
+        if (!row) return
+        yield* db
+          .update(MessageTable)
+          .set({
+            data: {
+              ...row.data,
+              error: {
+                name: "APIError",
+                data: {
+                  message: "overloaded",
+                  isRetryable: false,
+                  resolution: { kind: "model_capacity", retry: "never", action: "switch_model" },
+                },
+              },
+            } as unknown as (typeof MessageTable.$inferInsert)["data"],
+          })
+          .where(eq(MessageTable.id, aid))
+          .run()
+          .pipe(Effect.orDie)
+
+        const result = yield* MessageV2.get({ sessionID, messageID: aid })
+        expect(result.info.role).toBe("assistant")
+        if (result.info.role !== "assistant") return
+        expect(result.info.error).toMatchObject({
+          name: "APIError",
+          data: {
+            isRetryable: true,
+            resolution: { kind: "server", retry: "automatic", action: "retry" },
+          },
+        })
       }),
     ),
   )

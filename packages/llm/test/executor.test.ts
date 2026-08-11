@@ -1,7 +1,7 @@
 import { describe, expect } from "bun:test"
 import { Effect, Fiber, Layer, Random, Ref } from "effect"
 import * as TestClock from "effect/testing/TestClock"
-import { Headers, HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstable/http"
+import { Headers, HttpClient, HttpClientError, HttpClientRequest, HttpClientResponse } from "effect/unstable/http"
 import { LLM, LLMError } from "../src"
 import { LLMClient, RequestExecutor } from "../src/route"
 import * as OpenAIChat from "../src/protocols/openai-chat"
@@ -55,6 +55,22 @@ const countedResponsesLayer = (attempts: Ref.Ref<number>, responses: ReadonlyArr
             ),
           )
         }),
+      ),
+    ),
+  )
+
+const transportFailureLayer = (cause: unknown) =>
+  RequestExecutor.layer.pipe(
+    Layer.provide(
+      Layer.succeed(
+        HttpClient.HttpClient,
+        HttpClient.make((request) =>
+          Effect.fail(
+            new HttpClientError.HttpClientError({
+              reason: new HttpClientError.TransportError({ request, cause }),
+            }),
+          ),
+        ),
       ),
     ),
   )
@@ -313,6 +329,18 @@ describe("RequestExecutor", () => {
         ]),
       ),
     ),
+  )
+
+  it.effect("surfaces HTTP transport failure causes", () =>
+    Effect.gen(function* () {
+      const executor = yield* RequestExecutor.Service
+      const error = yield* executor.execute(request).pipe(Effect.flip)
+
+      expectLLMError(error)
+      expect(error.reason).toMatchObject({ _tag: "Transport" })
+      expect(error.message).toContain("HTTP transport failed")
+      expect(error.message).toContain("socket hang up")
+    }).pipe(Effect.provide(transportFailureLayer(new Error("socket hang up")))),
   )
 
   it.effect("redacts common secret fields in response bodies", () =>

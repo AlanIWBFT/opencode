@@ -47,6 +47,17 @@ describe("session.retry.delay", () => {
     expect(SessionRetry.delay(5, error, 1)).toBe(30000)
   })
 
+  test("prefers a structured retry delay", () => {
+    const error = Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
+      new SessionV1.APIError({
+        message: "overloaded",
+        isRetryable: true,
+        resolution: { kind: "server", retry: "automatic", action: "retry", retryAfterMs: 12_000 },
+      }).toObject(),
+    )
+    expect(SessionRetry.delay(1, error)).toBe(12_000)
+  })
+
   test("prefers retry-after-ms when shorter than exponential", () => {
     const error = apiError({ "retry-after-ms": "1500" })
     expect(SessionRetry.delay(4, error)).toBe(1500)
@@ -144,6 +155,41 @@ describe("session.retry.delay", () => {
       )
 
       expect(attempts).toStrictEqual([1, 2, 3, 4, 5])
+    }),
+  )
+
+  it.instance("policy preserves automatic retry resolution", () =>
+    Effect.gen(function* () {
+      const sessionID = SessionID.make("session-retry-resolution")
+      const error = Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
+        new SessionV1.APIError({
+          message: "Rate limited",
+          isRetryable: true,
+          resolution: { kind: "rate_limited", retry: "automatic", action: "wait" },
+        }).toObject(),
+      )
+      const status = yield* SessionStatus.Service
+
+      const step = yield* Schedule.toStepWithMetadata(
+        SessionRetry.policy({
+          provider: "test",
+          parse: Schema.decodeUnknownSync(SessionV1.APIError.Schema),
+          set: (info) =>
+            status.set(sessionID, {
+              type: "retry",
+              attempt: info.attempt,
+              message: info.message,
+              resolution: info.resolution,
+              next: info.next,
+            }),
+        }),
+      )
+      yield* step(error)
+
+      expect(yield* status.get(sessionID)).toMatchObject({
+        type: "retry",
+        resolution: { kind: "rate_limited", retry: "automatic", action: "wait" },
+      })
     }),
   )
 })
@@ -309,6 +355,59 @@ describe("session.retry.retryable", () => {
     expect(SessionRetry.retryable(error, retryProvider)).toEqual({ message: "Service unavailable" })
   })
 
+  test("retries an overloaded server error with its resolution", () => {
+    const error = Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
+      new SessionV1.APIError({
+        message: "Our servers are currently overloaded. Please try again later.",
+        isRetryable: true,
+        statusCode: 503,
+        resolution: {
+          kind: "server",
+          retry: "automatic",
+          action: "retry",
+          providerCode: "server_is_overloaded",
+        },
+      }).toObject(),
+    )
+
+    expect(SessionRetry.retryable(error, retryProvider)).toEqual({
+      message: "Our servers are currently overloaded. Please try again later.",
+      resolution: {
+        kind: "server",
+        retry: "automatic",
+        action: "retry",
+        providerCode: "server_is_overloaded",
+      },
+    })
+  })
+
+  test("retries legacy model-capacity errors after schema normalization", () => {
+    const error = Schema.decodeUnknownSync(SessionV1.APIError.Schema)({
+      name: "APIError",
+      data: {
+        message: "Our servers are currently overloaded. Please try again later.",
+        isRetryable: false,
+        resolution: {
+          kind: "model_capacity",
+          retry: "never",
+          action: "switch_model",
+          providerCode: "server_is_overloaded",
+        },
+      },
+    })
+
+    expect(error.data.isRetryable).toBe(true)
+    expect(SessionRetry.retryable(error, retryProvider)).toEqual({
+      message: "Our servers are currently overloaded. Please try again later.",
+      resolution: {
+        kind: "server",
+        retry: "automatic",
+        action: "retry",
+        providerCode: "server_is_overloaded",
+      },
+    })
+  })
+
   test("does not retry 4xx errors when isRetryable is false", () => {
     const error = Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
       new SessionV1.APIError({
@@ -428,6 +527,35 @@ describe("session.retry.retryable", () => {
 })
 
 describe("session.message-v2.fromError", () => {
+  test("converts response.failed stream frames to retryable API errors", () => {
+    const frame = {
+      type: "response.failed",
+      sequence_number: 1,
+      response: {
+        error: {
+          code: "server_is_overloaded",
+          message: "Our servers are currently overloaded. Please try again later.",
+        },
+      },
+    }
+
+    for (const input of [frame, new Error(JSON.stringify(frame))]) {
+      const result = MessageV2.fromError(input, { providerID: ProviderV2.ID.make("openai") })
+      expect(SessionV1.APIError.isInstance(result)).toBe(true)
+      if (!SessionV1.APIError.isInstance(result)) throw new Error("expected APIError")
+      expect(result.data).toMatchObject({
+        isRetryable: true,
+        resolution: {
+          kind: "server",
+          retry: "automatic",
+          action: "retry",
+          providerCode: "server_is_overloaded",
+        },
+      })
+      expect(SessionRetry.retryable(result, retryProvider)).toBeDefined()
+    }
+  })
+
   test.concurrent(
     "converts ECONNRESET socket errors to retryable APIError",
     async () => {
@@ -516,6 +644,12 @@ describe("session.message-v2.fromError", () => {
     expect(result.data.isRetryable).toBe(true)
     expect(SessionRetry.retryable(result, retryProvider)).toEqual({
       message: "An error occurred while processing your request.",
+      resolution: {
+        kind: "server",
+        retry: "automatic",
+        action: "retry",
+        providerCode: "server_error",
+      },
     })
   })
 })

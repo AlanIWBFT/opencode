@@ -276,20 +276,33 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
     }) {
       yield* revertSvc.cleanup(yield* requireSession(ctx.params.sessionID))
       const messages = yield* SessionError.mapStorageNotFound(session.messages({ sessionID: ctx.params.sessionID }))
+      const latest = messages.at(-1)?.info
+      if (
+        latest?.role === "assistant" &&
+        latest.summary === true &&
+        latest.finish &&
+        !latest.error &&
+        typeof latest.time.completed === "number"
+      )
+        return true
+      if ((yield* statusSvc.get(ctx.params.sessionID)).type !== "idle") return true
       const defaultAgent = yield* agentSvc.defaultAgent()
       const currentAgent = messages.findLast((message) => message.info.role === "user")?.info.agent ?? defaultAgent
 
-      yield* compactSvc.create({
-        sessionID: ctx.params.sessionID,
-        agent: currentAgent,
-        model: {
-          providerID: ctx.payload.providerID,
-          modelID: ctx.payload.modelID,
-        },
-        auto: ctx.payload.auto ?? false,
-      })
-      yield* promptSvc.loop({ sessionID: ctx.params.sessionID })
-      return true
+      yield* statusSvc.set(ctx.params.sessionID, { type: "busy" })
+      return yield* Effect.gen(function* () {
+        yield* compactSvc.create({
+          sessionID: ctx.params.sessionID,
+          agent: currentAgent,
+          model: {
+            providerID: ctx.payload.providerID,
+            modelID: ctx.payload.modelID,
+          },
+          auto: ctx.payload.auto ?? false,
+        })
+        yield* promptSvc.loop({ sessionID: ctx.params.sessionID })
+        return true
+      }).pipe(Effect.ensuring(statusSvc.set(ctx.params.sessionID, { type: "idle" })))
     })
 
     const prompt = Effect.fn("SessionHttpApi.prompt")(function* (ctx: {
