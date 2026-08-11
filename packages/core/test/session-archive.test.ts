@@ -12,14 +12,15 @@ import { SessionExecution } from "@opencode/core/session/execution"
 import { SessionProjector } from "@opencode/core/session/projector"
 import { SessionStore } from "@opencode/core/session/store"
 import { LayerNode } from "@opencode/util/effect/layer-node"
-import { Effect } from "effect"
+import { Deferred, Effect, Fiber } from "effect"
+import { ExecSessionControl } from "@opencode/core/tool/exec-session/control"
 import { eq } from "drizzle-orm"
 import { testEffect } from "./lib/effect"
 import { globalProjectNode } from "./lib/project"
 
 const it = testEffect(
   AppNodeBuilder.build(
-    LayerNode.group([Database.node, Bus.node, SessionProjector.node, SessionStore.node, Session.node]),
+    LayerNode.group([Database.node, Bus.node, SessionProjector.node, SessionStore.node, Session.node, ExecSessionControl.node]),
     [
       Bus.node.replace(Bus.configured({ persist: true })),
       Project.node.replace(globalProjectNode),
@@ -79,3 +80,36 @@ describe("Session.archive", () => {
     }),
   )
 })
+it.effect("archive persists before stopping existing owners and restore waits for cleanup", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const control = yield* ExecSessionControl.Service
+    const session = yield* sessions.create({ location: { directory: AbsolutePath.make(process.cwd()) } })
+    const started = yield* Deferred.make<void>()
+    const release = yield* Deferred.make<void>()
+    let stops = 0
+    yield* control.register((targets) =>
+      Effect.gen(function* () {
+        expect(targets).toEqual([{ sessionID: session.id }])
+        expect((yield* sessions.get(session.id).pipe(Effect.orDie)).time.archived).toBeDefined()
+        stops++
+        yield* Deferred.succeed(started, undefined)
+        yield* Deferred.await(release)
+        return { matched: 1, terminated: 1, failed: 0 }
+      }),
+    )
+    const archive = yield* sessions
+      .archive(session.id)
+      .pipe(Effect.forkScoped({ startImmediately: true }))
+    yield* Deferred.await(started)
+    const restore = yield* sessions
+      .unarchive(session.id)
+      .pipe(Effect.forkScoped({ startImmediately: true }))
+    expect((yield* sessions.get(session.id)).time.archived).toBeDefined()
+    yield* Deferred.succeed(release, undefined)
+    yield* Fiber.join(archive)
+    yield* Fiber.join(restore)
+    expect((yield* sessions.get(session.id)).time.archived).toBeUndefined()
+    expect(stops).toBe(1)
+  }),
+)

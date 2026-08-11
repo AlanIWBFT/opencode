@@ -64,6 +64,7 @@ test("execute describes invariant Code Mode behavior", () => {
       'Call tools through `tools` using only exact paths and signatures from the catalog. Do not infer or normalize tool names; preserve bracket notation such as `tools.<namespace>["tool-name"](input)`.',
       "Prefer an explicit `return`; if omitted, the final top-level expression becomes the result.",
       "Await every call whose completion matters; pending calls are interrupted when execution ends. Run independent calls concurrently with `Promise.allSettled`.",
+      "A script may make up to 64 tool calls, including discovery searches. Retained result and log output is limited to 1 MiB.",
     ].join("\n"),
   )
 })

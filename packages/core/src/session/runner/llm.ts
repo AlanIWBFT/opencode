@@ -34,6 +34,7 @@ import { ToolOutput } from "../../tool-output.js"
 import { Plugin } from "../../plugin.js"
 import { PluginHooks } from "../../plugin/hooks.js"
 import { MAX_STEPS_PROMPT } from "./max-steps.js"
+import { ExecSessionControl } from "../../tool/exec-session/control.js"
 
 const CONTINUE_AFTER_OUTPUT_LIMIT =
   "Your last response hit the output token limit (stop reason: length). Do not apologize, recap, or repeat yourself. Break the remaining work into smaller pieces."
@@ -44,6 +45,7 @@ const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const bus = yield* Bus.Service
+    const execControl = yield* ExecSessionControl.Service
     const lifecycle = yield* LocationLifecycle.Service
     const store = yield* SessionStore.Service
     const context = yield* SessionContext.Service
@@ -108,6 +110,7 @@ const layer = Layer.effect(
                     yield* restore(
                       Effect.gen(function* () {
                         yield* modelTransport.close(sessionID)
+                        yield* ExecSessionControl.beforeMove(execControl, sessionID)
                         yield* bus.publishAll([
                           [SessionEvent.InboxDelivered, { sessionID, inboxID: next.id }],
                           [SessionEvent.Moved, { sessionID, ...next.payload }],
@@ -465,6 +468,7 @@ export const node = makeLocationNode({
     Snapshot.node,
     PersistentPty.node,
     ToolOutput.node,
+    ExecSessionControl.node,
     Database.node,
   ],
 })

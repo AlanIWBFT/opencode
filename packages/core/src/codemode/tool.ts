@@ -2,6 +2,8 @@ export * as CodeModeTool from "./tool.js"
 
 import { ToolFailure } from "@opencode/ai/effect"
 import { CodeMode, Namespace, Tool } from "@opencode/codemode"
+import { Identifier } from "@opencode/schema/identifier"
+import { CallID, ChildCall } from "@opencode/schema/tool"
 import type {
   Content,
   Context as ToolContext,
@@ -11,12 +13,10 @@ import type {
   Namespace as ToolNamespace,
   Result,
 } from "@opencode/schema/tool"
-import { Identifier } from "@opencode/schema/identifier"
-import { CallID } from "@opencode/schema/tool"
-import { Clock, Context, Effect, Ref, Schema, Scope, Semaphore } from "effect"
+import { Clock, Context, Effect, Exit, Ref, Schema, Scope, Semaphore } from "effect"
+import { Location } from "../location.js"
 import { toSessionError } from "../session/to-session-error.js"
 import { definition, normalizedName } from "../tool/runtime.js"
-import { Location } from "../location.js"
 import { Permission } from "../permission.js"
 import { CodeModeCatalog } from "./catalog.js"
 import { CodeModeExecution } from "./execution.js"
@@ -29,17 +29,9 @@ const ExecuteFile = Schema.Struct({
   name: Schema.optionalKey(Schema.String),
 })
 
-const ExecuteCall = Schema.Struct({
-  tool: Schema.String,
-  status: Schema.Literals(["running", "completed", "error"]),
-  input: Schema.optionalKey(Schema.Record(Schema.String, Schema.Json)),
-})
-
-type ExecuteCall = typeof ExecuteCall.Type
-
 const ExecuteOutput = Schema.Struct({
   output: Schema.String,
-  toolCalls: Schema.Array(ExecuteCall),
+  toolCalls: Schema.Array(ChildCall),
   error: Schema.optionalKey(Schema.Literal(true)),
   files: Schema.Array(ExecuteFile),
 })
@@ -65,7 +57,12 @@ type Tools = {
 class Run extends Context.Service<
   Run,
   {
-    readonly executeTool: (name: string, tool: Info, input: unknown) => Effect.Effect<unknown, unknown>
+    readonly executeTool: (
+      name: string,
+      tool: Info,
+      input: unknown,
+      call: Tool.ToolContext,
+    ) => Effect.Effect<unknown, unknown>
     readonly hooks: CodeMode.Hooks
   }
 >()("@opencode/CodeModeTool/Run") {}
@@ -84,14 +81,15 @@ const description = [
   'Call tools through `tools` using only exact paths and signatures from the catalog. Do not infer or normalize tool names; preserve bracket notation such as `tools.<namespace>["tool-name"](input)`.',
   "Prefer an explicit `return`; if omitted, the final top-level expression becomes the result.",
   "Await every call whose completion matters; pending calls are interrupted when execution ends. Run independent calls concurrently with `Promise.allSettled`.",
+  "A script may make up to 64 tool calls, including discovery searches. Retained result and log output is limited to 1 MiB.",
 ].join("\n")
 
 export const create = (
   inventory: Inventory,
   executeTool: (name: string, tool: Info, input: unknown, context: ToolContext) => Effect.Effect<Result, Error>,
   permission: Permission.Interface,
-  /** With `full_codemode`, the session's Location, which turns on the experimental `path` global. */
   location?: Location.Interface,
+  capture?: (context: ToolContext, toolCalls: readonly ChildCall[], revision: number) => Effect.Effect<void>,
 ) => {
   return {
     name: "execute",
@@ -100,129 +98,193 @@ export const create = (
     freeform: { type: "text" },
     output: ExecuteOutput,
     execute: ({ code }, context) =>
-      Effect.gen(function* () {
-        const callIndex = yield* Ref.make(0)
-        const files = yield* Ref.make<Array<CollectedFiles>>([])
-        const calls = yield* Ref.make<Array<ExecuteCall>>([])
-        const lock = Semaphore.makeUnsafe(1)
-        // Each update replaces the last, so send at most one per 100 ms; a trailing one carries the latest rows.
-        // A success drops a pending one when the scope closes, since the result carries the final rows.
-        const scope = yield* Effect.scope
-        const publishedAt = yield* Ref.make(Number.NEGATIVE_INFINITY)
-        const trailing = yield* Ref.make(false)
-        const publish = Effect.gen(function* () {
-          yield* Ref.set(trailing, false)
-          yield* Ref.set(publishedAt, yield* Clock.currentTimeMillis)
-          yield* context.progress({ toolCalls: yield* Ref.get(calls) })
-        })
-        const record = (update: (items: Array<ExecuteCall>) => Array<ExecuteCall>) =>
-          lock.withPermit(
-            Effect.gen(function* () {
-              yield* Ref.update(calls, update)
-              if (yield* Ref.get(trailing)) return
-              const wait = (yield* Ref.get(publishedAt)) + 100 - (yield* Clock.currentTimeMillis)
-              if (wait <= 0) return yield* publish
-              yield* Ref.set(trailing, true)
-              yield* Effect.sleep(wait).pipe(Effect.andThen(lock.withPermit(publish)), Effect.forkIn(scope))
-            }),
-          )
-        const result = yield* runtime(inventory)
-          .execute(code, undefined, {
-            extensions: location ? [CodeModeFetch.extension, CodeModePath.extension] : [CodeModeFetch.extension],
+      Effect.suspend(() => {
+        const cleanups: Effect.Effect<unknown>[] = []
+        let revision = 0
+        const concurrency = new Map<string, Semaphore.Semaphore>()
+        const cleanup = Effect.suspend(() =>
+          Effect.forEach(cleanups.splice(0), (effect) => effect, { concurrency: "unbounded", discard: true }),
+        ).pipe(Effect.uninterruptible)
+        return Effect.gen(function* () {
+          const files = yield* Ref.make<Array<CollectedFiles>>([])
+          const calls = yield* Ref.make<Array<ChildCall>>([])
+          const lock = Semaphore.makeUnsafe(1)
+          const scope = yield* Effect.scope
+          const publishedAt = yield* Ref.make(Number.NEGATIVE_INFINITY)
+          const trailing = yield* Ref.make(false)
+          const publish = Effect.gen(function* () {
+            yield* Ref.set(trailing, false)
+            yield* Ref.set(publishedAt, yield* Clock.currentTimeMillis)
+            const toolCalls = yield* Ref.get(calls)
+            yield* context.progress({
+              toolCalls,
+              ...(capture && toolCalls.some((call) => call.id !== undefined) ? { codeModeRevision: revision } : {}),
+            })
           })
-          .pipe(
-            Effect.provideService(Run, {
-              executeTool: (name, tool, input) =>
-                Effect.gen(function* () {
-                  const index = yield* Ref.getAndUpdate(callIndex, (index) => index + 1)
-                  // Its own ID, so plugin hooks and traces can tell the program's calls apart. It has no row, so
-                  // until the program ends its permission requests show on this call's.
-                  const id = CallID.make(`call_${Identifier.ascending()}`)
-                  yield* permission.nested(id, context.id).pipe(Scope.provide(scope))
-                  // The program sees the same failure text the model gets for a direct call.
-                  const executed = yield* executeTool(name, tool, input, {
-                    ...context,
-                    id,
-                    // Progress replaces the execute call's own, so an inner tool's updates would hide the call rows.
-                    progress: () => Effect.void,
-                    // A stop is the execute call's to handle: a nested call never fails it with its own error.
-                    cancel: undefined,
-                  }).pipe(
-                    Effect.mapError((error) => new ToolFailure({ message: toSessionError(error).message, error })),
-                  )
-                  const content = resultContent(executed)
-                  const outputFileParts = outputFiles(content)
-                  if (outputFileParts.length > 0)
-                    yield* Ref.update(files, (items) => [...items, { index, files: outputFileParts }])
-                  return resultValue(executed)
-                }),
-              hooks: progressHooks(record),
-            }),
-            // A failed or interrupted call keeps its last progress, so send pending rows before it settles.
-            Effect.onError(() =>
-              lock.withPermit(Ref.get(trailing).pipe(Effect.flatMap((pending) => (pending ? publish : Effect.void)))),
-            ),
-            // Readers outlive the fetch call that returned them, up to the end of this program's scope.
-            Effect.provideService(CodeModeExecution.Service, { ...context, signal: yield* Effect.abortSignal }),
-            Effect.provideService(Permission.Service, permission),
-            (program) => (location ? Effect.provideService(program, Location.Service, location) : program),
+          const record = (update: (items: Array<ChildCall>) => Array<ChildCall>) =>
+            lock.withPermit(
+              Ref.updateAndGet(calls, update).pipe(
+                Effect.tap((toolCalls) =>
+                  Effect.gen(function* () {
+                    revision++
+                    if (capture && toolCalls.some((call) => call.id !== undefined))
+                      yield* capture(context, toolCalls, revision)
+                    if (yield* Ref.get(trailing)) return
+                    const wait = (yield* Ref.get(publishedAt)) + 100 - (yield* Clock.currentTimeMillis)
+                    if (wait <= 0) return yield* publish
+                    yield* Ref.set(trailing, true)
+                    yield* Effect.sleep(wait).pipe(Effect.andThen(lock.withPermit(publish)), Effect.forkIn(scope))
+                  }),
+                ),
+              ),
+            )
+          const progress = progressHooks(
+            record,
+            new Map(Array.from(inventory.tools.values(), (tool) => [qualifiedName(tool), tool.name])),
           )
-        const toolCalls = yield* Ref.get(calls)
-        const collected = (yield* Ref.get(files))
-          .toSorted((left, right) => left.index - right.index)
-          .flatMap((item) => item.files)
-        const output = formatResult(result)
-        const value: typeof ExecuteOutput.Type = {
-          output,
-          toolCalls,
-          files: collected,
-          ...(result.ok ? {} : { error: true }),
-        }
-        const content: Array<Content> = [
-          { type: "text", text: value.output },
-          ...value.files.map((file) => ({
-            type: "file" as const,
-            uri: `data:${file.mime};base64,${file.data}`,
-            mime: file.mime,
-            ...(file.name === undefined ? {} : { name: file.name }),
-          })),
-        ]
-        const metadata: Metadata = {
-          toolCalls: value.toolCalls,
-          ...(value.error ? { error: true } : {}),
-        }
-        return {
-          output: value,
-          content,
-          metadata,
-        }
-      }).pipe(Effect.scoped),
+          const result = yield* runtime(inventory)
+            .execute(code, undefined, {
+              extensions: location ? [CodeModeFetch.extension, CodeModePath.extension] : [CodeModeFetch.extension],
+            })
+            .pipe(
+              Effect.provideService(Run, {
+                executeTool: (name, tool, input, call) =>
+                  Effect.gen(function* () {
+                    const index = progress.index(call.key)
+                    const id = CallID.make(`call_${Identifier.ascending()}`)
+                    yield* permission.nested(id, context.id).pipe(Scope.provide(scope))
+                    const exec = isExec(tool.name)
+                    const update = (value: Partial<ChildCall>) =>
+                      record((items) => {
+                        const next = [...items]
+                        next[index] = { ...items[index], ...value }
+                        return next
+                      })
+                    const invocation = Effect.suspend(() =>
+                      executeTool(name, tool, input, {
+                        ...context,
+                        id,
+                        // The outer execute call owns cancellation, including completed children and their cleanup.
+                        cancel: undefined,
+                        ...(exec ? { parentCallID: context.id, childID: String(index) } : {}),
+                        registerCleanup: (cleanup) => {
+                          cleanups.push(cleanup)
+                        },
+                        progress: (metadata) => (exec ? update({ metadata }).pipe(Effect.asVoid) : Effect.void),
+                      }),
+                    )
+                    const policy =
+                      typeof tool.options?.codemode === "object" ? tool.options.codemode.concurrency : undefined
+                    const executed = yield* (() => {
+                      if (!policy) return invocation
+                      const suffix =
+                        policy.inputKey && typeof input === "object" && input !== null
+                          ? (input as Record<string, unknown>)[policy.inputKey]
+                          : undefined
+                      const key = JSON.stringify([policy.group, suffix])
+                      const semaphore = concurrency.get(key) ?? Semaphore.makeUnsafe(policy.limit)
+                      concurrency.set(key, semaphore)
+                      return semaphore.withPermit(invocation)
+                    })().pipe(
+                      Effect.mapError((error) => new ToolFailure({ message: toSessionError(error).message, error })),
+                    )
+                    const content = resultContent(executed)
+                    const outputFileParts = outputFiles(content)
+                    if (exec && executed.metadata !== undefined) yield* update({ metadata: executed.metadata })
+                    if (outputFileParts.length > 0)
+                      yield* Ref.update(files, (items) => [...items, { index, files: outputFileParts }])
+                    return resultValue(executed)
+                  }),
+                hooks: progress.hooks,
+              }),
+              Effect.onError(() =>
+                lock.withPermit(Ref.get(trailing).pipe(Effect.flatMap((pending) => (pending ? publish : Effect.void)))),
+              ),
+              Effect.provideService(CodeModeExecution.Service, { ...context, signal: yield* Effect.abortSignal }),
+              Effect.provideService(Permission.Service, permission),
+              (program) => (location ? Effect.provideService(program, Location.Service, location) : program),
+            )
+          if (!result.ok) yield* cleanup
+          const toolCalls = yield* Ref.get(calls)
+          const collected = (yield* Ref.get(files))
+            .toSorted((left, right) => left.index - right.index)
+            .flatMap((item) => item.files)
+          const output = formatResult(result)
+          const value: typeof ExecuteOutput.Type = {
+            output,
+            toolCalls,
+            files: collected,
+            ...(result.ok ? {} : { error: true }),
+          }
+          const content: Array<Content> = [
+            { type: "text", text: value.output },
+            ...value.files.map((file) => ({
+              type: "file" as const,
+              uri: `data:${file.mime};base64,${file.data}`,
+              mime: file.mime,
+              ...(file.name === undefined ? {} : { name: file.name }),
+            })),
+          ]
+          const metadata: Metadata = {
+            toolCalls: value.toolCalls,
+            ...(capture && toolCalls.some((call) => call.id !== undefined) ? { codeModeRevision: revision } : {}),
+            ...(value.error ? { error: true } : {}),
+          }
+          return {
+            output: value,
+            content,
+            metadata,
+          }
+        }).pipe(
+          Effect.onExit((exit) => (Exit.isFailure(exit) ? cleanup : Effect.void)),
+          Effect.scoped,
+        )
+      }),
   } satisfies Info
 }
 
-// Rows appear in start order; the same call object arrives at both hooks, so a call finds its row again.
-function progressHooks(record: (update: (items: Array<ExecuteCall>) => Array<ExecuteCall>) => Effect.Effect<unknown>) {
-  const rows = new WeakMap<object, number>()
-  const start = (call: object, entry: ExecuteCall) =>
+// Tools use the upstream invocation key; extension hooks keep their shared call object.
+function progressHooks(
+  record: (update: (items: Array<ChildCall>) => Array<ChildCall>) => Effect.Effect<unknown>,
+  names: ReadonlyMap<string, string>,
+) {
+  const rows = new Map<string | object, number>()
+  const start = (call: string | object, entry: ChildCall) =>
     record((items) => {
       rows.set(call, items.length)
-      return [...items, entry]
+      return [...items, { ...entry, ...(entry.name ? { id: String(items.length), time: { start: Date.now() } } : {}) }]
     })
-  const settle = (call: object, result: CodeMode.CallResult) => {
+  const settle = (call: string | object, result: CodeMode.CallResult) => {
     const index = rows.get(call)
     if (index === undefined) return Effect.void
     return record((items) => {
       const next = [...items]
-      next[index] = { ...items[index], status: result.status === "success" ? "completed" : "error" }
+      next[index] = {
+        ...items[index],
+        status: result.status === "success" ? "completed" : "error",
+        ...(items[index].id !== undefined
+          ? {
+              ...(result.status === "failure" ? { error: String(result.error) } : {}),
+              ...(result.status === "interrupted" ? { error: "Execution cancelled." } : {}),
+              ...(items[index].time ? { time: { ...items[index].time, end: Date.now() } } : {}),
+            }
+          : {}),
+      }
       return next
     })
   }
-  return {
+  const hooks: CodeMode.Hooks = {
     "tool.before": (call) => {
       const shown = displayInput(call.input)
-      return start(call, { tool: call.name, status: "running", ...(shown ? { input: shown } : {}) })
+      const name = names.get(call.name)
+      return start(call.key, {
+        tool: call.name,
+        status: "running",
+        ...(name && isExec(name) ? { name } : {}),
+        ...(shown ? { input: shown } : {}),
+      })
     },
-    "tool.after": settle,
+    "tool.after": (call, result) => settle(call.key, result),
     // Only listed extension functions get a row; anything else stays out of the TUI.
     "extension.before": (call) => {
       switch (call.name) {
@@ -234,6 +296,18 @@ function progressHooks(record: (update: (items: Array<ExecuteCall>) => Array<Exe
     },
     "extension.after": settle,
   } satisfies CodeMode.Hooks
+  return {
+    hooks,
+    index: (key: string) => {
+      const index = rows.get(key)
+      if (index === undefined) throw new globalThis.Error("Tool invocation has no progress record")
+      return index
+    },
+  }
+}
+
+function isExec(name: string) {
+  return name === "exec_command" || name === "poll_exec" || name === "write_stdin" || name === "terminate_exec"
 }
 
 export const catalog = (inventory: Inventory) => {
@@ -290,11 +364,11 @@ function runtime(inventory: Inventory) {
   const cached = runtimes.get(inventory)
   if (cached) return cached
   const tools = inventoryTools(inventory)
-  // Every extension a run may get; `create` picks each run's.
   const created = CodeMode.make<typeof tools, [typeof CodeModeFetch.extension, typeof CodeModePath.extension]>({
     tools,
     extensions: [CodeModeFetch.extension, CodeModePath.extension],
     hooks: runHooks,
+    limits: { maxToolCalls: 64, maxOutputBytes: 1_048_576 },
   })
   runtimes.set(inventory, created)
   return created
@@ -333,10 +407,8 @@ function inventoryTools(inventory: Inventory) {
       description: child.description,
       input: child.inputSchema,
       freeform: registration.freeform !== undefined,
-      // JSON Schema, which Code Mode renders but does not check: Core has validated the result of the tool that ran,
-      // and a plugin may have renamed the call to a tool with another output.
       output: child.outputSchema ?? { type: ["string", "null"] },
-      execute: (input) => Run.use((run) => run.executeTool(name, registration, input)),
+      execute: (input, call) => Run.use((run) => run.executeTool(name, registration, input, call)),
     })
   }
   return renderTools(root)
@@ -419,8 +491,10 @@ function flattenTools(node: ToolNode, path: ReadonlyArray<string>, tools: Tools)
 
 export function qualifiedName(registration: Info) {
   const normalized = normalizedName(registration)
-  if (registration.options?.namespace === undefined) return normalized
-  return `${registration.options.namespace}.${normalized}`
+  const namespace =
+    (typeof registration.options?.codemode === "object" ? registration.options.codemode.namespace : undefined) ??
+    registration.options?.namespace
+  return namespace === undefined ? normalized : `${namespace}.${normalized}`
 }
 
 // Tool inputs arrive as parsed JSON, so the JSON value cast is a boundary fact.
@@ -442,7 +516,6 @@ function formatResult(result: CodeMode.Result) {
       ? `Warnings:\n${result.warnings.map((item) => `- [${item.kind}] ${item.message}`).join("\n")}`
       : undefined
   const logs = result.logs && result.logs.length > 0 ? `Logs:\n${result.logs.join("\n")}` : undefined
-  // A program that only logs returns undefined (sent as null); a "null" line before its logs says nothing.
   const value = result.ok && result.value === null && (warnings || logs) ? undefined : output
   return [value, warnings, logs].filter((part) => part !== undefined && part !== "").join("\n\n")
 }

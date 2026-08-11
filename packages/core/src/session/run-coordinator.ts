@@ -19,9 +19,9 @@ export interface Coordinator<Key, E, Reason = never> {
    * Stops the active execution and clears its doorbell. No-op when idle. Resolves once the
    * interruption is accepted, not when cleanup settles: the execution fiber finishes its
    * finalizers and settled hook on its own time. Returns whether an active execution was
-   * interrupted.
+   * interrupted. `awaitSettlement` waits for this execution, never a successor admitted during cleanup.
    */
-  readonly interrupt: (key: Key, reason?: Reason) => Effect.Effect<boolean>
+  readonly interrupt: (key: Key, reason?: Reason, options?: { readonly awaitSettlement?: boolean }) => Effect.Effect<boolean>
   /** Why the key's execution is being stopped, once `interrupt` stopped it; undefined for teardown or when running. */
   readonly interruption: (key: Key) => Reason | undefined
   /** Resolves once no execution is active for the key. Returns immediately when already idle and never starts work. */
@@ -191,8 +191,13 @@ export const make = <Key, E, Reason = never>(options: {
       isActive,
       run,
       wake,
-      interrupt,
       interruption,
       awaitIdle,
+      interrupt: (key, reason, options) => Effect.suspend(() => {
+        const execution = executions.get(key)
+        return interrupt(key, reason).pipe(Effect.tap(() =>
+          options?.awaitSettlement && execution ? Deferred.await(execution.done).pipe(Effect.ignoreCause) : Effect.void,
+        ))
+      }),
     }
   })

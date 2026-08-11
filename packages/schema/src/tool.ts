@@ -28,6 +28,11 @@ export interface Context {
   readonly agent: Agent.ID
   readonly messageID: SessionMessage.ID
   readonly id: CallID
+  /** Transcript row that owns the nested exec; hooks and permissions use the invocation's own `id`. */
+  readonly parentCallID?: CallID
+  readonly childID?: string
+  /** Register cleanup for work created by this invocation if its enclosing script fails. */
+  readonly registerCleanup?: (cleanup: Effect.Effect<unknown>) => void
   readonly progress: (update: Metadata) => Effect.Effect<void>
   /**
    * Completes when the user asks the call to stop. A tool that awaits it can stop its work and fail with what it
@@ -46,10 +51,20 @@ interface BaseOptions {
   readonly permission?: string
 }
 
+export interface CodeModeOptions {
+  /** Script-only namespace; the direct model tool keeps its normal name. */
+  readonly namespace?: string
+  readonly concurrency?: {
+    readonly group: string
+    readonly limit: number
+    readonly inputKey?: string
+  }
+}
+
 export type Options = BaseOptions &
   (
     | {
-        readonly codemode?: true
+        readonly codemode?: true | CodeModeOptions
         readonly pinned?: boolean
       }
     | {
@@ -99,6 +114,21 @@ export const Content = Schema.Union([TextContent, FileContent])
   .pipe(Schema.toTaggedUnion("type"))
   .annotate({ identifier: "Tool.Content" })
 export type Content = Schema.Schema.Type<typeof Content>
+
+export const ChildCall = Schema.Struct({
+  id: Schema.String.pipe(Schema.optionalKey),
+  tool: Schema.String,
+  name: Schema.String.pipe(Schema.optionalKey),
+  status: Schema.Literals(["running", "completed", "error"]),
+  input: Schema.Record(Schema.String, Schema.Json).pipe(Schema.optionalKey),
+  metadata: Schema.Record(Schema.String, Schema.Json).pipe(Schema.optionalKey),
+  error: Schema.String.pipe(Schema.optionalKey),
+  time: Schema.Struct({
+    start: Schema.Number,
+    end: Schema.Number.pipe(Schema.optionalKey),
+  }).pipe(Schema.optionalKey),
+}).annotate({ identifier: "Tool.ChildCall" })
+export type ChildCall = typeof ChildCall.Type
 
 export interface Result<Output extends ValueSchema<any> | undefined = ValueSchema<any> | undefined> {
   readonly output?: OutputValue<Output>
