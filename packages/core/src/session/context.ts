@@ -18,6 +18,7 @@ import { SkillInstructions } from "../skill/instructions.js"
 import { Tool } from "../tool.js"
 import { AgentNotFoundError } from "./error.js"
 import { SessionHistory } from "./history.js"
+import { SessionNativeIdentity } from "./native-identity.js"
 import { InstructionEntry } from "./instruction-entry.js"
 import { SessionMessage } from "./message.js"
 import { SessionModelRequest } from "./model-request.js"
@@ -171,7 +172,7 @@ const layer = Layer.effect(
         db,
         selection.session.id,
         selection.instructions,
-        model.ref,
+        SessionNativeIdentity.target(model),
       )
       return {
         session: selection.session,

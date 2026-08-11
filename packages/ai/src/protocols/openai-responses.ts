@@ -15,6 +15,7 @@ import { JsonObject, lenient, optionalArray, optionalNull, ProviderShared } from
 import { ResponsesHostedTools } from "./utils/responses-hosted-tools.js"
 import { OpenResponsesChannel } from "./open-responses-channel.js"
 import { ResponsesCompaction } from "./utils/responses-compaction.js"
+export { ResponsesCompaction } from "./utils/responses-compaction.js"
 import { ResponsesCheckpoint } from "./utils/responses-checkpoint.js"
 import * as Cache from "./utils/cache.js"
 

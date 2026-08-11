@@ -29,6 +29,7 @@ import { Token } from "../util/token.js"
 import type { SessionContext } from "./context.js"
 import { SessionEvent } from "./event.js"
 import { SessionHistory } from "./history.js"
+import { SessionNativeIdentity } from "./native-identity.js"
 import type { SessionMessage } from "./message.js"
 import { SessionModelRequest } from "./model-request.js"
 import { SessionRunnerModel } from "./runner/model.js"
@@ -554,13 +555,18 @@ export const layer = Layer.effect(
       const unsupported = (message: string) =>
         Effect.fail<Failure>({ error: { type: "provider.unsupported-operation", message } })
       const prepared = yield* prepare(context, context.messages, budget, "session")
+      // History was selected before request hooks. Require the configured deployment even for the first checkpoint.
+      const identity = SessionNativeIdentity.provenance(context.model)
+      if (!identity) return yield* unsupported("Native compaction requires a stable provider endpoint")
+      if (!SessionNativeIdentity.compatible(identity, SessionNativeIdentity.provenance({ model: prepared.request.model, ref: context.model.ref })))
+        return yield* unsupported("Native compaction requires the endpoint in provider/model settings, not a model.request rewrite")
 
       const toResult = (window: ReadonlyArray<Message>, usage: Usage | undefined) =>
         spend(context.session.id, usage && SessionUsage.record(usage, context.model.cost)).pipe(
           Effect.as<Result>({
             text: "",
             // Plain JSON, not the schema encoder: provider metadata can hold undefined entries, which it rejects.
-            native: { messages: JSON.parse(JSON.stringify(window)) },
+            native: { messages: JSON.parse(JSON.stringify(window)), [SessionNativeIdentity.metadataKey]: identity },
           }),
         )
 
@@ -568,7 +574,8 @@ export const layer = Layer.effect(
         if (LLMClient.canCompact(request, { mechanism: "trigger" })) {
           return Effect.gen(function* () {
             const history = yield* SessionHistory.load(db, context.session.id, "local").pipe(Effect.orDie)
-            const retained = recentUserMessages(history, context.model, keep)
+            const openai = request.model.provider === "openai" && request.model.route.protocol === "openai-responses"
+            const retained = recentUserMessages(history, context.model, openai ? 64_000 : keep, openai)
             const response = yield* llm.compact(request, { ...prepared.options, mechanism: "trigger" })
             return yield* toResult([...retained, Message.assistant(response.checkpoint)], response.usage)
           })
@@ -858,6 +865,9 @@ export const layer = Layer.effect(
 
     /** A request hook supplied the summary itself, so no model call happens. */
     const fromHook = (context: SessionContext.Loaded, supplied: SessionCompactionResult, background?: Background) => {
+      const identity = supplied.native?.messages === undefined ? undefined : SessionNativeIdentity.provenance(context.model)
+      if (supplied.native?.messages !== undefined && !identity)
+        return Effect.fail<Failure>({ error: { type: "provider.unsupported-operation", message: "Native compaction requires a stable provider endpoint" } })
       const usage = supplied.tokens && {
         tokens: supplied.tokens,
         cost: SessionUsage.calculateCost(context.model.cost, supplied.tokens),
@@ -865,7 +875,9 @@ export const layer = Layer.effect(
       return spend(context.session.id, usage, background?.usage).pipe(
         Effect.as<Result>({
           text: supplied.summary,
-          native: supplied.native,
+          native: identity
+            ? { [SessionNativeIdentity.metadataKey]: identity, ...supplied.native }
+            : supplied.native,
           metadata: supplied.metadata,
         }),
       )
@@ -1086,11 +1098,12 @@ const clip = (value: string) => {
   return `${chars.slice(0, half).join("")}\n[… ${omitted} characters omitted …]\n${chars.slice(-half).join("")}`
 }
 
-/** The newest whole, real user messages within `keep` tokens: no synthetic guidance, no half of an attachment. */
+/** Real user messages; OpenAI may retain boundary text within its fixed allowance. */
 export const recentUserMessages = (
   messages: ReadonlyArray<SessionMessage.Info>,
   model: Pick<SessionContext.Loaded["model"], "ref" | "capabilities">,
   keep: number,
+  truncateText = false,
 ) => {
   const users = messages
     .filter((message) => message.type === "user")
@@ -1098,7 +1111,19 @@ export const recentUserMessages = (
   const sendable = SessionModelRequest.boundImages(
     SessionModelRequest.unsupportedParts(toLLMMessages(users, model.ref), model.capabilities),
   )
-  return sendable.slice(oldestToDrop(sendable, estimateMessage, keep))
+  const start = oldestToDrop(sendable, estimateMessage, keep)
+  if (!truncateText || start === 0) return sendable.slice(start)
+  const remaining = keep - sendable.slice(start).reduce((sum, message) => sum + estimateMessage(message), 0)
+  if (remaining <= 0) return sendable.slice(start)
+  let chars = remaining * 4
+  const boundary = sendable[start - 1]
+  const content = boundary.content.flatMap<ContentPart>((part) => {
+    if (part.type !== "text") return [part]
+    const text = part.text.slice(0, chars)
+    chars -= text.length
+    return text ? [{ ...part, text }] : []
+  })
+  return content.length ? [Message.make({ ...boundary, content }), ...sendable.slice(start)] : sendable.slice(start)
 }
 
 const total = (estimate: Estimate) => estimate.measured + estimate.estimated
