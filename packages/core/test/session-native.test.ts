@@ -15,6 +15,7 @@ import { SessionHistory } from "@opencode/core/session/history"
 import { SessionInbox } from "@opencode/core/session/inbox"
 import { InstructionState } from "@opencode/core/session/instruction-state"
 import { SessionMessage } from "@opencode/core/session/message"
+import { SessionNativeIdentity } from "@opencode/core/session/native-identity"
 import { SessionLegacy } from "@opencode/schema/session-legacy"
 import { SessionProjector } from "@opencode/core/session/projector"
 import { SessionRunnerModel } from "@opencode/core/session/runner/model"
@@ -43,7 +44,8 @@ const model = SessionRunnerModel.resolved(
     limit: { context: 128_000, output: 4096 },
   },
 )
-const target = model.ref
+const target = SessionNativeIdentity.target(model)
+const identity = Schema.decodeUnknownSync(SessionNativeIdentity.Provenance)(target.identity)
 const replacement = [
   Message.user("retained request"),
   Message.assistant(
@@ -167,11 +169,11 @@ it.effect("loads and replays a pre-v2.1 providerContext checkpoint with pre-2.0.
         reason: "manual",
         model: model.ref,
         text: "",
-        providerContext: { version: 1, provenance: { providerID: "openai" }, messages: legacyMedia },
+        providerContext: { version: 1, provenance: identity, messages: legacyMedia },
       },
     })
     // Its projected row, too: the event upgrades before projecting, so restore the old row shape directly.
-    const providerContext = JSON.stringify({ version: 1, provenance: { providerID: "openai" }, messages: legacyMedia })
+    const providerContext = JSON.stringify({ version: 1, provenance: identity, messages: legacyMedia })
     yield* s.db
       .update(SessionMessageTable)
       .set({
@@ -357,5 +359,106 @@ it.effect("skips a malformed native window and replays the history before it", (
     ])
     const store = yield* SessionStore.Service
     expect((yield* store.context(sessionID)).map((message) => message.type)).toEqual(["compaction", "user"])
+  }),
+)
+
+test("OpenAI compatibility spans models but still checks provider, route and endpoint", () => {
+  expect(SessionNativeIdentity.compatible(identity, SessionNativeIdentity.provenance({
+    ...model, ref: { ...model.ref, id: Model.ID.make("alias"), variant: Model.VariantID.make("high") },
+  }))).toBe(true)
+  expect(SessionNativeIdentity.compatible(identity, { ...identity, modelID: "other-model" })).toBe(true)
+  const other = { ...identity, provider: "anthropic", protocol: "anthropic-messages" }
+  expect(SessionNativeIdentity.compatible(other, { ...other, modelID: "other-model" })).toBe(false)
+  for (const changed of [
+    { ...identity, providerID: Provider.ID.make("other-provider") },
+    { ...identity, route: "other-route" },
+    { ...identity, protocol: "other-protocol" },
+    SessionNativeIdentity.provenance({
+      ...model,
+      model: LanguageModel.update(model.model, {
+        route: model.model.route.with({ endpoint: { baseURL: "https://another.example/v1?api-key=secret" } }),
+      }),
+    }),
+    undefined,
+  ]) expect(SessionNativeIdentity.compatible(identity, changed)).toBe(false)
+  const privateEndpoint = SessionNativeIdentity.provenance({
+    ...model,
+    model: LanguageModel.update(model.model, {
+      route: model.model.route.with({ endpoint: { baseURL: "https://user:secret@example.com/v1?api-key=secret" } }),
+    }),
+  })
+  expect(JSON.stringify(privateEndpoint)).not.toContain("secret")
+  expect(SessionNativeIdentity.provenance({
+    ...model,
+    model: LanguageModel.update(model.model, {
+      route: model.model.route.with({ endpoint: { path: () => "/dynamic" } }),
+    }),
+  })).toBeUndefined()
+})
+
+it.effect("persists deployment identity through event replay and falls back across deployments", () =>
+  Effect.gen(function* () {
+    const s = yield* setup
+    yield* s.prepare
+    yield* s.prompt("original request")
+    yield* s.compact({ ...native, [SessionNativeIdentity.metadataKey]: identity })
+    yield* s.prompt("continue")
+    const verify = Effect.gen(function* () {
+      const history = yield* SessionHistory.load(s.db, sessionID, target)
+      expect(history[0]).toMatchObject({ native: { [SessionNativeIdentity.metadataKey]: identity } })
+      expect(toLLMMessages(history, model.ref)).toEqual([
+        ...replacement,
+        expect.objectContaining({ role: "user", content: [Message.text("continue")] }),
+      ])
+      expect(yield* SessionHistory.load(s.db, sessionID, {
+        ...target, id: Model.ID.make("other-model"), identity: { ...identity, modelID: "other-model" },
+      })).toEqual(history)
+      for (const changed of [
+        { ...identity, endpoint: "other-deployment" },
+        { ...identity, providerID: Provider.ID.make("other-provider") },
+        { ...identity, protocol: "other-protocol" },
+        { ...identity, route: "other-route" },
+      ]) {
+        const expanded = yield* SessionHistory.load(s.db, sessionID, { ...target, identity: changed })
+        expect(toLLMMessages(expanded, model.ref).map((message) => message.content)).toEqual([
+          [Message.text("original request")], [Message.text("continue")],
+        ])
+      }
+      const exported = JSON.parse(JSON.stringify(Schema.encodeSync(Schema.Array(SessionMessage.Info))(history)))
+      expect(Schema.decodeUnknownSync(Schema.Array(SessionMessage.Info))(SessionLegacy.messages(exported))).toEqual(history)
+    })
+    yield* verify
+    const recorded = yield* s.db.select().from(EventTable).where(eq(EventTable.aggregate_id, sessionID)).orderBy(asc(EventTable.seq)).all()
+    expect(recorded.find((event) => event.data.native !== undefined)?.data.native).toMatchObject({ [SessionNativeIdentity.metadataKey]: identity })
+    yield* s.bus.remove(sessionID)
+    yield* s.db.delete(SessionTable).where(eq(SessionTable.id, sessionID)).run()
+    for (const event of recorded) yield* s.bus.replay({
+      id: event.id, created: event.created, aggregateID: event.aggregate_id, seq: event.seq, type: event.type, data: event.data,
+    })
+    yield* verify
+    yield* s.compact({ ...native, [SessionNativeIdentity.metadataKey]: { ...identity, endpoint: "other-deployment" } })
+    expect((yield* s.load(target)).entries.map((entry) => entry.message.type)).toEqual(["compaction", "user"])
+  }),
+)
+
+it.effect("binds a legacy checkpoint once to the selected OpenAI configuration and never to other providers", () =>
+  Effect.gen(function* () {
+    const s = yield* setup
+    yield* s.prepare
+    yield* s.prompt("original request")
+    yield* s.compact({ ...native, [SessionNativeIdentity.metadataKey]: { ...identity, endpoint: SessionNativeIdentity.legacyEndpoint } })
+    expect((yield* s.load("latest")).entries[0].message).toMatchObject({
+      native: { [SessionNativeIdentity.metadataKey]: { endpoint: SessionNativeIdentity.legacyEndpoint } },
+    })
+    for (const changed of [
+      { ...identity, provider: "anthropic", protocol: "anthropic-messages" },
+      { ...identity, providerID: Provider.ID.make("other-provider") },
+    ]) expect((yield* s.load({ ...target, identity: changed })).entries.map((entry) => entry.message.type)).toEqual(["user"])
+    const selected = { ...identity, modelID: "new-selected-model", endpoint: "selected-deployment" }
+    const bound = yield* s.load({ ...target, identity: selected })
+    expect(bound.entries[0].message).toMatchObject({ native: { [SessionNativeIdentity.metadataKey]: selected } })
+    expect((yield* s.load({ ...target, identity: { ...selected, modelID: "another-openai-model" } })).entries).toEqual(bound.entries)
+    expect((yield* s.load({ ...target, identity: { ...selected, endpoint: "later-different-deployment" } })).entries.map((entry) => entry.message.type)).toEqual(["user"])
+    expect((yield* s.load("latest")).entries[0].message).toMatchObject({ native: { [SessionNativeIdentity.metadataKey]: selected } })
   }),
 )
