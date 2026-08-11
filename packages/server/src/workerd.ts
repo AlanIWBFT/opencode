@@ -133,6 +133,8 @@ const ptyLayer = Layer.succeed(
     create: () => unavailable("Pty.create"),
     update: (ptyID) => Effect.fail(new Pty.NotFoundError({ ptyID })),
     remove: (ptyID) => Effect.fail(new Pty.NotFoundError({ ptyID })),
+    kill: (ptyID) => Effect.fail(new Pty.NotFoundError({ ptyID })),
+    read: (ptyID) => Effect.fail(new Pty.NotFoundError({ ptyID })),
     write: (ptyID) => Effect.fail(new Pty.NotFoundError({ ptyID })),
     attach: (ptyID) => Effect.fail(new Pty.NotFoundError({ ptyID })),
   }),

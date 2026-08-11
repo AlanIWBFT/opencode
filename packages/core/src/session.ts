@@ -147,20 +147,20 @@ export interface Interface {
   readonly remove: (sessionID: SessionSchema.ID) => Effect.Effect<void, NotFoundError>
   readonly messages: (
     input: SessionStore.MessagesInput,
-  ) => Effect.Effect<SessionMessage.Info[], NotFoundError | MessageDecodeError>
+  ) => Effect.Effect<SessionMessage.StoredInfo[], NotFoundError | MessageDecodeError>
   readonly message: (input: {
     sessionID: SessionSchema.ID
     messageID: SessionMessage.ID
-  }) => Effect.Effect<SessionMessage.Info | undefined>
+  }) => Effect.Effect<SessionMessage.StoredInfo | undefined>
   /** Experimental: {@link Interface.messages} with files stored in `blob` left as `media:` refs when the session's location enables `experimental.media_blob`. */
   readonly messagesWithRefs: (
     input: SessionStore.MessagesInput,
-  ) => Effect.Effect<SessionMessage.MediaInfo[], NotFoundError | MessageDecodeError>
+  ) => Effect.Effect<SessionMessage.StoredMediaInfo[], NotFoundError | MessageDecodeError>
   /** Experimental: {@link Interface.message} with files stored in `blob` left as `media:` refs when the session's location enables `experimental.media_blob`. */
   readonly messageWithRefs: (input: {
     sessionID: SessionSchema.ID
     messageID: SessionMessage.ID
-  }) => Effect.Effect<SessionMessage.MediaInfo | undefined>
+  }) => Effect.Effect<SessionMessage.StoredMediaInfo | undefined>
   readonly context: (
     sessionID: SessionSchema.ID,
   ) => Effect.Effect<SessionMessage.Info[], NotFoundError | MessageDecodeError>
@@ -456,15 +456,18 @@ const layer = Layer.effect(
       }),
       messagesWithRefs: Effect.fn("Session.messagesWithRefs")(function* (input) {
         const session = yield* result.get(input.sessionID)
-        if (!(yield* keepsMediaRefs(session))) return yield* store.messages(input)
-        return yield* store.messagesWithRefs(input)
+        if (!(yield* keepsMediaRefs(session))) return yield* result.messages(input)
+        const messages = yield* store.messagesWithRefs(input)
+        const entries = yield* execSnapshots.list(input.sessionID)
+        return messages.map((message) => SessionExecSnapshots.overlay(message, entries))
       }),
       messageWithRefs: Effect.fn("Session.messageWithRefs")(function* (input) {
         const session = yield* result.get(input.sessionID).pipe(Effect.option)
         if (Option.isNone(session)) return undefined
         if (!(yield* keepsMediaRefs(session.value))) return yield* result.message(input)
         const stored = yield* store.messageWithRefs(input.messageID)
-        return stored?.sessionID === input.sessionID ? stored.message : undefined
+        if (stored?.sessionID !== input.sessionID) return undefined
+        return SessionExecSnapshots.overlay(stored.message, yield* execSnapshots.list(input.sessionID, input.messageID))
       }),
       context: Effect.fn("Session.context")(function* (sessionID) {
         yield* result.get(sessionID)

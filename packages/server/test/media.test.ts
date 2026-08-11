@@ -129,12 +129,16 @@ it.live("serves stored media as refs only to clients that opt in while experimen
         storeAsBlobs(database)
 
         // Without the capability, reads stay byte-for-byte what was imported.
-        expect((await plain.message.list({ sessionID, order: "asc" })).data).toEqual([user, assistant])
+        expect((await plain.message.list({ sessionID, order: "asc" })).data).toEqual([
+          { ...user, seq: expect.any(Number) },
+          { ...assistant, seq: expect.any(Number) },
+        ])
 
         const refs: unknown = (await opted.message.list({ sessionID, order: "asc" })).data
         expect(refs).toEqual([
           {
             ...user,
+            seq: expect.any(Number),
             files: [
               {
                 uri: media(png),
@@ -168,6 +172,7 @@ it.live("serves stored media as refs only to clients that opt in while experimen
           },
           {
             ...assistant,
+            seq: expect.any(Number),
             content: [
               {
                 type: "tool",
@@ -186,8 +191,11 @@ it.live("serves stored media as refs only to clients that opt in while experimen
         ])
         const single: unknown = await opted.session.message.get({ sessionID, messageID: "msg_media_user" })
         expect(single).toMatchObject({ files: [{ uri: media(png) }, { uri: media(text) }, {}, {}] })
-        expect(await plain.session.message.get({ sessionID, messageID: "msg_media_user" })).toEqual(user)
-        expect((await opted.session.export({ sessionID })).messages).toEqual([user, assistant])
+        expect(await plain.session.message.get({ sessionID, messageID: "msg_media_user" })).toEqual({ ...user, seq: expect.any(Number) })
+        expect((await opted.session.export({ sessionID })).messages).toEqual([
+          { ...user, seq: expect.any(Number) },
+          { ...assistant, seq: expect.any(Number) },
+        ])
 
         // The route serves raw bytes, immutable caching and a 304, and never renders active content inline.
         const image = await handler(new Request(route(png)))
@@ -300,7 +308,7 @@ it.live("serves stored media as refs only to clients that opt in while experimen
         expect((await disabled(new Request(route(png)))).status).toBe(200)
         expect(
           (await client(disabled, "experimental-media-uri").message.list({ sessionID, order: "asc" })).data.slice(0, 2),
-        ).toEqual([user, assistant])
+        ).toEqual([{ ...user, seq: expect.any(Number) }, { ...assistant, seq: expect.any(Number) }])
         expect((await handler(new Request(route(png)))).status).toBe(200)
       })
     })

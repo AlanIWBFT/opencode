@@ -343,3 +343,8 @@ export const MediaInfo = Schema.Union([
   Idle,
 ]).annotate({ identifier: "Session.Message.MediaInfo" })
 export type MediaInfo = Exclude<Info, User> | MediaUser
+
+/** Read-model order from session_message.seq; never an update-event sequence or part index. */
+export type StoredInfo = Info & { readonly seq: number }
+/** Media read-model with the same authoritative creation order as inline messages. */
+export type StoredMediaInfo = MediaInfo & { readonly seq: number }
