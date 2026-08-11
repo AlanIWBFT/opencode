@@ -133,7 +133,7 @@ function interrupted(entry: Entry): Entry {
 }
 
 /** Parent children must exist before their independently advancing command previews are applied. */
-export function overlay(message: SessionMessage.Info, entries: readonly Entry[]) {
+export function overlay(message: SessionMessage.StoredInfo, entries: readonly Entry[]) {
   if (message.type !== "assistant") return message
   return produce(message, (draft) => {
     for (const entry of entries) if (entry.kind === "script") applyScriptMetadata(draft, entry.snapshot)

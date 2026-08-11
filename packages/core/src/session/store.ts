@@ -1,6 +1,21 @@
 export * as SessionStore from "./store.js"
 
-import { and, asc, desc, eq, gt, inArray, isNotNull, isNull, like, lt, notInArray, or, sql, type SQL } from "drizzle-orm"
+import {
+  and,
+  asc,
+  desc,
+  eq,
+  gt,
+  inArray,
+  isNotNull,
+  isNull,
+  like,
+  lt,
+  notInArray,
+  or,
+  sql,
+  type SQL,
+} from "drizzle-orm"
 import { Context, Effect, Layer, Schema } from "effect"
 import { Project } from "@opencode/schema/project"
 import { Workspace } from "@opencode/schema/workspace"
@@ -53,11 +68,11 @@ export type MessagesInput = {
 export interface Interface {
   readonly get: (sessionID: Session.ID) => Effect.Effect<Session.Info | undefined>
   readonly list: (input?: ListInput) => Effect.Effect<Session.Info[]>
-  readonly messages: (input: MessagesInput) => Effect.Effect<SessionMessage.Info[], MessageDecodeError>
+  readonly messages: (input: MessagesInput) => Effect.Effect<SessionMessage.StoredInfo[], MessageDecodeError>
   readonly context: (sessionID: Session.ID) => Effect.Effect<SessionMessage.Info[], MessageDecodeError>
   readonly message: (
     messageID: SessionMessage.ID,
-  ) => Effect.Effect<{ readonly sessionID: Session.ID; readonly message: SessionMessage.Info } | undefined>
+  ) => Effect.Effect<{ readonly sessionID: Session.ID; readonly message: SessionMessage.StoredInfo } | undefined>
   /**
    * Top-level Sessions holding an execution claim. Recoverable background
    * children are resumed separately through their durable Job records.
@@ -183,9 +198,8 @@ const layer = Layer.effect(
         const rows = yield* (input.limit === undefined ? query.all() : query.limit(input.limit).all()).pipe(
           Effect.orDie,
         )
-        return yield* Effect.forEach(
-          direction === "previous" ? rows.toReversed() : rows,
-          SessionHistory.decodeMessageRow,
+        return yield* Effect.forEach(direction === "previous" ? rows.toReversed() : rows, (row) =>
+          SessionHistory.decodeMessageRow(row).pipe(Effect.map((message) => ({ ...message, seq: row.seq }))),
         )
       }),
       context: Effect.fn("SessionStore.context")((sessionID) => SessionHistory.load(db, sessionID, "latest")),
@@ -199,7 +213,7 @@ const layer = Layer.effect(
         return row
           ? {
               sessionID: Session.ID.make(row.session_id),
-              message: yield* SessionHistory.decodeMessageRow(row).pipe(Effect.orDie),
+              message: { ...(yield* SessionHistory.decodeMessageRow(row).pipe(Effect.orDie)), seq: row.seq },
             }
           : undefined
       }),

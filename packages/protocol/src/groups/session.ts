@@ -41,7 +41,7 @@ import { SessionEvent } from "@opencode/schema/session-event"
 import { EventLog } from "@opencode/schema/event-log"
 import { FileDiff } from "@opencode/schema/file-diff"
 import { Form } from "@opencode/schema/form"
-import { PublicSessionMessage } from "./message.js"
+import { PublicSessionMessage, PublicStoredSessionMessage } from "./message.js"
 
 const ParentIDFilter = Schema.Union([
   Session.ID,
@@ -126,6 +126,11 @@ const PublicSessionTransfer = Schema.Struct({
   info: PublicSessionInfo,
   messages: Schema.Array(PublicSessionMessage),
 }).annotate({ identifier: "SessionTransfer.Data" })
+
+const PublicSessionExport = Schema.Struct({
+  info: PublicSessionInfo,
+  messages: Schema.Array(PublicStoredSessionMessage),
+}).annotate({ identifier: "SessionTransfer.Exported" })
 
 const PublicMovePayload = Schema.Struct({
   ...Struct.omit(SessionInbox.MovePayload.fields, ["location"]),
@@ -255,7 +260,7 @@ export const makeSessionGroup = <I extends HttpApiMiddleware.AnyId, S, FormI ext
       HttpApiEndpoint.get("session.export", "/api/experimental/session/:sessionID/export", {
         params: { sessionID: Session.ID },
         query: Schema.Struct({ sanitize: BooleanFromString.pipe(Schema.optional) }),
-        success: Schema.Struct({ data: PublicSessionTransfer }),
+        success: Schema.Struct({ data: PublicSessionExport }),
         error: [SessionNotFoundError, UnknownError],
       }).annotateMerge(
         OpenApi.annotations({
@@ -800,7 +805,7 @@ export const makeSessionGroup = <I extends HttpApiMiddleware.AnyId, S, FormI ext
     .add(
       HttpApiEndpoint.get("session.message", "/api/session/:sessionID/message/:messageID", {
         params: { sessionID: Session.ID, messageID: SessionMessage.ID },
-        success: Schema.Struct({ data: PublicSessionMessage }),
+        success: Schema.Struct({ data: PublicStoredSessionMessage }),
         error: [SessionNotFoundError, MessageNotFoundError],
       }).annotateMerge(
         OpenApi.annotations({
