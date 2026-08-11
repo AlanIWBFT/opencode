@@ -400,7 +400,14 @@ export const layer = Layer.effect(
         capabilities: selected.capabilities,
         cost: selected.cost,
         limit: selected.limit,
-        compaction: runtimeInfo.settings?.compaction,
+        compaction:
+          runtimeInfo.settings?.compaction ??
+          (selected.providerID === Provider.ID.openai &&
+          runtime.provider === "openai" &&
+          runtime.route.protocol === "openai-responses" &&
+          (runtime.route.compact?.trigger || runtime.route.compact?.endpoint)
+            ? { type: "native" as const }
+            : undefined),
         transport: provider?.settings?.transport,
         chunkTimeout: Provider.timeout(provider?.settings?.chunkTimeout),
       }

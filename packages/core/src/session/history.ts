@@ -30,6 +30,25 @@ export const latestCompaction = Effect.fnUntraced(function* (
   sessionID: SessionSchema.ID,
   boundary: Boundary,
 ) {
+  // Complete the V1 data conversion once a location-scoped model is selected.
+  // Never infer an OpenAI endpoint from another provider/protocol or rebind an installed provenance.
+  if (typeof boundary !== "string" && boundary.provider === "openai" && boundary.protocol === "openai-responses") {
+    yield* db
+      .update(SessionMessageTable)
+      .set({
+        data: sql`json_set(${SessionMessageTable.data}, '$.providerContext.provenance', json(${JSON.stringify(boundary)}))`,
+      })
+      .where(
+        and(
+          eq(SessionMessageTable.session_id, sessionID),
+          eq(SessionMessageTable.type, "compaction"),
+          sql`json_extract(${SessionMessageTable.data}, '$.providerContext.provenance.endpoint') = ${SessionProviderContext.legacyEndpoint}`,
+          sql`json_extract(${SessionMessageTable.data}, '$.providerContext.provenance.providerID') = ${boundary.providerID}`,
+        ),
+      )
+      .run()
+      .pipe(Effect.orDie)
+  }
   return yield* db
     .select({ seq: SessionMessageTable.seq })
     .from(SessionMessageTable)
@@ -45,7 +64,7 @@ export const latestCompaction = Effect.fnUntraced(function* (
               boundary === "local"
                 ? undefined
                 : and(
-                    ...Object.entries(boundary).map(
+                    ...Object.entries(SessionProviderContext.replayIdentity(boundary)).map(
                       ([key, value]) =>
                         sql`json_extract(${SessionMessageTable.data}, ${`$.providerContext.provenance.${key}`}) = ${value}`,
                     ),

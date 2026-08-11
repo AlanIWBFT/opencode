@@ -57,7 +57,7 @@ const MessageFields = {
   status: Schema.optional(Schema.String),
   phase: Schema.optional(OpenResponses.MessagePhase),
 }
-const Response = Schema.Struct({
+export const Response = Schema.Struct({
   object: Schema.Literal("response.compaction"),
   output: Schema.Array(
     Schema.Union([
@@ -148,7 +148,7 @@ export const make = (
     })
   })
 
-function toMessage(item: (typeof Response.Type.output)[number], model: LLMRequest["model"]): Message {
+export function toMessage(item: (typeof Response.Type.output)[number], model: LLMRequest["model"]): Message {
   if (item.type === "compaction")
     return Message.assistant(
       CompactionPart.make({ provider: model.provider, id: item.id ?? undefined, encrypted: item.encrypted_content }),
