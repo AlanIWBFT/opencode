@@ -1,4 +1,10 @@
-# OpenAI Native Server-Side Compaction Plan
+# Historical: OpenAI Native Server-Side Compaction Plan
+
+> Historical design note. The `/responses/compact` route and the native
+> `@opencode-ai/llm` compact API described below were removed after the
+> explicit compaction implementation moved into the OpenAI AI SDK adapter.
+> See `openai-native-codex-parity-compaction.md` for the retained checkpoint
+> and replay design.
 
 > Historical V1 plan. OpenCode v2.0.15 already supplies streamed trigger compaction, endpoint compaction and durable native windows. The local V2 migration reuses those implementations and the official retry/failure policy, rather than restoring the transport and session modules described below. See `openai-native-codex-parity-compaction.md` for the retained local policy and legacy-checkpoint conversion.
 
