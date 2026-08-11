@@ -15,8 +15,10 @@ import {
   toDefinitions,
   type JsonSchema,
   type LLMEvent,
+  type ProviderMetadata,
 } from "@opencode-ai/llm"
 import type { LLMClientShape } from "@opencode-ai/llm/route"
+import { OpenAINativeCompaction } from "../openai-native-compaction"
 import { LLMNative } from "./native-request"
 
 export type RuntimeStatus =
@@ -25,6 +27,10 @@ export type RuntimeStatus =
 export type StreamResult =
   | { readonly type: "supported"; readonly stream: Stream.Stream<LLMEvent, unknown> }
   | { readonly type: "unsupported"; readonly reason: string }
+
+export type TurnState = { value?: string }
+
+const TURN_STATE_HEADER = "x-codex-turn-state"
 
 type StreamInput = {
   readonly model: Provider.Model
@@ -41,6 +47,24 @@ type StreamInput = {
   readonly providerOptions?: Record<string, any>
   readonly headers: Record<string, string>
   readonly abort: AbortSignal
+  readonly nativeCompactionWindow?: OpenAINativeCompaction.Window
+  readonly turnState?: TurnState
+}
+
+type CompactInput = Omit<StreamInput, "tools" | "toolChoice" | "abort"> & {
+  readonly tools?: Record<string, Tool>
+}
+
+type RequestInput = Pick<
+  StreamInput,
+  "model" | "provider" | "toolChoice" | "temperature" | "topP" | "topK" | "maxOutputTokens" | "headers"
+> & {
+  readonly apiKey: string
+  readonly baseURL?: string
+  readonly messages: ModelMessage[]
+  readonly tools?: Record<string, Tool>
+  readonly providerOptions?: Record<string, any>
+  readonly turnState?: TurnState
 }
 
 export function status(input: Pick<StreamInput, "model" | "provider" | "auth">): RuntimeStatus {
@@ -73,6 +97,8 @@ function statusWithFetch(
 
 export function stream(input: StreamInput): StreamResult {
   const fetch = providerFetch(input)
+  if (input.nativeCompactionWindow && !OpenAINativeCompaction.supportsModel(input.model))
+    return { type: "unsupported", reason: "native compaction replay requires OpenAI Responses" }
   const current = statusWithFetch(input, fetch)
   if (current.type === "unsupported") return current
 
@@ -87,22 +113,13 @@ export function stream(input: StreamInput): StreamResult {
   // — if a field ever needs to differ between the two surfaces, the
   // translation belongs here, not split across both packages.
   const tools = nativeTools(input.tools, input)
-  const request = LLMNative.request({
-    model: input.model,
-    apiKey: current.apiKey,
-    baseURL: current.baseURL,
-    messages: ProviderTransform.message(input.messages, input.model, input.providerOptions ?? {}),
-    toolChoice: input.toolChoice,
-    temperature: input.temperature,
-    topP: input.topP,
-    topK: input.topK,
-    maxOutputTokens: input.maxOutputTokens,
-    providerOptions: ProviderTransform.providerOptions(input.model, input.providerOptions ?? {}),
-    headers: { ...providerHeaders(input.provider.options.headers), ...input.headers },
-  })
+  const baseRequest = buildRequest({ ...input, apiKey: current.apiKey, baseURL: current.baseURL })
   const stream = Stream.scoped(
     Stream.unwrap(
       Effect.gen(function* () {
+        const request = input.nativeCompactionWindow
+          ? applyNativeReplayWindow(baseRequest, input.nativeCompactionWindow)
+          : baseRequest
         const settlements = yield* FiberSet.make<void>()
         const results = yield* Queue.unbounded<LLMEvent, Cause.Done>()
         const provider = input.llmClient
@@ -112,6 +129,7 @@ export function stream(input: StreamInput): StreamResult {
             }),
           )
           .pipe(
+            Stream.tap((event) => Effect.sync(() => captureTurnState(input.turnState, event))),
             Stream.flatMap((event) =>
               event.type !== "tool-call" || event.providerExecuted
                 ? Stream.make(event)
@@ -145,6 +163,110 @@ export function stream(input: StreamInput): StreamResult {
   }
 }
 
+export const compact = Effect.fn("LLMNativeRuntime.compact")(function* (input: CompactInput) {
+  if (!OpenAINativeCompaction.supportsModel(input.model))
+    return { type: "unsupported" as const, reason: "native compaction requires OpenAI Responses" }
+  const fetch = providerFetch(input)
+  const current = statusWithFetch(input, fetch)
+  if (current.type === "unsupported") return current
+  const providerOptions = compactProviderOptions(input.providerOptions)
+  const baseRequest = buildRequest({
+    ...input,
+    apiKey: current.apiKey,
+    baseURL: current.baseURL,
+    messages: compactMessages(input.messages),
+    providerOptions,
+  })
+  const request = Effect.gen(function* () {
+    const compactRequest = input.nativeCompactionWindow
+      ? applyNativeReplayWindow(baseRequest, input.nativeCompactionWindow)
+      : baseRequest
+    return yield* input.llmClient.compactWithInput(compactRequest).pipe(
+      Effect.tap((result) => Effect.sync(() => captureTurnState(input.turnState, result.providerMetadata))),
+    )
+  })
+    .pipe(Effect.map((result) => ({ ...result, output: OpenAINativeCompaction.normalizeOutput(result.output) })))
+  const result = yield* (fetch ? request.pipe(Effect.provideService(FetchHttpClient.Fetch, fetch)) : request)
+  return { ...current, output: result.output, input: result.input, providerMetadata: result.providerMetadata }
+})
+
+function buildRequest(input: RequestInput) {
+  return LLMNative.request({
+    model: input.model,
+    apiKey: input.apiKey,
+    baseURL: input.baseURL,
+    messages: ProviderTransform.message(input.messages, input.model, input.providerOptions ?? {}),
+    tools: {},
+    toolChoice: input.toolChoice,
+    temperature: input.temperature,
+    topP: input.topP,
+    topK: input.topK,
+    maxOutputTokens: input.maxOutputTokens,
+    providerOptions: ProviderTransform.providerOptions(input.model, input.providerOptions ?? {}),
+    headers: { ...providerHeaders(input.provider.options.headers), ...input.headers, ...withTurnStateHeaders(input) },
+  })
+}
+
+export function createTurnState(): TurnState {
+  return {}
+}
+
+export function usesOpenAITurnState(input: Pick<RequestInput, "model" | "turnState">) {
+  return input.model.api.npm === "@ai-sdk/openai" && input.turnState !== undefined
+}
+
+export function withTurnStateHeaders(input: Pick<RequestInput, "model" | "turnState">) {
+  return usesOpenAITurnState(input) && input.turnState?.value
+    ? { [TURN_STATE_HEADER]: input.turnState.value }
+    : undefined
+}
+
+export function captureTurnState(state: TurnState | undefined, event: LLMEvent | ProviderMetadata | undefined) {
+  if (!state || state.value) return
+  const providerMetadata = eventProviderMetadata(event)
+  const openai = providerMetadata?.openai
+  if (!isRecord(openai) || !isRecord(openai.headers)) return
+  const value = headerValue(openai.headers, TURN_STATE_HEADER)
+  if (value) state.value = value
+}
+
+function eventProviderMetadata(event: LLMEvent | ProviderMetadata | undefined): ProviderMetadata | undefined {
+  if (!event) return undefined
+  if (isRecord(event) && typeof event.type === "string") {
+    if (!("providerMetadata" in event)) return undefined
+    return isProviderMetadata(event.providerMetadata) ? event.providerMetadata : undefined
+  }
+  return isProviderMetadata(event) ? event : undefined
+}
+
+function isProviderMetadata(value: unknown): value is ProviderMetadata {
+  if (!isRecord(value)) return false
+  return Object.values(value).every(isRecord)
+}
+
+function headerValue(headers: Record<string, unknown>, name: string) {
+  const found = Object.entries(headers).find(([key]) => key.toLowerCase() === name)
+  const value = found?.[1]
+  if (typeof value === "string") return value
+  if (Array.isArray(value)) return value.find((item): item is string => typeof item === "string")
+  return undefined
+}
+
+function applyNativeReplayWindow(
+  request: LLMRequest,
+  window: OpenAINativeCompaction.Window,
+) {
+  return LLMRequest.update(request, {
+    providerOptions: {
+      ...request.providerOptions,
+      openai: {
+        ...request.providerOptions?.openai,
+        responsesReplayInput: window.output,
+      },
+    },
+  })
+}
+
 function providerFetch(input: Pick<StreamInput, "provider" | "auth">): typeof globalThis.fetch | undefined {
   if (input.provider.id !== "openai" || input.auth?.type !== "oauth") return undefined
   const value: unknown = input.provider.options.fetch
@@ -157,6 +279,17 @@ function providerHeaders(value: unknown): Record<string, string> | undefined {
   return Object.fromEntries(
     Object.entries(value).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
   )
+}
+
+function compactMessages(messages: readonly ModelMessage[]) {
+  return messages.filter((message) => message.role !== "system")
+}
+
+function compactProviderOptions(options: Record<string, any> | undefined) {
+  if (!options || !("instructions" in options)) return options
+  const result = { ...options }
+  delete result.instructions
+  return result
 }
 
 function nativeSchema(value: unknown): JsonSchema {

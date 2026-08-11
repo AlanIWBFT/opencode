@@ -25,6 +25,7 @@ export interface StreamResponsesWebSocketOptions {
   signal?: AbortSignal
   onFirstEvent?: (error?: WrappedError) => void
   onComplete?: (event: Record<string, unknown>) => void
+  onEvent?: (event: Record<string, unknown>) => void
   onTerminal?: (event: Record<string, unknown>) => void
   onRetryableTerminal?: (event: Record<string, unknown>) => Promise<WebSocket | undefined>
   onConnectionInvalid?: (error: ProviderError.ResponseStreamError, closeCode?: number) => void
@@ -221,6 +222,7 @@ export function streamResponsesWebSocket(options: StreamResponsesWebSocketOption
 
     const wrappedError = parseWrappedError(event, text)
     if (wrappedError && event) {
+      options.onEvent?.(event)
       if (!emitted) options.onFirstEvent?.(wrappedError)
       completed = true
       cleanup()
@@ -239,6 +241,7 @@ export function streamResponsesWebSocket(options: StreamResponsesWebSocketOption
     }
 
     if (!emitted) options.onFirstEvent?.()
+    if (event) options.onEvent?.(event)
     controller?.enqueue(
       encoder.encode(
         `${text

@@ -171,6 +171,36 @@ describe("plugin.openai.ws-pool", () => {
     fetch.close()
   })
 
+  test("replays turn state through websocket client metadata", async () => {
+    const bodies: unknown[] = []
+    await using server = await createWebSocketServer((socket) => {
+      socket.on("message", (data) => {
+        bodies.push(JSON.parse(data.toString()))
+        if (bodies.length === 1) {
+          socket.send(JSON.stringify({ type: "response.metadata", headers: { "x-codex-turn-state": "turn-1" } }))
+        }
+        socket.send(JSON.stringify({ type: "response.completed", response: { id: `resp_${bodies.length}` } }))
+      })
+    })
+    const turnState = {}
+    const fetch = OpenAIWebSocketPool.createWebSocketFetch({
+      url: server.url,
+      turnState,
+    })
+
+    const first = await fetch(server.url, streamRequest())
+    expect(await first.text()).toContain("data: [DONE]")
+    const second = await fetch(server.url, streamRequest())
+    expect(await second.text()).toContain("data: [DONE]")
+
+    expect(turnState).toEqual({ value: "turn-1" })
+    expect(bodies).toEqual([
+      { type: "response.create", input: "hi" },
+      { type: "response.create", input: "hi", client_metadata: { "x-codex-turn-state": "turn-1" } },
+    ])
+    fetch.close()
+  })
+
   test("resolves websocket fetch before the first response event", async () => {
     let release: () => void = () => {}
     const released = new Promise<void>((resolve) => {

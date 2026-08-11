@@ -453,6 +453,9 @@ const layer = Layer.effect(
             }
             throw new Error(value.message)
 
+          case "provider-metadata":
+            return
+
           case "step-start":
             if (!ctx.snapshot) ctx.snapshot = yield* snapshot.track()
             yield* session.updatePart({

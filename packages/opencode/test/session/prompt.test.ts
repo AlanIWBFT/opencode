@@ -57,6 +57,7 @@ import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { LocationServiceMap, locationServiceMapLayer } from "@opencode-ai/core/location-services"
+import { OpenAINativeCompaction } from "@/session/openai-native-compaction"
 import { ExecSession } from "@/tool/exec-session"
 import { persistentShellScript } from "@/tool/shell"
 
@@ -797,6 +798,37 @@ function providerCfg(url: string) {
   }
 }
 
+function openAIProviderCfg(url: string) {
+  const base = providerCfg(url)
+  return {
+    ...base,
+    provider: {
+      ...base.provider,
+      openai: {
+        name: "OpenAI",
+        id: "openai",
+        env: [],
+        npm: "@ai-sdk/openai",
+        models: {
+          "gpt-5-mini": {
+            id: "gpt-5-mini",
+            name: "GPT-5 Mini",
+            attachment: false,
+            reasoning: true,
+            temperature: true,
+            tool_call: true,
+            release_date: "2026-01-01",
+            limit: { context: 128_000, output: 32_000 },
+            cost: { input: 0, output: 0 },
+            options: {},
+          },
+        },
+        options: { apiKey: "test-openai-key", baseURL: url },
+      },
+    },
+  }
+}
+
 const writeText = Effect.fn("test.writeText")(function* (file: string, text: string) {
   const fs = yield* FSUtil.Service
   yield* fs.writeWithDirs(file, text)
@@ -882,6 +914,126 @@ const user = Effect.fn("test.user")(function* (sessionID: SessionID, text: strin
   return msg
 })
 
+const nativeCheckpoint = Effect.fn("test.nativeCheckpoint")(function* (
+  sessionID: SessionID,
+  opts?: { auto?: boolean; tailStartID?: MessageID },
+) {
+  const sessions = yield* Session.Service
+  const test = yield* TestInstance
+  const model = {
+    providerID: ProviderV2.ID.make("openai"),
+    modelID: ModelV2.ID.make("gpt-5-mini"),
+  }
+  const before = yield* user(sessionID, "before compact")
+  yield* sessions.updateMessage({ ...before, model })
+  const marker = yield* sessions.updateMessage({
+    id: MessageID.ascending(),
+    role: "user",
+    sessionID,
+    agent: "build",
+    model,
+    time: { created: Date.now() },
+  })
+  yield* sessions.updatePart({
+    id: PartID.ascending(),
+    messageID: marker.id,
+    sessionID,
+    type: "compaction",
+    auto: opts?.auto ?? false,
+    tail_start_id: opts?.tailStartID,
+  })
+  const summary = yield* sessions.updateMessage({
+    id: MessageID.ascending(),
+    role: "assistant",
+    sessionID,
+    parentID: marker.id,
+    mode: "compaction",
+    agent: "compaction",
+    providerID: model.providerID,
+    modelID: model.modelID,
+    path: { cwd: test.directory, root: test.directory },
+    cost: 0,
+    tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+    summary: true,
+    finish: "stop",
+    time: { created: Date.now(), completed: Date.now() },
+  } satisfies SessionV1.Assistant)
+  yield* sessions.updatePart({
+    id: PartID.ascending(),
+    messageID: summary.id,
+    sessionID,
+    type: "text",
+    text: OpenAINativeCompaction.PLACEHOLDER,
+    metadata: OpenAINativeCompaction.metadata({
+      model,
+      output: [
+        { role: "user", content: [{ type: "input_text", text: "before compact" }] },
+        { type: "compaction", encrypted_content: "opaque" },
+      ],
+      compactOutput: [{ type: "compaction", encrypted_content: "opaque" }],
+    }),
+  })
+  return { model, marker, summary }
+})
+
+const legacyNativeCheckpoint = Effect.fn("test.legacyNativeCheckpoint")(function* (
+  sessionID: SessionID,
+  opts?: { auto?: boolean; tailStartID?: MessageID },
+) {
+  const sessions = yield* Session.Service
+  const test = yield* TestInstance
+  const model = {
+    providerID: ProviderV2.ID.make("openai"),
+    modelID: ModelV2.ID.make("gpt-5-mini"),
+  }
+  const before = yield* user(sessionID, "before legacy compact")
+  yield* sessions.updateMessage({ ...before, model })
+  const marker = yield* sessions.updateMessage({
+    id: MessageID.ascending(),
+    role: "user",
+    sessionID,
+    agent: "build",
+    model,
+    time: { created: Date.now() },
+  })
+  yield* sessions.updatePart({
+    id: PartID.ascending(),
+    messageID: marker.id,
+    sessionID,
+    type: "compaction",
+    auto: opts?.auto ?? false,
+    tail_start_id: opts?.tailStartID,
+  })
+  const summary = yield* sessions.updateMessage({
+    id: MessageID.ascending(),
+    role: "assistant",
+    sessionID,
+    parentID: marker.id,
+    mode: "compaction",
+    agent: "compaction",
+    providerID: model.providerID,
+    modelID: model.modelID,
+    path: { cwd: test.directory, root: test.directory },
+    cost: 0,
+    tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+    summary: true,
+    finish: "stop",
+    time: { created: Date.now(), completed: Date.now() },
+  } satisfies SessionV1.Assistant)
+  yield* sessions.updatePart({
+    id: PartID.ascending(),
+    messageID: summary.id,
+    sessionID,
+    type: "text",
+    text: OpenAINativeCompaction.PLACEHOLDER,
+    metadata: OpenAINativeCompaction.legacyMetadata({
+      model,
+      output: [{ type: "compaction", encrypted_content: "legacy-window" }],
+    }),
+  })
+  return { model, before, marker, summary }
+})
+
 const seed = Effect.fn("test.seed")(function* (sessionID: SessionID, opts?: { finish?: string }) {
   const session = yield* Session.Service
   const msg = yield* user(sessionID, "hello")
@@ -955,6 +1107,158 @@ noLLMServer.instance(
 )
 
 noLLMServer.instance(
+  "rejects provider changes while an OpenAI native compaction lock is active and allows them after revert cleanup",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Pinned" })
+      const checkpoint = yield* nativeCheckpoint(chat.id)
+
+      const acceptedOpenAI = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          agent: "build",
+          model: {
+            providerID: checkpoint.model.providerID,
+            modelID: ModelV2.ID.make("gpt-5.4"),
+          },
+          variant: "xhigh",
+          noReply: true,
+          parts: [{ type: "text", text: "stay on openai" }],
+        })
+        .pipe(Effect.catch(Effect.die))
+
+      expect(acceptedOpenAI.info.role).toBe("user")
+      if (acceptedOpenAI.info.role === "user") {
+        expect(acceptedOpenAI.info.model.providerID).toBe(checkpoint.model.providerID)
+        expect(acceptedOpenAI.info.model.modelID).toBe(ModelV2.ID.make("gpt-5.4"))
+        expect(acceptedOpenAI.info.model.variant).toBe("xhigh")
+      }
+
+      const rejected = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          agent: "build",
+          model: ref,
+          noReply: true,
+          parts: [{ type: "text", text: "switch model" }],
+        })
+        .pipe(Effect.catch(Effect.die))
+        .pipe(Effect.exit)
+      expect(Exit.isFailure(rejected)).toBe(true)
+      if (Exit.isFailure(rejected)) expect(JSON.stringify(Cause.squash(rejected.cause))).toContain("OpenAI Responses")
+
+      yield* sessions.setRevert({ sessionID: chat.id, revert: { messageID: checkpoint.marker.id }, summary: undefined })
+      const accepted = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          agent: "build",
+          model: ref,
+          noReply: true,
+          parts: [{ type: "text", text: "after cleanup" }],
+        })
+        .pipe(Effect.catch(Effect.die))
+
+      expect(accepted.info.role).toBe("user")
+      expect(accepted.info.role === "user" ? accepted.info.model : undefined).toMatchObject(ref)
+      const remaining = yield* sessions.messages({ sessionID: chat.id })
+      expect(remaining.map((message) => message.info.id)).not.toContain(checkpoint.marker.id)
+      expect(remaining.map((message) => message.info.id)).not.toContain(checkpoint.summary.id)
+    }),
+  { config: cfg, git: true },
+  30_000,
+)
+
+noLLMServer.instance(
+  "retains legacy native checkpoint when admitting a matching OpenAI prompt",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const database = yield* Database.Service
+      const chat = yield* sessions.create({ title: "Pinned" })
+      const legacy = yield* legacyNativeCheckpoint(chat.id)
+
+      const result = yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        model: legacy.model,
+        noReply: true,
+        parts: [{ type: "text", text: "after legacy checkpoint" }],
+      })
+      const remaining = yield* sessions.messages({ sessionID: chat.id })
+      const compacted = yield* MessageV2.filterCompactedEffect(chat.id).pipe(
+        Effect.provideService(Database.Service, database),
+      )
+      const checkpoint = OpenAINativeCompaction.findCheckpoint(compacted)
+
+      expect(result.info.role).toBe("user")
+      expect(result.info.id).not.toBe(legacy.before.id)
+      expect(remaining.map((message) => message.info.id)).toContain(legacy.before.id)
+      expect(remaining.map((message) => message.info.id)).toContain(result.info.id)
+      expect(remaining.map((message) => message.info.id)).toContain(legacy.marker.id)
+      expect(remaining.map((message) => message.info.id)).toContain(legacy.summary.id)
+      expect(compacted.map((message) => message.info.id)).not.toContain(legacy.before.id)
+      expect(checkpoint?.window.version).toBe(1)
+    }),
+  { config: cfg, git: true },
+)
+
+it.instance("loop replays legacy native checkpoint window before a follow-up user", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(openAIProviderCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+    const legacy = yield* legacyNativeCheckpoint(chat.id)
+    const followUp = yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      model: legacy.model,
+      noReply: true,
+      parts: [{ type: "text", text: "follow up after legacy compact" }],
+    })
+    yield* llm.text("answered after legacy compact")
+
+    const result = yield* prompt.loop({ sessionID: chat.id })
+    const inputs = yield* llm.inputs
+    const last = inputs.at(-1)
+    const requestInput = Array.isArray(last?.input) ? last.input : []
+    const body = JSON.stringify(last)
+
+    expect(result.info.role).toBe("assistant")
+    if (result.info.role === "assistant") expect(result.info.parentID).toBe(followUp.info.id)
+    expect(requestInput).toContainEqual({ type: "compaction", encrypted_content: "legacy-window" })
+    expect(requestInput).toContainEqual({
+      role: "user",
+      content: [{ type: "input_text", text: "follow up after legacy compact" }],
+    })
+    expect(body).not.toContain("before legacy compact")
+    expect(body).not.toContain("Continue if you have next steps")
+    expect(body).not.toContain("如果你有下一步")
+  }),
+)
+
+noLLMServer.instance(
+  "loop exits cleanly after a manual native compaction checkpoint with no retained user tail",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Pinned" })
+      const checkpoint = yield* nativeCheckpoint(chat.id)
+
+      const result = yield* prompt.loop({ sessionID: chat.id })
+
+      expect(result.info.id).toBe(checkpoint.summary.id)
+      expect(result.info.role).toBe("assistant")
+      if (result.info.role === "assistant") expect(result.info.summary).toBe(true)
+    }),
+  { config: cfg, git: true },
+)
+
+noLLMServer.instance(
   "loop exits for a completed parent turn with nonmonotonic message IDs",
   () =>
     Effect.gen(function* () {
@@ -992,6 +1296,326 @@ noLLMServer.instance(
       expect(result.info.id).toBe(assistantID)
     }),
   { config: cfg },
+)
+
+it.instance("loop resumes a native checkpoint without retained tail or synthetic continue prompt", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(openAIProviderCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+    const checkpoint = yield* nativeCheckpoint(chat.id, { auto: true })
+    yield* llm.text("resumed from native checkpoint")
+
+    const result = yield* prompt.loop({ sessionID: chat.id })
+    const inputs = yield* llm.inputs
+    const body = JSON.stringify(inputs.at(-1))
+    const all = yield* sessions.messages({ sessionID: chat.id })
+
+    expect(result.info.role).toBe("assistant")
+    if (result.info.role === "assistant") expect(result.info.parentID).toBe(checkpoint.marker.id)
+    expect(body).toContain("opaque")
+    expect(body).toContain("before compact")
+    expect(body.match(/before compact/g)?.length ?? 0).toBe(1)
+    expect(body).not.toContain("Continue if you have next steps")
+    expect(body).not.toContain("如果你有下一步")
+    expect(
+      all.some(
+        (message) =>
+          message.info.role === "user" &&
+          message.parts.some((part) => part.type === "text" && part.metadata?.compaction_continue),
+      ),
+    ).toBe(false)
+  }),
+)
+
+it.instance("loop sends manual native checkpoint window before a follow-up user", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(openAIProviderCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+    const checkpoint = yield* nativeCheckpoint(chat.id)
+    const followUp = yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      model: checkpoint.model,
+      noReply: true,
+      parts: [{ type: "text", text: "follow up after manual compact" }],
+    })
+    yield* llm.text("answered after compact")
+
+    const result = yield* prompt.loop({ sessionID: chat.id })
+    const inputs = yield* llm.inputs
+    const last = inputs.at(-1)
+    const requestInput = Array.isArray(last?.input) ? last.input : []
+    const body = JSON.stringify(last)
+
+    expect(result.info.role).toBe("assistant")
+    if (result.info.role === "assistant") expect(result.info.parentID).toBe(followUp.info.id)
+    expect(requestInput).toContainEqual({ role: "user", content: [{ type: "input_text", text: "before compact" }] })
+    expect(requestInput).toContainEqual({ type: "compaction", encrypted_content: "opaque" })
+    expect(requestInput).toContainEqual({
+      role: "user",
+      content: [{ type: "input_text", text: "follow up after manual compact" }],
+    })
+    expect(body.match(/before compact/g)?.length ?? 0).toBe(1)
+    expect(body.match(/follow up after manual compact/g)?.length ?? 0).toBe(1)
+    expect(body).not.toContain("Continue if you have next steps")
+    expect(body).not.toContain("如果你有下一步")
+  }),
+)
+
+it.instance("loop sends native checkpoint retained user with tool call continuation", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(openAIProviderCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({
+      title: "Pinned",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+    const checkpoint = yield* nativeCheckpoint(chat.id, { auto: true })
+    yield* llm.toolHang("glob", { pattern: "**/*.txt" })
+
+    const fiber = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkScoped)
+    yield* llm.wait(1)
+    yield* Fiber.interrupt(fiber)
+    const inputs = yield* llm.inputs
+    const first = JSON.stringify(inputs[0])
+    const all = yield* sessions.messages({ sessionID: chat.id })
+
+    expect(inputs).toHaveLength(1)
+    expect(first).toContain("opaque")
+    expect(first).toContain("glob")
+    expect(first).toContain("before compact")
+    expect(first.match(/before compact/g)?.length ?? 0).toBe(1)
+    expect(
+      all.some(
+        (message) =>
+          message.info.role === "user" &&
+          message.parts.some((part) => part.type === "text" && part.metadata?.compaction_continue),
+      ),
+    ).toBe(false)
+    expect(
+      all.some((message) =>
+        message.parts.some((part) => part.type === "text" && part.synthetic && part.text.includes("Continue if")),
+      ),
+    ).toBe(false)
+    expect(
+      all.some(
+        (message) => message.info.role === "assistant" && message.info.parentID === checkpoint.marker.id && !message.info.summary,
+      ),
+    ).toBe(true)
+  }),
+)
+
+noLLMServer.instance(
+  "loop stops after a completed native checkpoint tail without synthetic continue",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const test = yield* TestInstance
+      const chat = yield* sessions.create({ title: "Pinned" })
+      yield* user(chat.id, "before compact")
+      const tail = yield* user(chat.id, "retained tail")
+      const tailAssistant = yield* sessions.updateMessage({
+        id: MessageID.ascending(),
+        role: "assistant",
+        sessionID: chat.id,
+        parentID: tail.id,
+        mode: "build",
+        agent: "build",
+        path: { cwd: test.directory, root: test.directory },
+        cost: 0,
+        tokens: { input: 120_000, output: 1, reasoning: 0, cache: { read: 0, write: 0 }, total: 120_001 },
+        providerID: ref.providerID,
+        modelID: ref.modelID,
+        finish: "stop",
+        time: { created: Date.now(), completed: Date.now() },
+      } satisfies SessionV1.Assistant)
+      yield* sessions.updatePart({
+        id: PartID.ascending(),
+        messageID: tailAssistant.id,
+        sessionID: chat.id,
+        type: "text",
+        text: "tail response",
+      })
+      const marker = yield* sessions.updateMessage({
+        id: MessageID.ascending(),
+        role: "user",
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        time: { created: Date.now() },
+      })
+      yield* sessions.updatePart({
+        id: PartID.ascending(),
+        messageID: marker.id,
+        sessionID: chat.id,
+        type: "compaction",
+        auto: true,
+        tail_start_id: tail.id,
+      })
+      const summary = yield* sessions.updateMessage({
+        id: MessageID.ascending(),
+        role: "assistant",
+        sessionID: chat.id,
+        parentID: marker.id,
+        mode: "compaction",
+        agent: "compaction",
+        providerID: ref.providerID,
+        modelID: ref.modelID,
+        path: { cwd: test.directory, root: test.directory },
+        cost: 0,
+        tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        summary: true,
+        finish: "stop",
+        time: { created: Date.now(), completed: Date.now() },
+      } satisfies SessionV1.Assistant)
+      yield* sessions.updatePart({
+        id: PartID.ascending(),
+        messageID: summary.id,
+        sessionID: chat.id,
+        type: "text",
+        text: OpenAINativeCompaction.PLACEHOLDER,
+        metadata: OpenAINativeCompaction.metadata({
+          model: { providerID: ProviderV2.ID.make("openai"), modelID: ModelV2.ID.make("gpt-5-mini") },
+          output: [{ type: "compaction", encrypted_content: "opaque" }],
+        }),
+      })
+      const result = yield* prompt.loop({ sessionID: chat.id })
+      const all = yield* sessions.messages({ sessionID: chat.id })
+
+      const compactions = (yield* sessions.messages({ sessionID: chat.id })).flatMap((message) =>
+        message.parts.filter((part) => part.type === "compaction"),
+      )
+      expect(result.info.id).toBe(summary.id)
+      expect(compactions).toHaveLength(1)
+      expect(
+        all.some(
+          (message) =>
+            message.info.role === "user" &&
+            message.parts.some((part) => part.type === "text" && part.metadata?.compaction_continue),
+        ),
+      ).toBe(false)
+    }),
+  { config: cfg, git: true },
+)
+
+it.instance("loop resumes unfinished native checkpoint tail without synthetic continue prompt", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(openAIProviderCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const test = yield* TestInstance
+    const chat = yield* sessions.create({ title: "Pinned" })
+    const model = {
+      providerID: ProviderV2.ID.make("openai"),
+      modelID: ModelV2.ID.make("gpt-5-mini"),
+    }
+    const user = yield* sessions.updateMessage({
+      id: MessageID.ascending(),
+      role: "user",
+      sessionID: chat.id,
+      agent: "build",
+      model,
+      time: { created: Date.now() },
+    })
+    yield* sessions.updatePart({
+      id: PartID.ascending(),
+      messageID: user.id,
+      sessionID: chat.id,
+      type: "text",
+      text: "Research the plan but do not start implementation yet.",
+    })
+    const interrupted = yield* sessions.updateMessage({
+      id: MessageID.ascending(),
+      role: "assistant",
+      sessionID: chat.id,
+      parentID: user.id,
+      mode: "build",
+      agent: "build",
+      providerID: model.providerID,
+      modelID: model.modelID,
+      path: { cwd: test.directory, root: test.directory },
+      cost: 0,
+      tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      time: { created: Date.now(), completed: Date.now() },
+    } satisfies SessionV1.Assistant)
+    yield* sessions.updatePart({
+      id: PartID.ascending(),
+      messageID: interrupted.id,
+      sessionID: chat.id,
+      type: "text",
+      text: "I am still evaluating the plan.",
+    })
+    const marker = yield* sessions.updateMessage({
+      id: MessageID.ascending(),
+      role: "user",
+      sessionID: chat.id,
+      agent: "build",
+      model,
+      time: { created: Date.now() },
+    })
+    yield* sessions.updatePart({
+      id: PartID.ascending(),
+      messageID: marker.id,
+      sessionID: chat.id,
+      type: "compaction",
+      auto: true,
+      tail_start_id: user.id,
+    })
+    const summary = yield* sessions.updateMessage({
+      id: MessageID.ascending(),
+      role: "assistant",
+      sessionID: chat.id,
+      parentID: marker.id,
+      mode: "compaction",
+      agent: "compaction",
+      providerID: model.providerID,
+      modelID: model.modelID,
+      path: { cwd: test.directory, root: test.directory },
+      cost: 0,
+      tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      summary: true,
+      finish: "stop",
+      time: { created: Date.now(), completed: Date.now() },
+    } satisfies SessionV1.Assistant)
+    yield* sessions.updatePart({
+      id: PartID.ascending(),
+      messageID: summary.id,
+      sessionID: chat.id,
+      type: "text",
+      text: OpenAINativeCompaction.PLACEHOLDER,
+      metadata: OpenAINativeCompaction.metadata({
+        model,
+        output: [{ type: "compaction", encrypted_content: "opaque-native-checkpoint" }],
+      }),
+    })
+    yield* llm.text("resumed without synthetic prompt")
+
+    const result = yield* prompt.loop({ sessionID: chat.id })
+    const inputs = yield* llm.inputs
+    const body = JSON.stringify(inputs.at(-1))
+    const all = yield* sessions.messages({ sessionID: chat.id })
+
+    expect(result.info.role).toBe("assistant")
+    expect(body).toContain("opaque-native-checkpoint")
+    expect(body).toContain("Research the plan")
+    expect(body).toContain("I am still evaluating the plan")
+    expect(body).not.toContain("Continue if you have next steps")
+    expect(body).not.toContain("如果你有下一步")
+    expect(
+      all.some(
+        (message) =>
+          message.info.role === "user" &&
+          message.parts.some((part) => part.type === "text" && part.metadata?.compaction_continue),
+      ),
+    ).toBe(false)
+    if (result.info.role === "assistant") expect(result.info.parentID).toBe(marker.id)
+  }),
 )
 
 it.instance("loop exits without an LLM request for interrupted orphan tool calls", () =>

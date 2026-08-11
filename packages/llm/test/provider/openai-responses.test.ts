@@ -40,6 +40,355 @@ const expectToolOutput = (body: OpenAIResponses.OpenAIResponsesBody): OpenAITool
 }
 
 describe("OpenAI Responses route", () => {
+  it.effect("calls /responses with a compaction trigger and lowered OpenAI input window", () =>
+    Effect.gen(function* () {
+      const output = yield* LLMClient.compact(
+        LLM.updateRequest(request, {
+          providerOptions: { openai: { promptCacheKey: "cache-key", serviceTier: "priority" } },
+          tools: [
+            {
+              name: "lookup",
+              description: "Lookup facts.",
+              inputSchema: {
+                type: "object",
+                properties: { query: { type: "string" } },
+                required: ["query"],
+                additionalProperties: false,
+              },
+            },
+          ],
+        }),
+      ).pipe(
+        Effect.provide(
+          dynamicResponse((input) =>
+            Effect.gen(function* () {
+              const web = yield* HttpClientRequest.toWeb(input.request).pipe(Effect.orDie)
+              expect(web.url).toBe("https://api.openai.test/v1/responses")
+              expect(web.headers.get("authorization")).toBe("Bearer test")
+              expect(web.headers.get("accept")).toBe("text/event-stream")
+              expect(JSON.parse(input.text)).toEqual({
+                model: "gpt-4.1-mini",
+                store: false,
+                stream: true,
+                service_tier: "priority",
+                prompt_cache_key: "cache-key",
+                input: [
+                  { role: "system", content: "You are concise." },
+                  { role: "user", content: [{ type: "input_text", text: "Say hello." }] },
+                  { type: "compaction_trigger" },
+                ],
+                tools: [
+                  {
+                    type: "function",
+                    name: "lookup",
+                    description: "Lookup facts.",
+                    strict: false,
+                    parameters: {
+                      type: "object",
+                      properties: { query: { type: "string" } },
+                      required: ["query"],
+                      additionalProperties: false,
+                    },
+                  },
+                ],
+              })
+              return input.respond(
+                sseEvents(
+                  {
+                    type: "response.created",
+                    response: { object: "response.compaction", output: [] },
+                  },
+                  {
+                    type: "response.output_item.done",
+                    item: {
+                      type: "message",
+                      role: "user",
+                      content: [{ type: "input_text", text: "Say hello." }],
+                    },
+                  },
+                  {
+                    type: "response.output_item.done",
+                    item: { type: "compaction", encrypted_content: "opaque-state", id: "cmp_1" },
+                  },
+                  {
+                    type: "response.completed",
+                    response: {
+                      object: "response.compaction",
+                      output: [
+                        {
+                          type: "message",
+                          role: "user",
+                          content: [{ type: "input_text", text: "Say hello." }],
+                        },
+                        { type: "compaction", encrypted_content: "opaque-state", id: "cmp_1" },
+                      ],
+                    },
+                  },
+                ),
+                { headers: { "content-type": "text/event-stream" } },
+              )
+            }),
+          ),
+        ),
+      )
+
+      expect(output).toEqual([{ type: "compaction", encrypted_content: "opaque-state", id: "cmp_1" }])
+    }),
+  )
+
+  it.effect("parses mislabeled OpenAI Responses compact SSE responses", () =>
+    Effect.gen(function* () {
+      const output = yield* LLMClient.compact(request).pipe(
+        Effect.provide(
+          dynamicResponse((input) =>
+            Effect.sync(() =>
+              input.respond(
+                sseEvents({
+                  type: "response.completed",
+                  response: {
+                    object: "response.compaction",
+                    output: [
+                      {
+                        type: "message",
+                        role: "user",
+                        content: [{ type: "input_text", text: "Say hello." }],
+                      },
+                      { type: "compaction", encrypted_content: "opaque-state", id: "cmp_1" },
+                    ],
+                  },
+                }),
+                { headers: { "content-type": "text/plain" } },
+              ),
+            ),
+          ),
+        ),
+      )
+
+      expect(output).toEqual([{ type: "compaction", encrypted_content: "opaque-state", id: "cmp_1" }])
+    }),
+  )
+
+  it.effect("returns compact request input without the compaction trigger", () =>
+    Effect.gen(function* () {
+      const result = yield* LLMClient.compactWithInput(request).pipe(
+        Effect.provide(
+          dynamicResponse((input) =>
+            Effect.sync(() =>
+              input.respond(
+                JSON.stringify({
+                  object: "response.compaction",
+                  output: [{ type: "compaction", encrypted_content: "opaque-state", id: "cmp_1" }],
+                }),
+                { headers: { "content-type": "application/json", "x-codex-turn-state": "turn-1" } },
+              ),
+            ),
+          ),
+        ),
+      )
+
+      expect(result).toEqual({
+        output: [{ type: "compaction", encrypted_content: "opaque-state", id: "cmp_1" }],
+        input: [
+          { role: "system", content: "You are concise." },
+          { role: "user", content: [{ type: "input_text", text: "Say hello." }] },
+        ],
+        providerMetadata: { openai: { headers: { "x-codex-turn-state": "turn-1" } } },
+      })
+    }),
+  )
+
+  it.effect("returns compact turn-state metadata from stream events", () =>
+    Effect.gen(function* () {
+      const result = yield* LLMClient.compactWithInput(request).pipe(
+        Effect.provide(
+          dynamicResponse((input) =>
+            Effect.sync(() =>
+              input.respond(
+                sseEvents(
+                  {
+                    type: "response.metadata",
+                    metadata: { headers: { "x-codex-turn-state": "turn-1" } },
+                  },
+                  {
+                    type: "response.output_item.done",
+                    output_index: 0,
+                    item: { type: "compaction", encrypted_content: "opaque-state", id: "cmp_1" },
+                  },
+                  {
+                    type: "response.completed",
+                    response: { object: "response.compaction", output: [] },
+                  },
+                ),
+                { headers: { "content-type": "text/event-stream" } },
+              ),
+            ),
+          ),
+        ),
+      )
+
+      expect(result.providerMetadata).toEqual({ openai: { headers: { "x-codex-turn-state": "turn-1" } } })
+    }),
+  )
+
+  it.effect("uses added compact stream items when done items are absent", () =>
+    Effect.gen(function* () {
+      const output = yield* LLMClient.compact(request).pipe(
+        Effect.provide(
+          dynamicResponse((input) =>
+            Effect.sync(() =>
+              input.respond(
+                sseEvents(
+                  {
+                    type: "response.output_item.added",
+                    output_index: 0,
+                    item: {
+                      type: "message",
+                      role: "user",
+                      content: [{ type: "input_text", text: "Say hello." }],
+                    },
+                  },
+                  {
+                    type: "response.output_item.added",
+                    output_index: 1,
+                    item: { type: "compaction", encrypted_content: "opaque-state", id: "cmp_1" },
+                  },
+                  {
+                    type: "response.completed",
+                    response: { object: "response.compaction", output: [] },
+                  },
+                ),
+                { headers: { "content-type": "text/event-stream" } },
+              ),
+            ),
+          ),
+        ),
+      )
+
+      expect(output).toEqual([{ type: "compaction", encrypted_content: "opaque-state", id: "cmp_1" }])
+    }),
+  )
+
+  it.effect("keeps compaction trigger as the final compact input item", () =>
+    Effect.gen(function* () {
+      yield* LLMClient.compact(
+        LLM.updateRequest(request, {
+          providerOptions: {
+            openai: {
+              responsesReplayInput: [{ type: "compaction_trigger" }, { role: "user", content: [] }],
+            },
+          },
+        }),
+      ).pipe(
+        Effect.provide(
+          dynamicResponse((input) =>
+            Effect.gen(function* () {
+              const body = JSON.parse(input.text) as { readonly input: readonly unknown[] }
+              expect(body.input.at(-1)).toEqual({ type: "compaction_trigger" })
+              expect(body.input.filter((item) => ProviderShared.isRecord(item) && item.type === "compaction_trigger"))
+                .toHaveLength(1)
+              expect(body.input).toContainEqual({ role: "user", content: [] })
+              return input.respond(
+                JSON.stringify({
+                  object: "response.compaction",
+                  output: [{ type: "compaction", encrypted_content: "opaque-state", id: "cmp_1" }],
+                }),
+                { headers: { "content-type": "application/json" } },
+              )
+            }),
+          ),
+        ),
+      )
+    }),
+  )
+
+  it.effect("accepts non-streaming OpenAI Responses compact JSON responses", () =>
+    Effect.gen(function* () {
+      const output = yield* LLMClient.compact(request).pipe(
+        Effect.provide(
+          dynamicResponse((input) =>
+            Effect.gen(function* () {
+              const web = yield* HttpClientRequest.toWeb(input.request).pipe(Effect.orDie)
+              expect(web.url).toBe("https://api.openai.test/v1/responses")
+              expect(JSON.parse(input.text)).toMatchObject({
+                stream: true,
+                store: false,
+                input: expect.arrayContaining([{ type: "compaction_trigger" }]),
+              })
+              return input.respond(
+                JSON.stringify({
+                  object: "response.compaction",
+                  output: [
+                    {
+                      type: "message",
+                      role: "user",
+                      content: [{ type: "input_text", text: "Say hello." }],
+                    },
+                    { type: "compaction", encrypted_content: "opaque-state", id: "cmp_1" },
+                  ],
+                }),
+                { headers: { "content-type": "application/json" } },
+              )
+            }),
+          ),
+        ),
+      )
+
+      expect(output).toEqual([{ type: "compaction", encrypted_content: "opaque-state", id: "cmp_1" }])
+    }),
+  )
+
+  it.effect("rejects compact streams without a compaction item", () =>
+    Effect.gen(function* () {
+      const error = yield* LLMClient.compact(request).pipe(
+        Effect.provide(
+          fixedResponse(
+            sseEvents(
+              {
+                type: "response.output_item.done",
+                item: {
+                  type: "message",
+                  role: "user",
+                  content: [{ type: "input_text", text: "Say hello." }],
+                },
+              },
+              { type: "response.completed", response: { output: [] } },
+            ),
+          ),
+        ),
+        Effect.flip,
+      )
+
+      expect(error.message).toContain("expected exactly one compaction item, received 0")
+    }),
+  )
+
+  it.effect("rejects compact streams with multiple compaction items", () =>
+    Effect.gen(function* () {
+      const error = yield* LLMClient.compact(request).pipe(
+        Effect.provide(
+          fixedResponse(
+            sseEvents(
+              {
+                type: "response.output_item.done",
+                output_index: 0,
+                item: { type: "compaction", encrypted_content: "first" },
+              },
+              {
+                type: "response.output_item.done",
+                output_index: 1,
+                item: { type: "compaction", encrypted_content: "second" },
+              },
+              { type: "response.completed", response: { output: [] } },
+            ),
+          ),
+        ),
+        Effect.flip,
+      )
+
+      expect(error.message).toContain("expected exactly one compaction item, received 2")
+    }),
+  )
+
   it.effect("prepares OpenAI Responses target", () =>
     Effect.gen(function* () {
       const prepared = yield* LLMClient.prepare(request)
@@ -198,6 +547,10 @@ describe("OpenAI Responses route", () => {
                     sent.push(message)
                   }),
                 messages: Stream.fromArray([
+                  ProviderShared.encodeJson({
+                    type: "response.metadata",
+                    headers: { "x-codex-turn-state": "turn-1" },
+                  }),
                   ProviderShared.encodeJson({ type: "response.output_text.delta", item_id: "msg_1", delta: "Hi" }),
                   ProviderShared.encodeJson({ type: "response.completed", response: { id: "resp_ws" } }),
                 ]),
@@ -218,6 +571,10 @@ describe("OpenAI Responses route", () => {
       ).pipe(Effect.provide(LLMClient.layer.pipe(Layer.provide(deps))))
 
       expect(response.text).toBe("Hi")
+      expect(response.events).toContainEqual({
+        type: "provider-metadata",
+        providerMetadata: { openai: { headers: { "x-codex-turn-state": "turn-1" } } },
+      })
       expect(opened).toEqual([{ url: "wss://api.openai.test/v1/responses", authorization: "Bearer test" }])
       expect(closed).toBe(true)
       expect(sent).toHaveLength(1)
@@ -226,6 +583,30 @@ describe("OpenAI Responses route", () => {
         model: "gpt-4.1-mini",
         input: [{ role: "user", content: [{ type: "input_text", text: "Say hello." }] }],
         store: false,
+      })
+    }),
+  )
+
+  it.effect("prepares OpenAI Responses client metadata", () =>
+    Effect.gen(function* () {
+      const prepared = yield* LLMClient.prepare(
+        LLM.updateRequest(request, {
+          model: OpenAIResponses.webSocketRoute
+            .with({ endpoint: { baseURL: "https://api.openai.test/v1/" }, auth: Auth.bearer("test") })
+            .model({ id: "gpt-4.1-mini" }),
+          providerOptions: {
+            openai: {
+              clientMetadata: {
+                "x-codex-turn-state": "turn-1",
+                ignored: 1,
+              },
+            },
+          },
+        }),
+      )
+
+      expect(prepared.body).toMatchObject({
+        client_metadata: { "x-codex-turn-state": "turn-1" },
       })
     }),
   )

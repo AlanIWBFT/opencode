@@ -8,11 +8,14 @@ export const TITLE_HEADER = "x-opencode-title"
 export interface CreateWebSocketFetchOptions {
   httpFetch?: typeof globalThis.fetch
   url?: string
+  turnState?: TurnState
   connectTimeout?: number
   idleTimeout?: number
   maxConnectionAge?: number
   streamRetries?: number
 }
+
+type TurnState = { value?: string }
 
 interface PoolEntry {
   socket?: WebSocket
@@ -29,6 +32,7 @@ const DEFAULT_MAX_CONNECTION_AGE = 55 * 60 * 1000
 const FIRST_EVENT_GRACE_TIMEOUT = 100
 const HEADER_TIMEOUT_BUFFER = 1_000
 const CONNECTION_LIMIT_REACHED_CODE = "websocket_connection_limit_reached"
+const TURN_STATE_HEADER = "x-codex-turn-state"
 
 export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
   const httpFetch = options?.httpFetch ?? globalThis.fetch
@@ -53,16 +57,17 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
     if (!request) {
       return httpFetch(input, httpInit)
     }
+    const fallbackInit = withTurnStateHeader(httpInit, options?.turnState)
     const key = `${request.sessionID}:conversation`
 
     const entry = pool.get(key) ?? { lastUsedAt: Date.now(), busy: false, fallback: false, streamFailures: 0 }
     pool.set(key, entry)
 
     if (entry.fallback) {
-      return httpFetch(input, httpInit)
+      return httpFetch(input, fallbackInit)
     }
     if (entry.busy) {
-      return httpFetch(input, httpInit)
+      return httpFetch(input, fallbackInit)
     }
 
     entry.busy = true
@@ -84,9 +89,10 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
       })
       const response = OpenAIWebSocket.streamResponsesWebSocket({
         socket: entry.socket,
-        body: request.body,
+        body: bodyWithTurnState(request.body, options?.turnState, request.turnState),
         idleTimeout,
         signal: init?.signal ?? undefined,
+        onEvent: (event) => captureTurnState(options?.turnState, event),
         onFirstEvent: (error) => resolveFirstEvent(error ?? true),
         onTerminal: (event) => {
           entry.busy = false
@@ -131,7 +137,7 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
         })
       }
       if (!entry.fallback) return response
-      return httpFetch(input, httpInit)
+      return httpFetch(input, fallbackInit)
     } catch (error) {
       entry.busy = false
       entry.lastUsedAt = Date.now()
@@ -143,7 +149,7 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
 
       recordStreamFailure(entry)
       invalidate(entry)
-      if (entry.fallback) return httpFetch(input, httpInit)
+      if (entry.fallback) return httpFetch(input, fallbackInit)
       return failedResponse(
         new ProviderError.ResponseStreamError(error instanceof Error ? error.message : String(error), {
           cause: error,
@@ -186,6 +192,48 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
   return Object.assign(websocketFetch, { close, remove, providerHeaderTimeout: websocketHeaderTimeout })
 }
 
+function bodyWithTurnState(body: Record<string, unknown>, state: TurnState | undefined, value: string | undefined) {
+  const turnState = state?.value ?? value
+  if (!turnState) return body
+  const clientMetadata = isRecord(body.client_metadata) ? stringRecord(body.client_metadata) : {}
+  return { ...body, client_metadata: { ...clientMetadata, [TURN_STATE_HEADER]: turnState } }
+}
+
+function withTurnStateHeader(init: RequestInit | undefined, state: TurnState | undefined) {
+  if (!state?.value) return init
+  const headers = new Headers(init?.headers)
+  headers.set(TURN_STATE_HEADER, state.value)
+  return init ? { ...init, headers } : { headers }
+}
+
+function captureTurnState(state: TurnState | undefined, event: Record<string, unknown>) {
+  if (!state || state.value) return
+  const headers = eventHeaders(event)
+  const value = headers ? headerValue(headers, TURN_STATE_HEADER) : undefined
+  if (value) state.value = value
+}
+
+function eventHeaders(event: Record<string, unknown>) {
+  if (isRecord(event.headers)) return event.headers
+  if (isRecord(event.metadata) && isRecord(event.metadata.headers)) return event.metadata.headers
+  if (!isRecord(event.response)) return undefined
+  if (isRecord(event.response.headers)) return event.response.headers
+  if (isRecord(event.response.metadata) && isRecord(event.response.metadata.headers)) return event.response.metadata.headers
+  return undefined
+}
+
+function headerValue(headers: Record<string, unknown>, name: string) {
+  const found = Object.entries(headers).find(([key]) => key.toLowerCase() === name)
+  const value = found?.[1]
+  if (typeof value === "string") return value
+  if (Array.isArray(value)) return value.find((item): item is string => typeof item === "string")
+  return undefined
+}
+
+function stringRecord(input: Record<string, unknown>) {
+  return Object.fromEntries(Object.entries(input).filter((entry): entry is [string, string] => typeof entry[1] === "string"))
+}
+
 function websocketRequest(input: RequestInfo | URL, init: RequestInit | undefined) {
   const url = input instanceof URL ? input.toString() : typeof input === "string" ? input : input.url
   if (init?.method !== "POST" || !new URL(url).pathname.endsWith("/responses")) return
@@ -206,7 +254,7 @@ function websocketRequest(input: RequestInfo | URL, init: RequestInit | undefine
 
   const sessionID = internalHeaders["x-session-affinity"] ?? internalHeaders["session-id"]
   if (!sessionID) return
-  return { url, body, sessionID }
+  return { url, body, sessionID, turnState: internalHeaders[TURN_STATE_HEADER] }
 }
 
 function connectionLimitError(event: Record<string, unknown>) {

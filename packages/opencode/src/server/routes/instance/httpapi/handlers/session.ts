@@ -320,7 +320,12 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       yield* promptSvc.prompt({ ...ctx.payload, sessionID: ctx.params.sessionID }).pipe(
         Effect.catchCause((cause) =>
           Effect.gen(function* () {
-            yield* Effect.logError("prompt_async failed", { sessionID: ctx.params.sessionID, cause })
+            const squashed = Cause.squash(cause)
+            yield* Effect.logError("prompt_async failed", {
+              sessionID: ctx.params.sessionID,
+              cause: Cause.pretty(cause),
+              message: squashed instanceof Error ? squashed.message : String(squashed),
+            })
             yield* events.publish(Session.Event.Error, {
               sessionID: ctx.params.sessionID,
               error: new NamedError.Unknown({ message: Cause.pretty(cause) }).toObject(),
