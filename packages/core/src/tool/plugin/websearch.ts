@@ -40,7 +40,7 @@ export const Plugin = {
       .transform((editor) =>
         editor.add({
           name,
-          options: { codemode: false },
+          options: { codemode: { namespace: "$opencode", concurrency: { group: "network", limit: 4 } } },
           description,
           input: Input,
           output: Output,

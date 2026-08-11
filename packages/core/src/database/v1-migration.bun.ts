@@ -377,6 +377,7 @@ export function transformSession(input: TransformInput): TransformResult {
         owned.some((part) => part.type === "tool" && part.tool === "task")
       )
         return []
+      const tools = migrateTools(owned, item.row.time_created)
       const content = owned.flatMap((part): Array<Record<string, unknown>> => {
         if (part.type === "text")
           return [{ type: "text", text: part.text, ...(part.metadata ? { state: part.metadata } : {}) }]
@@ -390,7 +391,8 @@ export function transformSession(input: TransformInput): TransformResult {
             },
           ]
         if (part.type !== "tool") return []
-        return [migrateTool(part, item.row.time_created)]
+        const tool = tools.get(part.id)
+        return tool ? [tool] : []
       })
       const start =
         owned.flatMap((part) => (part.type === "step-start" && part.snapshot ? [part.snapshot] : []))[0] ??
@@ -896,7 +898,7 @@ function row(
   }
 }
 
-const RENAMED_TOOLS: Readonly<Record<string, string>> = { bash: "shell", task: "subagent", apply_patch: "patch" }
+const RENAMED_TOOLS: Readonly<Record<string, string>> = { bash: "exec_command", task: "subagent", apply_patch: "patch" }
 const PATH_TOOLS = ["read", "edit", "write"]
 const REMOVED_TOOLS = ["todowrite"]
 
@@ -929,6 +931,9 @@ function legacyToolNotice(messages: ReadonlyArray<TransformResult["messages"][nu
               .join("; ")}.`,
           ]
         : []),
+    ...(called.has("bash")
+      ? ["The `exec_command` tool takes `cmd` instead of `command`. Use the returned `exec_id` with `poll_exec`, `write_stdin`, or `terminate_exec` to control a running command."]
+      : []),
     ...(called.has("task")
       ? ["The `subagent` tool takes `agent` instead of `subagent_type` and `sessionID` instead of `task_id`."]
       : []),
@@ -948,7 +953,80 @@ function legacyToolNotice(messages: ReadonlyArray<TransformResult["messages"][nu
   return ["The available tools have changed.", ...parts].join("\n\n")
 }
 
+const decodeCodeModeChild = Schema.decodeUnknownOption(
+  Schema.Struct({
+    parentCallID: Schema.String,
+    runtimeCallID: Schema.String,
+  }),
+)
+
+function migrateTools(parts: readonly (typeof SessionV1.Part.Type)[], fallback: number) {
+  const source = parts.filter((part): part is typeof SessionV1.ToolPart.Type => part.type === "tool")
+  const converted = new Map(source.map((part) => [part.id, migrateTool(part, fallback)]))
+  const parents = new Map(source.filter((part) => part.tool === "execute").map((part) => [part.callID, part]))
+  const children = new Map<string, Record<string, unknown>[]>()
+  for (const parent of parents.values()) {
+    const tool = converted.get(parent.id)!
+    const existing = tool.state.metadata?.toolCalls
+    const calls: Record<string, unknown>[] = Array.isArray(existing)
+      ? existing.flatMap((call, index) => {
+          if (typeof call !== "object" || call === null || Array.isArray(call)) return []
+          return [
+            {
+              ...call,
+              id: String(index),
+              ...(call.status === "running"
+                ? { status: "error", error: "Tool execution was interrupted before V2 migration" }
+                : {}),
+            },
+          ]
+        })
+      : []
+    children.set(parent.callID, calls)
+    tool.state.metadata = { ...tool.state.metadata, toolCalls: calls }
+  }
+  for (const part of source) {
+    const child = Option.getOrUndefined(decodeCodeModeChild(part.metadata?.codeMode))
+    if (!child || !parents.has(child.parentCallID) || part.callID === child.parentCallID) continue
+    const calls = children.get(child.parentCallID)!
+    const index = calls.findIndex((call) => call.id === child.runtimeCallID)
+    const previous = index < 0 ? undefined : calls[index]
+    const migrated = converted.get(part.id)!
+    const call = {
+      ...previous,
+      id: child.runtimeCallID,
+      tool: typeof previous?.tool === "string" ? previous.tool : part.tool,
+      name: part.tool,
+      status: migrated.state.status,
+      input: migrated.state.input,
+      ...(migrated.state.metadata ? { metadata: migrated.state.metadata } : {}),
+      ...("title" in part.state && part.state.title ? { title: part.state.title } : {}),
+      ...("content" in migrated.state && migrated.state.content ? { content: migrated.state.content } : {}),
+      ...("error" in migrated.state ? { error: migrated.state.error.message } : {}),
+      time: {
+        start: migrated.time.created,
+        ...("completed" in migrated.time ? { end: migrated.time.completed } : {}),
+      },
+    }
+    if (!("error" in migrated.state)) delete call.error
+    if (index < 0) calls.push(call)
+    else calls[index] = call
+    // This part is a projected Script child, not a call emitted by the model.
+    converted.delete(part.id)
+  }
+  return converted
+}
+
 function migrateTool(part: typeof SessionV1.ToolPart.Type, fallback: number) {
+  const previous = part.state.status === "pending" ? undefined : part.state.metadata
+  const metadata =
+    part.tool === "exec_command" && previous?.processRunning === true
+      ? {
+          ...previous,
+          processRunning: false,
+          execError: "Live execution state is unavailable after V2 migration. The last saved output is preserved.",
+        }
+      : previous
   const base = {
     type: "tool" as const,
     id: part.callID,
@@ -973,7 +1051,7 @@ function migrateTool(part: typeof SessionV1.ToolPart.Type, fallback: number) {
                 })),
               ]
             : [{ type: "text", text: "[Old tool result content cleared]" }],
-        metadata: part.state.metadata,
+        metadata,
       },
       time: { created: part.state.time.start, completed: part.state.time.end },
     }
@@ -987,7 +1065,7 @@ function migrateTool(part: typeof SessionV1.ToolPart.Type, fallback: number) {
         ...(typeof part.state.metadata?.output === "string"
           ? { content: [{ type: "text", text: part.state.metadata.output }] }
           : {}),
-        ...(part.state.metadata ? { metadata: part.state.metadata } : {}),
+        ...(metadata ? { metadata } : {}),
       },
       time: { created: part.state.time.start, completed: part.state.time.end },
     }
@@ -997,7 +1075,7 @@ function migrateTool(part: typeof SessionV1.ToolPart.Type, fallback: number) {
       status: "error",
       input: part.state.input,
       error: { type: "tool.interrupted", message: "Tool execution was interrupted before V2 migration" },
-      ...(part.state.status === "running" && part.state.metadata ? { metadata: part.state.metadata } : {}),
+      ...(metadata ? { metadata } : {}),
     },
     time: { created: part.state.status === "running" ? part.state.time.start : fallback },
   }
@@ -1029,7 +1107,9 @@ function migrateError(error: NonNullable<(typeof SessionV1.Assistant.Type)["erro
   return {
     type,
     message,
-    ...(data.statusCode !== undefined && data.statusCode >= 100 && data.statusCode <= 599 ? { status: data.statusCode } : {}),
+    ...(data.statusCode !== undefined && data.statusCode >= 100 && data.statusCode <= 599
+      ? { status: data.statusCode }
+      : {}),
     ...(data.resolution === undefined ? {} : { resolution: data.resolution }),
     ...(data.responseBody === undefined ? {} : { responseBody: data.responseBody }),
     ...(data.responseHeaders === undefined ? {} : { responseHeaders: data.responseHeaders }),

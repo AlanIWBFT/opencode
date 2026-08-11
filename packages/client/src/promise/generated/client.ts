@@ -83,6 +83,8 @@ import type {
   SessionLogOutput,
   SessionInterruptInput,
   SessionInterruptOutput,
+  SessionStopInput,
+  SessionStopOutput,
   SessionBackgroundInput,
   SessionBackgroundOutput,
   SessionMessageGetInput,
@@ -696,7 +698,12 @@ export function make(options: ClientOptions) {
           {
             method: "PATCH",
             path: `/api/session/${encodeURIComponent(input.sessionID)}`,
-            body: { title: input["title"], metadata: input["metadata"], permissions: input["permissions"] },
+            body: {
+              title: input["title"],
+              archivedAt: input["archivedAt"],
+              metadata: input["metadata"],
+              permissions: input["permissions"],
+            },
             successStatus: 204,
             declaredStatuses: [400, 401, 404],
             empty: true,
@@ -984,6 +991,17 @@ export function make(options: ClientOptions) {
             method: "POST",
             path: `/api/session/${encodeURIComponent(input.sessionID)}/interrupt`,
             query: { resume: input["resume"] },
+            successStatus: 200,
+            declaredStatuses: [400, 401, 404],
+            empty: false,
+          },
+          requestOptions,
+        ),
+      stop: (input: SessionStopInput, requestOptions?: RequestOptions) =>
+        request<SessionStopOutput>(
+          {
+            method: "POST",
+            path: `/api/session/${encodeURIComponent(input.sessionID)}/stop`,
             successStatus: 200,
             declaredStatuses: [400, 401, 404],
             empty: false,

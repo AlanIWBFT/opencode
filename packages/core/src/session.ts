@@ -25,6 +25,10 @@ import { Slug } from "./util/slug.js"
 import path from "path"
 import { SessionRunner } from "./session/runner/index.js"
 import { SessionStore } from "./session/store.js"
+import { SessionExecSnapshots } from "./session/exec-snapshots.js"
+import { SessionExecPresentation } from "./session/exec-presentation.js"
+import { ExecSessionControl } from "./tool/exec-session/control.js"
+import { KeyedMutex } from "./effect/keyed-mutex.js"
 import { SessionExecution } from "./session/execution.js"
 import {
   AttachmentError,
@@ -174,6 +178,10 @@ export interface Interface {
   readonly switchAgent: (input: { sessionID: SessionSchema.ID; agent: Agent.ID }) => Effect.Effect<void, NotFoundError>
   readonly switchModel: (input: { sessionID: SessionSchema.ID; model: Model.Ref }) => Effect.Effect<void, NotFoundError>
   readonly rename: (input: { sessionID: SessionSchema.ID; title: string }) => Effect.Effect<void, NotFoundError>
+  readonly setArchived: (input: {
+    sessionID: SessionSchema.ID
+    archivedAt: number | null
+  }) => Effect.Effect<void, NotFoundError>
   readonly setMetadata: (input: {
     sessionID: SessionSchema.ID
     metadata: SessionSchema.Metadata
@@ -217,6 +225,8 @@ export interface Interface {
   readonly background: (sessionID: SessionSchema.ID) => Effect.Effect<void, NotFoundError>
   readonly resume: (sessionID: SessionSchema.ID) => Effect.Effect<void, NotFoundError | SessionRunner.RunError>
   readonly interrupt: (sessionID: SessionSchema.ID, options?: { readonly resume?: boolean }) => Effect.Effect<boolean>
+  /** Interrupt this session and close its persistent command slots, without stopping background children. */
+  readonly stop: (sessionID: SessionSchema.ID) => Effect.Effect<ExecSessionControl.Result, NotFoundError>
   readonly synthetic: (
     input: Parameters<Session.Handle["synthetic"]>[0] & { sessionID: SessionSchema.ID },
   ) => ReturnType<Session.Handle["synthetic"]>
@@ -250,6 +260,10 @@ const layer = Layer.effect(
     const llm = yield* LLMClient.Service
     const transport = yield* SessionModelTransport.Service
     const store = yield* SessionStore.Service
+    const execSnapshots = yield* SessionExecSnapshots.Service
+    const execPresentation = yield* SessionExecPresentation.Service
+    const execControl = yield* ExecSessionControl.Service
+    const archiveLock = KeyedMutex.makeUnsafe<SessionSchema.ID>()
     const instances = yield* Instance.Service
     const moves = yield* SessionMove.Service
     const jobs = yield* Job.Service
@@ -349,6 +363,7 @@ const layer = Layer.effect(
         // The fork adopts the parent's newest instruction values rather than the
         // values in effect at the boundary; copied history may contain frozen
         // instruction-update text the initial baseline already reflects.
+        yield* execPresentation.checkpoint(parent.id)
         yield* bus.publish(SessionEvent.Forked, {
           sessionID,
           parentID: parent.id,
@@ -368,11 +383,13 @@ const layer = Layer.effect(
         yield* result.get(sessionID)
         yield* execution.interrupt(sessionID)
         yield* execution.awaitIdle(sessionID)
+        yield* execControl.stop([{ sessionID, deleted: true }])
         yield* transport.close(sessionID)
         const children = yield* result.list({ parentID: sessionID })
         yield* Effect.forEach(children.data, (child) => result.remove(child.id), { concurrency: 1, discard: true })
         yield* environments.clear(sessionID)
         yield* bus.publish(SessionEvent.Deleted, { sessionID })
+        yield* execSnapshots.remove(sessionID)
         yield* bus.remove(sessionID)
       }),
       list: Effect.fn("Session.list")(function* (input) {
@@ -380,9 +397,15 @@ const layer = Layer.effect(
       }),
       messages: Effect.fn("Session.messages")(function* (input) {
         yield* result.get(input.sessionID)
-        return yield* store.messages(input)
+        const messages = yield* store.messages(input)
+        const entries = yield* execSnapshots.list(input.sessionID)
+        return messages.map((message) => SessionExecSnapshots.overlay(message, entries))
       }),
-      message: (input) => sessions.forSession(input.sessionID).message(input.messageID),
+      message: Effect.fn("Session.message")(function* (input) {
+        const message = yield* sessions.forSession(input.sessionID).message(input.messageID)
+        if (!message) return
+        return SessionExecSnapshots.overlay(message, yield* execSnapshots.list(input.sessionID, input.messageID))
+      }),
       context: Effect.fn("Session.context")(function* (sessionID) {
         yield* result.get(sessionID)
         return yield* store.context(sessionID)
@@ -433,6 +456,21 @@ const layer = Layer.effect(
       switchAgent: (input) => sessions.forSession(input.sessionID).switchAgent(input),
       switchModel: (input) => sessions.forSession(input.sessionID).switchModel(input),
       rename: (input) => sessions.forSession(input.sessionID).rename(input),
+      setArchived: (input) =>
+        archiveLock.withLock(input.sessionID)(
+          Effect.gen(function* () {
+            yield* result.get(input.sessionID)
+            // Persist the launch guard before invalidating existing owners and queued launches.
+            yield* bus.publish(SessionEvent.ArchiveUpdated, input)
+            if (input.archivedAt === null) return
+            const stopped = yield* execControl.stop([{ sessionID: input.sessionID }])
+            if (stopped.failed > 0)
+              yield* Effect.logWarning("Archived session has commands that could not be terminated", {
+                sessionID: input.sessionID,
+                failed: stopped.failed,
+              })
+          }).pipe(Effect.uninterruptible),
+        ),
       setMetadata: (input) => sessions.forSession(input.sessionID).setMetadata(input),
       setPermissions: (input) => sessions.forSession(input.sessionID).setPermissions(input),
       move: moves.move,
@@ -460,6 +498,13 @@ const layer = Layer.effect(
       resume: (sessionID) => sessions.forSession(sessionID).resume(),
       synthetic: (input) => sessions.forSession(input.sessionID).synthetic(input),
       interrupt: (sessionID, options) => sessions.forSession(sessionID).interrupt(options),
+      stop: (sessionID) =>
+        Effect.gen(function* () {
+          yield* result.get(sessionID)
+          // Wait for the interrupted tools' cleanup, not a later background notification's new execution.
+          yield* execution.interrupt(sessionID, { awaitSettlement: true })
+          return yield* execControl.stop([{ sessionID }])
+        }).pipe(Effect.uninterruptible),
       revert: {
         stage: (input) => sessions.forSession(input.sessionID).revert.stage(input),
         clear: (sessionID) => sessions.forSession(sessionID).revert.clear(),
@@ -484,6 +529,9 @@ export const node: LayerNode.Provider<Service, never, typeof Node.tags.values.gl
     SessionModelTransport.node,
     llmClient,
     SessionStore.node,
+    SessionExecSnapshots.node,
+    SessionExecPresentation.node,
+    ExecSessionControl.node,
     Instance.node,
     SessionInbox.node,
     SessionMove.node,

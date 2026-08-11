@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect } from "bun:test"
 import path from "path"
-import { Effect, Exit, Layer, Result } from "effect"
+import { ConfigProvider, Effect, Exit, Layer, Result } from "effect"
 import { Config } from "@opencode/core/config"
 import { AppNodeBuilder } from "@opencode/core/effect/app-node-builder"
 import { LayerNode } from "@opencode/util/effect/layer-node"
@@ -133,6 +133,9 @@ const readLayer = (imageLayer: Layer.Layer<Image.Service>) =>
   )
 const it = testEffect(readLayer(imageLayer))
 const itWithoutResizer = testEffect(readLayer(unavailableImage))
+const itCodeMode = testEffect(readLayer(imageLayer).pipe(
+  Layer.provide(Layer.succeed(ConfigProvider.ConfigProvider, ConfigProvider.fromUnknown({ OPENCODE_EXPERIMENTAL_CODE_MODE: true }))),
+))
 const sessionID = Session.ID.make("ses_read_tool_test")
 
 describe("ReadTool", () => {
@@ -157,16 +160,36 @@ describe("ReadTool", () => {
     readOverride = undefined
   })
 
+  itCodeMode.effect("exposes native reads inside Script while retaining permission filtering", () =>
+    Effect.gen(function* () {
+      const registry = yield* Tool.Service
+      const snapshot = yield* registry.snapshot()
+      expect(snapshot.definitions.map((tool) => tool.name)).toEqual(["execute"])
+      const input = {
+        sessionID,
+        ...toolIdentity,
+        call: { type: "tool-call" as const, id: "call-script", name: "execute", input: { code: 'return await tools.$opencode.read({ path: "README.md" })' } },
+      }
+      const result = yield* snapshot.execute(input)
+      expect(result.metadata).toMatchObject({ toolCalls: [{ id: "0", tool: "$opencode.read", name: "read", status: "completed" }] })
+      expect(readCalls).toHaveLength(1)
+      expect(assertions.some((input) => input.action === "read")).toBe(true)
+      const denied = yield* registry.snapshot([{ action: "read", resource: "*", effect: "deny" }])
+      expect((yield* denied.execute(input)).metadata?.error).toBe(true)
+      expect(readCalls).toHaveLength(1)
+    }),
+  )
+
   it.effect("registers, authorizes, and reads through the location filesystem", () =>
     Effect.gen(function* () {
       const registry = yield* Tool.Service
 
-      expect((yield* toolDefinitions(registry)).map((tool) => tool.name)).toEqual(["read", "execute"])
+      expect((yield* toolDefinitions(registry)).map((tool) => tool.name)).toEqual(["read"])
       expect(
         (yield* toolDefinitions(registry, [{ action: "read", resource: "*", effect: "deny" }])).map(
           (tool) => tool.name,
         ),
-      ).toEqual(["execute"])
+      ).toEqual([])
       const execution = yield* executeTool(registry, {
         sessionID,
         ...toolIdentity,

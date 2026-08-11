@@ -127,6 +127,90 @@ const transform = (messages: V1Migration.SourceMessage[], parts: V1Migration.Sou
 }
 
 describe("V1Migration.transformSession", () => {
+  test.each([false, true])(
+    "folds projected Script children into parent details without adding model calls (processRunning=%s)",
+    (processRunning) => {
+      const message = assistant("msg_script", "msg_user")
+      const completed = (output: string, metadata: Record<string, unknown> = {}) => ({
+        status: "completed",
+        input: {},
+        title: "child",
+        output,
+        metadata,
+        time: { start: 21, end: 22 },
+      })
+      const result = transform(
+        [message],
+        [
+          part("prt_1", message.id, {
+            type: "tool",
+            tool: "execute",
+            callID: "script",
+            state: completed("Script result", {
+              toolCalls: [
+                { tool: "$opencode.exec_command", status: "running", metadata: { output: "old preview" } },
+                { tool: "$opencode.read", status: "running" },
+              ],
+            }),
+          }),
+          part("prt_2", message.id, {
+            type: "tool",
+            tool: "exec_command",
+            callID: "script/code-mode/0",
+            metadata: { codeMode: { parentCallID: "script", runtimeCallID: "0" } },
+            state: completed("Command invocation result", { output: "final preview", processRunning }),
+          }),
+          part("prt_3", message.id, {
+            type: "tool",
+            tool: "read",
+            callID: "script/code-mode/1",
+            metadata: { codeMode: { parentCallID: "script", runtimeCallID: "1" } },
+            state: { status: "running", input: { filePath: "file.txt" }, time: { start: 23 } },
+          }),
+          part("prt_4", message.id, {
+            type: "tool",
+            tool: "read",
+            callID: "real_model_call",
+            state: completed("Direct result"),
+          }),
+        ],
+      )
+      expect(result.messages).toHaveLength(2)
+      expect(result.messages[1]).toMatchObject({
+        type: "system",
+        seq: 1,
+        data: { text: "The available tools have changed.\n\nThe `read` tool now takes `path` instead of `filePath`." },
+      })
+      expect(result.messages[0].seq).toBe(0)
+      const migrated = Schema.decodeUnknownSync(SessionMessage.Assistant)({
+        id: message.id,
+        type: "assistant",
+        ...result.messages[0].data,
+      })
+      expect(migrated.content).toHaveLength(2)
+      expect(migrated.content.map((item) => (item.type === "tool" ? item.id : item.type))).toEqual([
+        "script",
+        "real_model_call",
+      ])
+      const parent = migrated.content[0]
+      if (parent.type !== "tool" || parent.state.status !== "completed") throw new Error("Expected Script result")
+      expect(parent.state.content).toEqual([{ type: "text", text: "Script result" }])
+      expect(parent.state.metadata?.toolCalls).toMatchObject([
+        {
+          id: "0",
+          tool: "$opencode.exec_command",
+          name: "exec_command",
+          status: "completed",
+          metadata: { output: "final preview", processRunning: false },
+          content: [{ type: "text", text: "Command invocation result" }],
+        },
+        { id: "1", name: "read", status: "error", error: "Tool execution was interrupted before V2 migration" },
+      ])
+      const calls = parent.state.metadata?.toolCalls as Array<Record<string, unknown>>
+      expect(calls[0]).not.toHaveProperty("error")
+    },
+  )
+
   test("maps ordinary user text, agents, ignored fields, order, and timestamps", () => {
     const message = user("msg_000000000001aaaaaaaaaaaaaa", {
       system: "discard",
@@ -502,7 +586,8 @@ describe("V1Migration.transformSession", () => {
       data: {
         text: [
           "The available tools have changed.",
-          "The following tools were renamed and must be called by their new names: `bash` is now `shell`; `task` is now `subagent`; `apply_patch` is now `patch`.",
+          "The following tools were renamed and must be called by their new names: `bash` is now `exec_command`; `task` is now `subagent`; `apply_patch` is now `patch`.",
+          "The `exec_command` tool takes `cmd` instead of `command`. Use the returned `exec_id` with `poll_exec`, `write_stdin`, or `terminate_exec` to control a running command.",
           "The `subagent` tool takes `agent` instead of `subagent_type` and `sessionID` instead of `task_id`.",
           "The `read` tool now takes `path` instead of `filePath`.",
           "The `todowrite` tool is no longer available and must not be called.",
@@ -557,7 +642,8 @@ describe("V1Migration.transformSession", () => {
     expect(result.messages[5]?.data).toMatchObject({
       text: [
         "The available tools have changed.",
-        "The `bash` tool is now `shell` and must be called by that name.",
+        "The `bash` tool is now `exec_command` and must be called by that name.",
+        "The `exec_command` tool takes `cmd` instead of `command`. Use the returned `exec_id` with `poll_exec`, `write_stdin`, or `terminate_exec` to control a running command.",
         "The following tools now take `path` instead of `filePath`: `edit`, `write`.",
         "The `skill` tool now takes `id` instead of `name`.",
       ].join("\n\n"),
@@ -576,8 +662,12 @@ describe("V1Migration.transformSession", () => {
       [
         "APIError",
         {
-          message: "api", statusCode: 503, isRetryable: false, responseBody: "retained",
-          responseHeaders: { "x-request-id": "request-1" }, metadata: { url: "https://example.com/responses" },
+          message: "api",
+          statusCode: 503,
+          isRetryable: false,
+          responseBody: "retained",
+          responseHeaders: { "x-request-id": "request-1" },
+          metadata: { url: "https://example.com/responses" },
           resolution: { kind: "model_capacity", retry: "never", action: "switch_model" },
         },
         "provider.error",
@@ -600,8 +690,12 @@ describe("V1Migration.transformSession", () => {
       if (!error || typeof error !== "object") throw new Error("Expected assistant error")
       if (entry[0] === "APIError") {
         expect(error).toEqual({
-          type: "provider.error", message: "api", status: 503, responseBody: "retained",
-          responseHeaders: { "x-request-id": "request-1" }, url: "https://example.com/responses",
+          type: "provider.error",
+          message: "api",
+          status: 503,
+          responseBody: "retained",
+          responseHeaders: { "x-request-id": "request-1" },
+          url: "https://example.com/responses",
           resolution: { kind: "server", retry: "automatic", action: "retry" },
         })
       } else expect(Object.keys(error).sort()).toEqual(["message", "type"])

@@ -12,6 +12,7 @@ import { SessionMetadata } from "./session-metadata.js"
 import { Location } from "./location.js"
 import { SessionMessage } from "./session-message.js"
 import { Revert } from "./session-revert.js"
+import { SessionExec } from "./session-exec.js"
 import { Shell as ShellSchema } from "./shell.js"
 import { SessionError } from "./session-error.js"
 import { Instruction } from "./instruction.js"
@@ -117,6 +118,13 @@ export const MetadataUpdated = Event.durable({
   },
 })
 export type MetadataUpdated = typeof MetadataUpdated.Type
+
+export const ArchiveUpdated = Event.durable({
+  type: "session.archive.updated",
+  ...options,
+  schema: { ...Base, archivedAt: Schema.NullOr(PositiveInt) },
+})
+export type ArchiveUpdated = typeof ArchiveUpdated.Type
 
 export const Permissions = Event.durable({
   type: "session.permissions",
@@ -649,6 +657,23 @@ export namespace RevertEvent {
   })
 }
 
+export namespace Exec {
+  export const Updated = Event.ephemeral({
+    type: "session.exec.updated",
+    schema: SessionExec.Snapshot.fields,
+  })
+  export const Captured = Event.durable({
+    type: "session.exec.captured",
+    ...options,
+    schema: SessionExec.Snapshot.fields,
+  })
+  export const ScriptCaptured = Event.durable({
+    type: "session.script.captured",
+    ...options,
+    schema: SessionExec.ScriptSnapshot.fields,
+  })
+}
+
 export const Definitions = Event.inventory(
   Created,
   AgentSelected,
@@ -656,6 +681,7 @@ export const Definitions = Event.inventory(
   Moved,
   Renamed,
   MetadataUpdated,
+  ArchiveUpdated,
   Permissions,
   Viewed,
   UsageUpdated,
@@ -691,6 +717,9 @@ export const Definitions = Event.inventory(
   Tool.Progress,
   Tool.Success,
   Tool.Failed,
+  Exec.Updated,
+  Exec.Captured,
+  Exec.ScriptCaptured,
   RetryScheduled,
   Compaction.Started,
   Compaction.Delta,

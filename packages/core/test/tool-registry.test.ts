@@ -11,7 +11,7 @@ import { Tool } from "@opencode/core/tool"
 import type { Info } from "@opencode/schema/tool"
 import { LayerNode } from "@opencode/util/effect/layer-node"
 import { codeModeListings, executeTool, toolDefinitions } from "./lib/tool"
-import { Deferred, Effect, Exit, Fiber, Layer, Logger, Schema, SchemaGetter, SchemaIssue, Scope } from "effect"
+import { ConfigProvider, Deferred, Effect, Exit, Fiber, Layer, Logger, Schema, SchemaGetter, SchemaIssue, Scope } from "effect"
 import { z } from "zod"
 import { testEffect } from "./lib/effect"
 
@@ -39,7 +39,7 @@ const imageStore = Layer.mock(Image.Service, {
 })
 const registryLayer = AppNodeBuilder.build(LayerNode.group([Tool.node, PluginHooks.node]), [
   Image.node.replace(imageStore),
-])
+]).pipe(Layer.provide(Layer.succeed(ConfigProvider.ConfigProvider, ConfigProvider.fromUnknown({ OPENCODE_EXPERIMENTAL_CODE_MODE: true }))))
 const it = testEffect(registryLayer)
 const identity = {
   agent: Agent.ID.make("build"),
@@ -1175,11 +1175,10 @@ describe("Tool", () => {
 
       expect(execution).toMatchObject({ content: [{ type: "text" }] })
       expect(executed).toEqual(["old:request"])
-      expect(progress).toEqual([
-        { toolCalls: [{ tool: "echo", status: "running", input: { text: "request" } }] },
-        { stage: "old" },
-        { toolCalls: [{ tool: "echo", status: "completed", input: { text: "request" } }] },
-      ])
+      expect(progress[0]).toMatchObject({ toolCalls: [{ id: "0", tool: "echo", status: "running", input: { text: "request" } }] })
+      expect(progress.some((update) => update.toolCalls?.[0]?.metadata?.stage === "old")).toBe(true)
+      expect(progress.every((update) => !Object.hasOwn(update, "stage"))).toBe(true)
+      expect(progress.at(-1)).toMatchObject({ toolCalls: [{ id: "0", tool: "echo", status: "completed", input: { text: "request" } }] })
     }),
   )
 })
