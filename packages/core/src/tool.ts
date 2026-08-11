@@ -13,6 +13,7 @@ import { Image } from "./image.js"
 import { Permission } from "./permission.js"
 import { PluginHooks } from "./plugin/hooks.js"
 import { SessionMessage } from "./session/message.js"
+import { SessionExecSnapshots } from "./session/exec-snapshots.js"
 import { SessionSchema } from "./session/schema.js"
 import { State } from "./state.js"
 import { definition, effectiveName, execute, normalizedName, normalizeContent } from "./tool/runtime.js"
@@ -69,6 +70,7 @@ const layer = Layer.effect(
   Effect.gen(function* () {
     const hooks = yield* PluginHooks.Service
     const image = yield* Image.Service
+    const snapshots = yield* SessionExecSnapshots.Service
 
     type NormalizedItem = Tool.Content | "decode" | "size"
     const normalizeImages = Effect.fnUntraced(function* (content: ReadonlyArray<Tool.Content>) {
@@ -233,20 +235,33 @@ const layer = Layer.effect(
             if (whollyDisabled(tool.options?.permission ?? name, rules)) continue
             active.set(name, tool)
           }
+          const codeModeEnabled = !whollyDisabled("execute", rules)
           const direct = new Map(Array.from(active).filter(([, tool]) => tool.options?.codemode === false))
           const codeModeTools = new Map(Array.from(active).filter(([, tool]) => tool.options?.codemode !== false))
           const names = Array.from(codeModeTools.keys()).join("\0")
-          const codeModeEnabled = !whollyDisabled("execute", rules)
           // Discovery is immutable for a registry revision and visible tool set. Keep request
           // definitions/executors fresh, but share the inventory, whose prepared runtime and much
           // larger rendered catalog are cached by identity, across steps.
           const cached = catalog?.data === data && catalog.names === names ? catalog : undefined
           const codeModeInventory = cached?.inventory ?? { tools: codeModeTools, namespaces: data.namespaces }
           const codeModeTool = codeModeEnabled
-            ? CodeModeTool.create(codeModeInventory, (name, tool, input, context) =>
-                beforeExecute(name, input, context).pipe(
-                  Effect.flatMap((event) => executeTool(tool, name, event.input, context)),
-                ),
+            ? CodeModeTool.create(
+                codeModeInventory,
+                (name, tool, input, context) =>
+                  beforeExecute(name, input, context).pipe(
+                    Effect.flatMap((event) => executeTool(tool, name, event.input, context)),
+                  ),
+                (context, toolCalls, revision) =>
+                  snapshots.save({
+                    kind: "script",
+                    snapshot: {
+                      sessionID: context.sessionID,
+                      assistantMessageID: context.messageID,
+                      id: context.id,
+                      toolCalls,
+                      revision,
+                    },
+                  }),
               )
             : undefined
           const codeModeCatalog = !codeModeEnabled
@@ -329,5 +344,5 @@ function namespaceError(name: string) {
 export const node = makeLocationNode({
   service: Service,
   layer,
-  deps: [PluginHooks.node, Image.node],
+  deps: [PluginHooks.node, Image.node, SessionExecSnapshots.node],
 })

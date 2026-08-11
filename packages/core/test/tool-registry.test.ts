@@ -1175,11 +1175,10 @@ describe("Tool", () => {
 
       expect(execution).toMatchObject({ content: [{ type: "text" }] })
       expect(executed).toEqual(["old:request"])
-      expect(progress).toEqual([
-        { toolCalls: [{ tool: "echo", status: "running", input: { text: "request" } }] },
-        { stage: "old" },
-        { toolCalls: [{ tool: "echo", status: "completed", input: { text: "request" } }] },
-      ])
+      expect(progress[0]).toMatchObject({ toolCalls: [{ id: "0", tool: "echo", status: "running", input: { text: "request" } }] })
+      expect(progress.some((update) => update.toolCalls?.[0]?.metadata?.stage === "old")).toBe(true)
+      expect(progress.every((update) => !Object.hasOwn(update, "stage"))).toBe(true)
+      expect(progress.at(-1)).toMatchObject({ toolCalls: [{ id: "0", tool: "echo", status: "completed", input: { text: "request" } }] })
     }),
   )
 })

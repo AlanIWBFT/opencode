@@ -1,4 +1,5 @@
 import { Session } from "@opencode/core/session"
+import { Instance } from "@opencode/core/instance/service"
 import { SessionStats } from "@opencode/core/session/stats"
 import { SessionTitle } from "@opencode/core/session/title"
 import { SessionTransfer } from "@opencode/core/session/transfer"
@@ -32,6 +33,7 @@ function missingForm(id: Form.ID) {
 export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handlers) =>
   Effect.gen(function* () {
     const session = yield* Session.Service
+    const instances = yield* Instance.Service
     const transfer = yield* SessionTransfer.Service
     const requireOwnedForm = Effect.fnUntraced(function* (sessionID: Form.Info["sessionID"], formID: Form.ID) {
       const form = yield* Form.Service
@@ -225,15 +227,17 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
       .handle(
         "session.update",
         Effect.fn(function* (ctx) {
-          yield* session.get(ctx.params.sessionID).pipe(Effect.catchTag("Session.NotFoundError", missingSession))
+          const current = yield* session.get(ctx.params.sessionID).pipe(Effect.catchTag("Session.NotFoundError", missingSession))
           if (ctx.payload.title !== undefined) {
             if (ctx.payload.title) {
               yield* session
                 .rename({ sessionID: ctx.params.sessionID, title: ctx.payload.title })
                 .pipe(Effect.catchTag("Session.NotFoundError", missingSession))
             } else {
-              const title = yield* SessionTitle.Service
-              yield* title.generate(ctx.params.sessionID)
+              yield* SessionTitle.Service.use((title) => title.generate(ctx.params.sessionID)).pipe(
+                instances.provide(current),
+                locationErrors,
+              )
             }
           }
           if (ctx.payload.metadata !== undefined)
@@ -591,6 +595,14 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
         "session.interrupt",
         Effect.fn(function* (ctx) {
           return { interrupted: yield* session.interrupt(ctx.params.sessionID, { resume: ctx.query.resume }) }
+        }),
+      )
+      .handle(
+        "session.stop",
+        Effect.fn(function* (ctx) {
+          return yield* session
+            .stop(ctx.params.sessionID)
+            .pipe(Effect.catchTag("Session.NotFoundError", missingSession))
         }),
       )
       .handle(

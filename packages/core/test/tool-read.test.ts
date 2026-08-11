@@ -157,6 +157,29 @@ describe("ReadTool", () => {
     readOverride = undefined
   })
 
+  it.effect("can opt native reads into Script through a plugin transform while retaining permission filtering", () =>
+    Effect.gen(function* () {
+      const registry = yield* Tool.Service
+      yield* registry.transform((editor) => editor.update("read", (tool) => {
+        tool.options = { ...tool.options, codemode: { namespace: "$opencode" } }
+      }))
+      const snapshot = yield* registry.snapshot()
+      expect(snapshot.definitions.map((tool) => tool.name)).toEqual(["execute"])
+      const input = {
+        sessionID,
+        ...toolIdentity,
+        call: { type: "tool-call" as const, id: "call-script", name: "execute", input: { code: 'return await tools.$opencode.read({ path: "README.md" })' } },
+      }
+      const result = yield* snapshot.execute(input)
+      expect(result.metadata).toMatchObject({ toolCalls: [{ id: "0", tool: "$opencode.read", name: "read", status: "completed" }] })
+      expect(readCalls).toHaveLength(1)
+      expect(assertions.some((input) => input.action === "read")).toBe(true)
+      const denied = yield* registry.snapshot([{ action: "read", resource: "*", effect: "deny" }])
+      expect((yield* denied.execute(input)).metadata?.error).toBe(true)
+      expect(readCalls).toHaveLength(1)
+    }),
+  )
+
   it.effect("registers, authorizes, and reads through the location filesystem", () =>
     Effect.gen(function* () {
       const registry = yield* Tool.Service
