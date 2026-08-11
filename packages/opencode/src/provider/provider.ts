@@ -91,6 +91,25 @@ function timeoutController(ms: number) {
   }
 }
 
+type ProviderFetch = typeof fetch & {
+  providerHeaderTimeout?: (
+    input: RequestInfo | URL,
+    init: BunFetchRequestInit | undefined,
+    timeout: number,
+  ) => number | false | undefined
+}
+
+function providerHeaderTimeout(
+  fetchFn: ProviderFetch,
+  input: RequestInfo | URL,
+  init: BunFetchRequestInit | undefined,
+  timeout: unknown,
+) {
+  if (timeout === false) return
+  if (typeof timeout !== "number") return
+  return fetchFn.providerHeaderTimeout?.(input, init, timeout) ?? timeout
+}
+
 function googleVertexAnthropicBaseURL(project: string | undefined, location: string | undefined) {
   if (!project) return
   if (location !== "eu" && location !== "us") return
@@ -1802,10 +1821,10 @@ const layer = Layer.effect(
         delete options["headerTimeout"]
 
         options["fetch"] = async (input: any, init?: BunFetchRequestInit) => {
-          const fetchFn = customFetch ?? fetch
+          const fetchFn = (customFetch ?? fetch) as ProviderFetch
           const opts = init ?? {}
           const chunkAbortCtl = typeof chunkTimeout === "number" && chunkTimeout > 0 ? new AbortController() : undefined
-          const headerTimeoutMs = headerTimeout === false ? undefined : headerTimeout
+          const headerTimeoutMs = providerHeaderTimeout(fetchFn, input, opts, headerTimeout)
           const headerTimeoutCtl = typeof headerTimeoutMs === "number" ? timeoutController(headerTimeoutMs) : undefined
           const signals: AbortSignal[] = []
 

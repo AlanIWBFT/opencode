@@ -13,6 +13,7 @@ export type RetryReason = "free_tier_limit" | "account_rate_limit" | (string & {
 
 export type Retryable = {
   message: string
+  resolution?: SessionV1.APIErrorResolution
   action?: {
     reason: RetryReason
     provider: string
@@ -46,6 +47,7 @@ function cap(ms: number) {
 
 export function delay(attempt: number, error?: SessionV1.APIError, random = Math.random()) {
   if (error) {
+    if (error.data.resolution?.retryAfterMs !== undefined) return cap(error.data.resolution.retryAfterMs)
     const headers = error.data.responseHeaders
     if (headers) {
       const retryAfterMs = headers["retry-after-ms"]
@@ -82,14 +84,16 @@ function exponential(attempt: number, random: number) {
   return Math.ceil(base + base * RETRY_JITTER_FACTOR * random)
 }
 
-export function retryable(error: Err, provider: string) {
+export function retryable(error: Err, provider: string): Retryable | undefined {
   // context overflow errors should not be retried
   if (SessionV1.ContextOverflowError.isInstance(error)) return undefined
   if (SessionV1.APIError.isInstance(error)) {
+    if (error.data.resolution?.retry === "never") return undefined
     const status = error.data.statusCode
     // 5xx errors are transient server failures and should always be retried,
     // even when the provider SDK doesn't explicitly mark them as retryable.
     if (
+      error.data.resolution?.retry !== "automatic" &&
       !error.data.isRetryable &&
       !(status !== undefined && status >= 500) &&
       !matchesRetryableMessage(error.data.message) &&
@@ -99,6 +103,7 @@ export function retryable(error: Err, provider: string) {
     if (error.data.responseBody?.includes("FreeUsageLimitError")) {
       return {
         message: GO_UPSELL_MESSAGE,
+        ...(error.data.resolution ? { resolution: error.data.resolution } : {}),
         action: {
           reason: "free_tier_limit",
           provider,
@@ -132,6 +137,7 @@ export function retryable(error: Err, provider: string) {
       const link = `https://opencode.ai/workspace/${workspace}/go`
       return {
         message: `${message} - ${link}`,
+        ...(error.data.resolution ? { resolution: error.data.resolution } : {}),
         action: {
           reason: "account_rate_limit",
           provider,
@@ -142,7 +148,10 @@ export function retryable(error: Err, provider: string) {
         },
       }
     }
-    return { message: error.data.message.includes("Overloaded") ? "Provider is overloaded" : error.data.message }
+    return {
+      message: error.data.message.includes("Overloaded") ? "Provider is overloaded" : error.data.message,
+      ...(error.data.resolution ? { resolution: error.data.resolution } : {}),
+    }
   }
 
   const message = isRecord(error.data) ? error.data.message : undefined
@@ -183,7 +192,13 @@ function parseJSON(value: unknown) {
 export function policy(opts: {
   provider: string
   parse: (error: unknown) => Err
-  set: (input: { attempt: number; message: string; action?: Retryable["action"]; next: number }) => Effect.Effect<void>
+  set: (input: {
+    attempt: number
+    message: string
+    action?: Retryable["action"]
+    resolution?: Retryable["resolution"]
+    next: number
+  }) => Effect.Effect<void>
 }) {
   return Schedule.fromStepWithMetadata(
     Effect.succeed((meta: Schedule.InputMetadata<unknown>) => {
@@ -198,6 +213,7 @@ export function policy(opts: {
           attempt: meta.attempt,
           message: retry.message,
           action: retry.action,
+          resolution: retry.resolution,
           next: now + wait,
         })
         return [meta.attempt, Duration.millis(wait)] as [number, Duration.Duration]

@@ -345,95 +345,96 @@ export async function CodexAuthPlugin(input: PluginInput, options: CodexAuthPlug
             }>
           | undefined
 
+        const fetchWithOAuth = async (requestInput: RequestInfo | URL, init?: RequestInit) => {
+          if (init?.headers) {
+            if (init.headers instanceof Headers) {
+              init.headers.delete("authorization")
+              init.headers.delete("Authorization")
+            } else if (Array.isArray(init.headers)) {
+              init.headers = init.headers.filter(([key]) => key.toLowerCase() !== "authorization")
+            } else {
+              delete init.headers["authorization"]
+              delete init.headers["Authorization"]
+            }
+          }
+
+          const currentAuth = await getAuth()
+          if (currentAuth.type !== "oauth")
+            return websocketFetch ? websocketFetch(requestInput, init) : fetch(requestInput, init)
+
+          const authWithAccount = currentAuth as typeof currentAuth & { accountId?: string }
+
+          if (!currentAuth.access || currentAuth.expires < Date.now()) {
+            if (!refreshPromise) {
+              refreshPromise = refreshAccessToken(currentAuth.refresh, issuer)
+                .then(async (tokens) => {
+                  const accountId = extractAccountId(tokens) || authWithAccount.accountId
+                  await input.client.auth.set({
+                    path: { id: "openai" },
+                    body: {
+                      type: "oauth",
+                      refresh: tokens.refresh_token,
+                      access: tokens.access_token,
+                      expires: Date.now() + (tokens.expires_in ?? 3600) * 1000,
+                      ...(accountId && { accountId }),
+                    },
+                  })
+                  return {
+                    access: tokens.access_token,
+                    accountId,
+                  }
+                })
+                .finally(() => {
+                  refreshPromise = undefined
+                })
+            }
+
+            const refreshed = await refreshPromise
+            currentAuth.access = refreshed.access
+            authWithAccount.accountId = refreshed.accountId
+          }
+
+          const headers = new Headers()
+          if (init?.headers) {
+            if (init.headers instanceof Headers) {
+              init.headers.forEach((value, key) => headers.set(key, value))
+            } else if (Array.isArray(init.headers)) {
+              for (const [key, value] of init.headers) {
+                if (value !== undefined) headers.set(key, String(value))
+              }
+            } else {
+              for (const [key, value] of Object.entries(init.headers)) {
+                if (value !== undefined) headers.set(key, String(value))
+              }
+            }
+          }
+          headers.set("authorization", `Bearer ${currentAuth.access}`)
+          if (authWithAccount.accountId) {
+            headers.set("ChatGPT-Account-Id", authWithAccount.accountId)
+          }
+
+          const parsed =
+            requestInput instanceof URL
+              ? requestInput
+              : new URL(typeof requestInput === "string" ? requestInput : requestInput.url)
+          const url =
+            parsed.pathname.includes("/v1/responses") || parsed.pathname.includes("/chat/completions")
+              ? new URL(codexApiEndpoint)
+              : parsed
+
+          const requestInit = {
+            ...init,
+            headers,
+          }
+          if (websocketFetch && parsed.pathname.endsWith("/responses")) return websocketFetch(url, requestInit)
+          return fetch(url, OpenAIWebSocketPool.withoutInternalHeaders(requestInit))
+        }
+
         return {
           apiKey: OAUTH_DUMMY_KEY,
-          async fetch(requestInput: RequestInfo | URL, init?: RequestInit) {
-            if (init?.headers) {
-              if (init.headers instanceof Headers) {
-                init.headers.delete("authorization")
-                init.headers.delete("Authorization")
-              } else if (Array.isArray(init.headers)) {
-                init.headers = init.headers.filter(([key]) => key.toLowerCase() !== "authorization")
-              } else {
-                delete init.headers["authorization"]
-                delete init.headers["Authorization"]
-              }
-            }
-
-            const currentAuth = await getAuth()
-            if (currentAuth.type !== "oauth")
-              return websocketFetch ? websocketFetch(requestInput, init) : fetch(requestInput, init)
-
-            const authWithAccount = currentAuth as typeof currentAuth & { accountId?: string }
-
-            if (!currentAuth.access || currentAuth.expires < Date.now()) {
-              if (!refreshPromise) {
-                refreshPromise = refreshAccessToken(currentAuth.refresh, issuer)
-                  .then(async (tokens) => {
-                    const accountId = extractAccountId(tokens) || authWithAccount.accountId
-                    await input.client.auth.set({
-                      path: { id: "openai" },
-                      body: {
-                        type: "oauth",
-                        refresh: tokens.refresh_token,
-                        access: tokens.access_token,
-                        expires: Date.now() + (tokens.expires_in ?? 3600) * 1000,
-                        ...(accountId && { accountId }),
-                      },
-                    })
-                    return {
-                      access: tokens.access_token,
-                      accountId,
-                    }
-                  })
-                  .finally(() => {
-                    refreshPromise = undefined
-                  })
-              }
-
-              const refreshed = await refreshPromise
-              currentAuth.access = refreshed.access
-              authWithAccount.accountId = refreshed.accountId
-            }
-
-            const headers = new Headers()
-            if (init?.headers) {
-              if (init.headers instanceof Headers) {
-                init.headers.forEach((value, key) => headers.set(key, value))
-              } else if (Array.isArray(init.headers)) {
-                for (const [key, value] of init.headers) {
-                  if (value !== undefined) headers.set(key, String(value))
-                }
-              } else {
-                for (const [key, value] of Object.entries(init.headers)) {
-                  if (value !== undefined) headers.set(key, String(value))
-                }
-              }
-            }
-            headers.set("authorization", `Bearer ${currentAuth.access}`)
-            if (authWithAccount.accountId) {
-              headers.set("ChatGPT-Account-Id", authWithAccount.accountId)
-            }
-
-            const parsed =
-              requestInput instanceof URL
-                ? requestInput
-                : new URL(typeof requestInput === "string" ? requestInput : requestInput.url)
-            const rewrite = parsed.pathname.includes("/v1/responses") || parsed.pathname.includes("/chat/completions")
-            const url = rewrite ? new URL(codexApiEndpoint) : parsed
-            if (rewrite) {
-              const residency = extractResidency(currentAuth.access)
-              if (residency) headers.set("x-openai-internal-codex-residency", residency)
-            }
-
-            const requestInit = {
-              ...init,
-              body: init?.body,
-              headers,
-            }
-            if (websocketFetch && parsed.pathname.endsWith("/responses")) return websocketFetch(url, requestInit)
-            return fetch(url, OpenAIWebSocketPool.withoutInternalHeaders(requestInit))
-          },
+          fetch: websocketFetch
+            ? Object.assign(fetchWithOAuth, { providerHeaderTimeout: websocketFetch.providerHeaderTimeout })
+            : fetchWithOAuth,
         }
       },
       methods: [
@@ -558,12 +559,12 @@ export async function CodexAuthPlugin(input: PluginInput, options: CodexAuthPlug
     },
     "chat.headers": async (input, output) => {
       if (input.model.providerID !== "openai") return
+      const affinity = input.agent === "title" ? `${input.sessionID}-title` : input.sessionID
       output.headers.originator = "opencode"
       output.headers["User-Agent"] = `opencode/${InstallationVersion} (${os.platform()} ${os.release()}; ${os.arch()})`
-      output.headers["session-id"] = input.sessionID
-      // Temporary fetch-layer hack: title generation currently shares the conversation
-      // session ID, so the OpenAI plugin marks it for HTTP fallback until transport
-      // context can be passed directly instead of smuggled through headers.
+      output.headers["session-id"] = affinity
+      output.headers["x-session-affinity"] = affinity
+      // Keep title generation off the primary conversation's WebSocket lane.
       if (websocketFetchInstalled && input.agent === "title") output.headers[OpenAIWebSocketPool.TITLE_HEADER] = "true"
     },
     "chat.params": async (input, output) => {

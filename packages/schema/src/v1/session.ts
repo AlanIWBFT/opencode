@@ -1,6 +1,6 @@
 export * as SessionV1 from "./session"
 
-import { Effect, Schema, Types } from "effect"
+import { Effect, Schema, SchemaGetter, Types } from "effect"
 import { define, inventory } from "../event"
 import { FileDiff } from "../file-diff"
 import { Project } from "../project"
@@ -9,8 +9,11 @@ import { Model } from "../model"
 import { NonNegativeInt, optional, statics } from "../schema"
 import { ascending } from "../identifier"
 import { SessionID } from "../session-id"
+import { APIErrorResolution } from "../session-status-event"
 import { WorkspaceID } from "../workspace-id"
 import { PermissionV1 } from "./permission"
+
+export { APIErrorResolution } from "../session-status-event"
 
 const Timestamp = Schema.Finite.check(Schema.isGreaterThanOrEqualTo(0))
 
@@ -45,14 +48,27 @@ export const StructuredOutputError = namedError("StructuredOutputError", {
   message: Schema.String,
   retries: NonNegativeInt,
 })
-export const APIError = namedError("APIError", {
+const APIErrorDataStruct = Schema.Struct({
   message: Schema.String,
   statusCode: Schema.optional(NonNegativeInt),
   isRetryable: Schema.Boolean,
+  resolution: optional(APIErrorResolution),
   responseHeaders: Schema.optional(Schema.Record(Schema.String, Schema.String)),
   responseBody: Schema.optional(Schema.String),
   metadata: Schema.optional(Schema.Record(Schema.String, Schema.String)),
 })
+export const APIErrorData = APIErrorDataStruct.pipe(
+  Schema.decodeTo(Schema.toType(APIErrorDataStruct), {
+    decode: SchemaGetter.transform((value) =>
+      value.resolution?.retry === "automatic" && !value.isRetryable ? { ...value, isRetryable: true } : value,
+    ),
+    encode: SchemaGetter.transform((value) => value),
+  }),
+)
+const APIErrorSchema = Schema.Struct({ name: Schema.Literal("APIError"), data: APIErrorData }).annotate({
+  identifier: "APIError",
+})
+export const APIError = { Schema: APIErrorSchema, EffectSchema: APIErrorSchema }
 export type APIError = Schema.Schema.Type<typeof APIError.Schema>
 export const ContextOverflowError = namedError("ContextOverflowError", {
   message: Schema.String,

@@ -23,6 +23,7 @@ import {
   UnknownProviderReason,
 } from "../schema"
 import { isContextOverflow } from "../provider-error"
+import * as ProviderShared from "../protocols/shared"
 
 export interface Interface {
   readonly execute: (
@@ -305,6 +306,11 @@ const statusError =
     })
 
 const toHttpError = (redactedNames: ReadonlyArray<string | RegExp>) => (error: unknown) => {
+  const detail = (message: string, cause: unknown) => {
+    const text = ProviderShared.errorText(cause)
+    if (!text || text === "Unknown stream error" || text === message) return message
+    return `${message}: ${text}`
+  }
   const transportError = (input: {
     readonly message: string
     readonly kind?: string | undefined
@@ -322,21 +328,23 @@ const toHttpError = (redactedNames: ReadonlyArray<string | RegExp>) => (error: u
     })
 
   if (Cause.isTimeoutError(error)) {
-    return transportError({ message: error.message, kind: "Timeout" })
+    return transportError({ message: detail(error.message, error), kind: "Timeout" })
   }
   if (!HttpClientError.isHttpClientError(error)) {
-    return transportError({ message: "HTTP transport failed" })
+    return transportError({ message: detail("HTTP transport failed", error) })
   }
   const request = "request" in error ? error.request : undefined
   if (error.reason._tag === "TransportError") {
+    const message = error.reason.description ?? "HTTP transport failed"
     return transportError({
-      message: error.reason.description ?? "HTTP transport failed",
+      message: detail(message, error),
       kind: error.reason._tag,
       request,
     })
   }
+  const message = `HTTP transport failed: ${error.reason._tag}`
   return transportError({
-    message: `HTTP transport failed: ${error.reason._tag}`,
+    message: detail(message, error),
     kind: error.reason._tag,
     request,
   })

@@ -77,12 +77,17 @@ export const cursor = {
   },
 }
 
-const info = (row: typeof MessageTable.$inferSelect) =>
-  ({
+const decodeAPIError = Schema.decodeUnknownSync(APIError.Schema)
+
+const info = (row: typeof MessageTable.$inferSelect): Info => {
+  const value = {
     ...row.data,
     id: row.id,
     sessionID: row.session_id,
-  }) as Info
+  } as Info
+  if (value.role !== "assistant" || !APIError.isInstance(value.error)) return value
+  return { ...value, error: decodeAPIError(value.error) }
+}
 
 const part = (row: typeof PartTable.$inferSelect) =>
   ({
@@ -617,6 +622,10 @@ export function fromError(
       ).toObject()
     case OutputLengthError.isInstance(e):
       return e
+    case ContextOverflowError.isInstance(e):
+      return e
+    case APIError.isInstance(e):
+      return e
     case LoadAPIKeyError.isInstance(e):
       return new AuthError(
         {
@@ -696,17 +705,16 @@ export function fromError(
           message: parsed.message,
           statusCode: parsed.statusCode,
           isRetryable: parsed.isRetryable,
+          ...(parsed.resolution ? { resolution: parsed.resolution } : {}),
           responseHeaders: parsed.responseHeaders,
           responseBody: parsed.responseBody,
           metadata: parsed.metadata,
         },
         { cause: e },
       ).toObject()
-    case e instanceof Error:
-      return new NamedError.Unknown({ message: errorMessage(e) }, { cause: e }).toObject()
     default:
       try {
-        const parsed = ProviderError.parseStreamError(e)
+        const parsed = ProviderError.parseStreamError(e, ctx.providerID)
         if (parsed) {
           if (parsed.type === "context_overflow") {
             return new ContextOverflowError(
@@ -721,6 +729,7 @@ export function fromError(
             {
               message: parsed.message,
               isRetryable: parsed.isRetryable,
+              ...(parsed.resolution ? { resolution: parsed.resolution } : {}),
               responseBody: parsed.responseBody,
             },
             {
@@ -729,7 +738,10 @@ export function fromError(
           ).toObject()
         }
       } catch {}
-      return new NamedError.Unknown({ message: JSON.stringify(e) }, { cause: e }).toObject()
+      return new NamedError.Unknown(
+        { message: e instanceof Error ? errorMessage(e) : (JSON.stringify(e) ?? String(e)) },
+        { cause: e },
+      ).toObject()
   }
 }
 

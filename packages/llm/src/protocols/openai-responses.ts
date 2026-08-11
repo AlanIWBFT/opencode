@@ -198,11 +198,10 @@ const OpenAIResponsesStreamItem = Schema.Struct({
 })
 type OpenAIResponsesStreamItem = Schema.Schema.Type<typeof OpenAIResponsesStreamItem>
 
-// OpenAI Responses surfaces provider failures in two related shapes. The
-// streaming `error` event carries the details at the top level
-// (`{ type: "error", code, message, param, sequence_number }`), while
-// `response.failed` carries them under `response.error`. We capture both so
-// the parser can surface a useful provider-error message in either path.
+// OpenAI Responses surfaces provider failures in a few related shapes. The
+// streaming `error` event can carry details either directly at the top level or
+// nested under `error`, while `response.failed` carries them under
+// `response.error`. Capture all three so users see the provider's real cause.
 const OpenAIResponsesErrorPayload = Schema.Struct({
   code: optionalNull(Schema.String),
   message: optionalNull(Schema.String),
@@ -227,6 +226,7 @@ const OpenAIResponsesEvent = Schema.Struct({
       [Schema.Record(Schema.String, Schema.Unknown)],
     ),
   ),
+  error: Schema.optional(OpenAIResponsesErrorPayload),
   code: Schema.optional(Schema.String),
   message: Schema.optional(Schema.String),
   param: Schema.optional(Schema.String),
@@ -239,6 +239,7 @@ interface ParserState {
   readonly lifecycle: Lifecycle.State
   readonly reasoningItems: Readonly<Record<string, ReasoningStreamItem>>
   readonly store: boolean | undefined
+  readonly warnedCompactionItem: boolean
 }
 
 type ReasoningSummaryStatus = "active" | "can-conclude" | "concluded"
@@ -689,6 +690,21 @@ const onOutputItemAdded = (state: ParserState, event: OpenAIResponsesEvent): Ste
   ]
 }
 
+const onUnexpectedCompactionItem = Effect.fn("OpenAIResponses.onUnexpectedCompactionItem")(function* (
+  state: ParserState,
+  event: OpenAIResponsesEvent,
+) {
+  const item = event.item
+  if (item?.type !== "compaction") return [state, NO_EVENTS] satisfies StepResult
+  if (state.warnedCompactionItem) return [state, NO_EVENTS] satisfies StepResult
+  yield* Effect.logWarning("OpenAI Responses stream returned unexpected compaction item; ignoring", {
+    eventType: event.type,
+    itemID: item.id,
+    hasEncryptedContent: typeof item.encrypted_content === "string",
+  })
+  return [{ ...state, warnedCompactionItem: true }, NO_EVENTS] satisfies StepResult
+})
+
 const onReasoningSummaryPartAdded = (state: ParserState, event: OpenAIResponsesEvent): StepResult => {
   if (!event.item_id || event.summary_index === undefined) return [state, NO_EVENTS]
   const item = state.reasoningItems[event.item_id] ?? { encryptedContent: undefined, summaryParts: {} }
@@ -894,7 +910,7 @@ const onResponseFinish = (state: ParserState, event: OpenAIResponsesEvent): Step
 // the bare message — production rate limits and context-length failures used
 // to be indistinguishable from generic stream drops.
 const providerErrorMessage = (event: OpenAIResponsesEvent, fallback: string): string => {
-  const nested = event.response?.error ?? undefined
+  const nested = event.error ?? event.response?.error ?? undefined
   const message = event.message || nested?.message || undefined
   const code = event.code || nested?.code || undefined
   if (message && code) return `${code}: ${message}`
@@ -902,7 +918,7 @@ const providerErrorMessage = (event: OpenAIResponsesEvent, fallback: string): st
 }
 
 const providerError = (event: OpenAIResponsesEvent, fallback: string) => {
-  const code = event.code || event.response?.error?.code || undefined
+  const code = event.code || event.error?.code || event.response?.error?.code || undefined
   const message = providerErrorMessage(event, fallback)
   return LLMEvent.providerError({
     message,
@@ -938,9 +954,15 @@ const step = (state: ParserState, event: OpenAIResponsesEvent) => {
     return Effect.succeed(onReasoningSummaryPartAdded(state, event))
   if (event.type === "response.reasoning_summary_part.done")
     return Effect.succeed(onReasoningSummaryPartDone(state, event))
-  if (event.type === "response.output_item.added") return Effect.succeed(onOutputItemAdded(state, event))
+  if (event.type === "response.output_item.added") {
+    if (event.item?.type === "compaction") return onUnexpectedCompactionItem(state, event)
+    return Effect.succeed(onOutputItemAdded(state, event))
+  }
   if (event.type === "response.function_call_arguments.delta") return onFunctionCallArgumentsDelta(state, event)
-  if (event.type === "response.output_item.done") return onOutputItemDone(state, event)
+  if (event.type === "response.output_item.done") {
+    if (event.item?.type === "compaction") return onUnexpectedCompactionItem(state, event)
+    return onOutputItemDone(state, event)
+  }
   if (event.type === "response.completed" || event.type === "response.incomplete")
     return Effect.succeed(onResponseFinish(state, event))
   if (event.type === "response.failed") return Effect.succeed(onResponseFailed(state, event))
@@ -970,6 +992,7 @@ export const protocol = Protocol.make({
       lifecycle: Lifecycle.initial(),
       reasoningItems: {},
       store: OpenAIOptions.store(request),
+      warnedCompactionItem: false,
     }),
     step,
     terminal: (event) => TERMINAL_TYPES.has(event.type),

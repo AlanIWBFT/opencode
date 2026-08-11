@@ -361,6 +361,21 @@ describe("plugin.codex", () => {
     expect(Object.keys(models)).toEqual(allowed ? [id] : [])
   })
 
+  test("uses an independent affinity for title requests", async () => {
+    const hooks = await CodexAuthPlugin({} as never)
+    const regular = { headers: {} as Record<string, string> }
+    const title = { headers: {} as Record<string, string> }
+    const model = { providerID: "openai" }
+
+    await hooks["chat.headers"]?.({ sessionID: "session-1", agent: "build", model } as never, regular)
+    await hooks["chat.headers"]?.({ sessionID: "session-1", agent: "title", model } as never, title)
+
+    expect(regular.headers["session-id"]).toBe("session-1")
+    expect(regular.headers["x-session-affinity"]).toBe("session-1")
+    expect(title.headers["session-id"]).toBe("session-1-title")
+    expect(title.headers["x-session-affinity"]).toBe("session-1-title")
+  })
+
   test("deduplicates concurrent Codex token refreshes", async () => {
     const refreshedAccess = createTestJwt({
       "https://api.openai.com/auth": { chatgpt_compute_residency: "eu" },

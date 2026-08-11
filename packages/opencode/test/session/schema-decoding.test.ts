@@ -229,7 +229,7 @@ describe("SessionStatus.Info", () => {
     expect(decode({ type: "busy" })).toEqual({ type: "busy" })
   })
 
-  test("retry carries attempt/message/action/next", () => {
+  test("retry carries attempt/message/action/resolution/next", () => {
     const input = {
       type: "retry" as const,
       attempt: 1,
@@ -242,8 +242,13 @@ describe("SessionStatus.Info", () => {
         label: "subscribe",
         link: "https://opencode.ai/go",
       },
+      resolution: {
+        kind: "rate_limited",
+        retry: "automatic",
+        action: "wait",
+      },
       next: 500,
-    }
+    } as const
     expect(decode(input)).toEqual(input)
   })
 

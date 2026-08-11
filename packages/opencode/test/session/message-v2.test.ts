@@ -1364,6 +1364,71 @@ describe("session.message-v2.toModelMessage", () => {
 })
 
 describe("session.message-v2.fromError", () => {
+  test("preserves classified ContextOverflowError instances", () => {
+    const input = new SessionV1.ContextOverflowError({ message: "prompt too long" }).toObject()
+
+    expect(MessageV2.fromError(input, { providerID })).toStrictEqual(input)
+  })
+
+  test("keeps non-OpenAI overloaded stream errors retryable", () => {
+    const input = {
+      type: "error",
+      error: {
+        code: "server_is_overloaded",
+        message: "The upstream provider is overloaded.",
+      },
+    }
+    const result = MessageV2.fromError(input, { providerID: ProviderV2.ID.make("test") })
+
+    expect(result).toStrictEqual({
+      name: "APIError",
+      data: {
+        message: "The upstream provider is overloaded.",
+        isRetryable: true,
+        resolution: {
+          kind: "server",
+          retry: "automatic",
+          action: "retry",
+          providerCode: "server_is_overloaded",
+        },
+        responseBody: JSON.stringify(input),
+      },
+    })
+  })
+
+  test("retries AI SDK OpenAI overloaded errors", () => {
+    const result = MessageV2.fromError(
+      new APICallError({
+        message: "Service Unavailable",
+        url: "https://api.openai.com/v1/responses",
+        requestBodyValues: {},
+        statusCode: 503,
+        responseHeaders: { "content-type": "application/json" },
+        responseBody: JSON.stringify({
+          error: {
+            code: "server_is_overloaded",
+            message: "Our servers are currently overloaded. Please try again later.",
+          },
+        }),
+        isRetryable: true,
+      }),
+      { providerID: ProviderV2.ID.make("openai") },
+    )
+
+    expect(result).toMatchObject({
+      name: "APIError",
+      data: {
+        isRetryable: true,
+        resolution: {
+          kind: "server",
+          retry: "automatic",
+          action: "retry",
+          providerCode: "server_is_overloaded",
+        },
+      },
+    })
+  })
+
   test("serializes context_length_exceeded as ContextOverflowError", () => {
     const input = {
       type: "error",
@@ -1396,6 +1461,10 @@ describe("session.message-v2.fromError", () => {
         code: "invalid_prompt",
         message: "Invalid prompt from test",
       },
+      {
+        code: "invalid_request_error",
+        message: "Invalid request from test",
+      },
     ]
 
     cases.forEach((item) => {
@@ -1403,7 +1472,7 @@ describe("session.message-v2.fromError", () => {
         type: "error",
         error: {
           code: item.code,
-          message: item.code === "invalid_prompt" ? item.message : undefined,
+          message: item.code === "invalid_prompt" || item.code === "invalid_request_error" ? item.message : undefined,
         },
       }
       const result = MessageV2.fromError(input, { providerID })
@@ -1414,6 +1483,34 @@ describe("session.message-v2.fromError", () => {
           message: item.message,
           isRetryable: false,
           responseBody: JSON.stringify(input),
+          ...(item.code === "insufficient_quota"
+            ? {
+                resolution: {
+                  kind: "quota_exceeded",
+                  retry: "never",
+                  action: "manage_billing",
+                  providerCode: "insufficient_quota",
+                },
+              }
+            : item.code === "usage_not_included"
+              ? {
+                  resolution: {
+                    kind: "plan_not_included",
+                    retry: "never",
+                    action: "switch_model",
+                    providerCode: "usage_not_included",
+                  },
+                }
+              : item.code === "invalid_prompt" || item.code === "invalid_request_error"
+                ? {
+                    resolution: {
+                      kind: "invalid_input",
+                      retry: "never",
+                      action: "fix_input",
+                      providerCode: item.code,
+                    },
+                  }
+                : {}),
         },
       })
     })
@@ -1439,6 +1536,7 @@ describe("session.message-v2.fromError", () => {
         message: body.error.message,
         isRetryable: true,
         responseBody: JSON.stringify(body),
+        resolution: { kind: "server", retry: "automatic", action: "retry", providerCode: "server_error" },
       },
     })
   })

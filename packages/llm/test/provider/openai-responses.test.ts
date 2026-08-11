@@ -1,5 +1,5 @@
 import { describe, expect } from "bun:test"
-import { ConfigProvider, Effect, Layer, Stream } from "effect"
+import { ConfigProvider, Effect, Layer, Logger, Stream } from "effect"
 import { Headers, HttpClientRequest } from "effect/unstable/http"
 import { LLM, LLMError, Message, Model, ToolCallPart, Usage } from "../../src"
 import { Auth, LLMClient, RequestExecutor, WebSocketExecutor } from "../../src/route"
@@ -9,7 +9,7 @@ import * as OpenAIResponses from "../../src/protocols/openai-responses"
 import * as ProviderShared from "../../src/protocols/shared"
 import { continuationRequest, nativeOpenAIResponsesContinuation } from "../continuation-scenarios"
 import { it } from "../lib/effect"
-import { dynamicResponse, fixedResponse } from "../lib/http"
+import { dynamicResponse, fixedResponse, truncatedStream } from "../lib/http"
 import { sseEvents } from "../lib/sse"
 
 const model = OpenAIResponses.route
@@ -786,6 +786,41 @@ describe("OpenAI Responses route", () => {
     }),
   )
 
+  it.effect("warns when a normal stream includes compaction items", () =>
+    Effect.gen(function* () {
+      const logs: unknown[] = []
+      const logger = Logger.make<unknown, void>((options) => {
+        logs.push(options.message)
+      })
+      const response = yield* LLMClient.generate(request).pipe(
+        Effect.provide(
+          fixedResponse(
+            sseEvents(
+              {
+                type: "response.output_item.added",
+                item: { type: "compaction", id: "cmp_1", encrypted_content: "opaque-state" },
+              },
+              {
+                type: "response.output_item.done",
+                item: { type: "compaction", id: "cmp_1", encrypted_content: "opaque-state" },
+              },
+              { type: "response.output_text.delta", item_id: "msg_1", delta: "Hello" },
+              { type: "response.completed", response: { id: "resp_1" } },
+            ),
+          ),
+        ),
+        Effect.provide(Logger.layer([logger])),
+      )
+
+      expect(response.text).toBe("Hello")
+      expect(
+        logs.filter((message) =>
+          String(message).includes("OpenAI Responses stream returned unexpected compaction item; ignoring"),
+        ),
+      ).toHaveLength(1)
+    }),
+  )
+
   it.effect("preserves encrypted reasoning metadata for continuation", () =>
     Effect.gen(function* () {
       const response = yield* LLMClient.generate(request).pipe(
@@ -1432,6 +1467,28 @@ describe("OpenAI Responses route", () => {
     }),
   )
 
+  it.effect("surfaces error event details from top-level error payload", () =>
+    Effect.gen(function* () {
+      const response = yield* LLMClient.generate(request).pipe(
+        Effect.provide(
+          fixedResponse(
+            sseEvents({
+              type: "error",
+              error: { code: "invalid_request_error", message: "Invalid input: unsupported item type" },
+            }),
+          ),
+        ),
+      )
+
+      expect(response.events).toEqual([
+        {
+          type: "provider-error",
+          message: "invalid_request_error: Invalid input: unsupported item type",
+        },
+      ])
+    }),
+  )
+
   it.effect("falls back to a stable default when both error and response are absent", () =>
     Effect.gen(function* () {
       const response = yield* LLMClient.generate(request).pipe(
@@ -1449,6 +1506,22 @@ describe("OpenAI Responses route", () => {
       )
 
       expect(response.events).toEqual([{ type: "provider-error", message: "OpenAI Responses response failed" }])
+    }),
+  )
+
+  it.effect("surfaces transport error details that occur mid-stream", () =>
+    Effect.gen(function* () {
+      const error = yield* LLMClient.generate(request).pipe(
+        Effect.provide(
+          truncatedStream([
+            `data: ${JSON.stringify({ type: "response.output_text.delta", item_id: "msg_1", delta: "Hello" })}\n\n`,
+          ]),
+        ),
+        Effect.flip,
+      )
+
+      expect(error.message).toContain("Failed to read openai/openai-responses stream")
+      expect(error.message).toContain("connection reset")
     }),
   )
 
