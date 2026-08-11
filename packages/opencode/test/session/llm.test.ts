@@ -3,7 +3,7 @@ import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import path from "path"
-import { tool, type ModelMessage } from "ai"
+import { APICallError, tool, type ModelMessage } from "ai"
 import { Cause, Effect, Exit, Fiber, Layer, Stream } from "effect"
 import { InstanceRef } from "../../src/effect/instance-ref"
 import { HttpClientRequest, HttpClientResponse } from "effect/unstable/http"
@@ -21,17 +21,23 @@ import { SessionID, MessageID } from "../../src/session/schema"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Permission } from "@/permission"
 import { LLMAISDK } from "@/session/llm/ai-sdk"
+import { ProviderError } from "@/provider/error"
 import { Session as SessionNs } from "@/session/session"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { LayerNodePlatform } from "@opencode-ai/core/effect/app-node-platform"
-import { ProviderError } from "@/provider/error"
+import { Auth } from "@/auth"
+import { Plugin } from "@/plugin"
 
 type ConfigModel = NonNullable<NonNullable<ConfigV1.Info["provider"]>[string]["models"]>[string]
 
-const openAIConfig = (model: ModelsDev.Provider["models"][string], baseURL: string): Partial<ConfigV1.Info> => {
+const openAIConfig = (
+  model: ModelsDev.Provider["models"][string],
+  baseURL: string,
+  headers?: Record<string, string>,
+): Partial<ConfigV1.Info> => {
   const { experimental: _experimental, ...configModel } = model
   return {
     enabled_providers: ["openai"],
@@ -42,7 +48,10 @@ const openAIConfig = (model: ModelsDev.Provider["models"][string], baseURL: stri
         npm: "@ai-sdk/openai",
         api: "https://api.openai.com/v1",
         models: {
-          [model.id]: JSON.parse(JSON.stringify(configModel)) as ConfigModel,
+          [model.id]: {
+            ...(JSON.parse(JSON.stringify(configModel)) as ConfigModel),
+            ...(headers ? { headers } : {}),
+          },
         },
         options: {
           apiKey: "test-openai-key",
@@ -74,15 +83,34 @@ const drainWith = (layer: Layer.Layer<LLM.Service>, input: LLM.StreamInput) =>
     )
   })
 
+const compactWith = (layer: Layer.Layer<LLM.Service>, input: LLM.StreamInput) =>
+  Effect.gen(function* () {
+    const ctx = yield* InstanceRef
+    if (!ctx) return yield* Effect.die("InstanceRef not provided")
+    const result = yield* Effect.promise(() =>
+      Effect.runPromise(
+        LLM.Service.use((svc) => svc.compact(input)).pipe(
+          Effect.provide(layer),
+          Effect.provideService(InstanceRef, ctx),
+        ),
+      ),
+    )
+    return result
+  })
+
 function llmLayerWithExecutor(
   options: {
     executor?: Layer.Layer<RequestExecutor.Service>
     flags?: Partial<RuntimeFlags.Info>
+    auth?: Layer.Layer<Auth.Service>
+    plugin?: Layer.Layer<Plugin.Service>
   } = {},
 ) {
   return AppNodeBuilder.build(LLM.node, [
     [RuntimeFlags.node, RuntimeFlags.layer(options.flags)],
     ...(options.executor ? ([[LayerNodePlatform.requestExecutor, options.executor]] as const) : []),
+    ...(options.auth ? ([[Auth.node, options.auth]] as const) : []),
+    ...(options.plugin ? ([[Plugin.node, options.plugin]] as const) : []),
   ])
 }
 
@@ -184,6 +212,24 @@ describe("session.llm.ai-sdk adapter", () => {
   }
   // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion -- tests defensive adapter branches outside AI SDK's current typed surface
   const uncheckedAdapterEvent = (input: unknown) => input as AISDKAdapterEvent
+  const compactionTerminal = (outcome: Record<string, unknown>, headers?: Record<string, string>, cancel?: () => void) => ({
+    type: "raw",
+    rawValue: {
+      type: "opencode.compaction.terminal",
+      version: 1,
+      ...(headers ? { headers } : {}),
+      ...(cancel ? { cancel } : {}),
+      outcome,
+    },
+  })
+  const collectCompaction = (events: readonly unknown[]) => {
+    const fullStream: AsyncIterable<AISDKAdapterEvent> = {
+      async *[Symbol.asyncIterator]() {
+        for (const event of events) yield uncheckedAdapterEvent(event)
+      },
+    }
+    return LLMAISDK.collectExplicitCompaction({ fullStream })
+  }
 
   test("maps AI SDK stream chunks without losing session-visible fields", async () => {
     const metadata = { openai: { itemID: "item-1" } }
@@ -573,6 +619,275 @@ describe("session.llm.ai-sdk adapter", () => {
       },
     ])
   })
+
+  test("commits explicit compaction only from a completed terminal", async () => {
+    const closed = await collectCompaction([compactionTerminal({ type: "stream-closed" })]).then(
+      () => undefined,
+      (error) => error,
+    )
+    expect(closed).toMatchObject({ _tag: "ExplicitCompactionError", retryable: true })
+
+    await expect(
+      collectCompaction([
+        compactionTerminal({
+          type: "completed",
+          input: [{ role: "user" }, { type: "compaction_trigger" }],
+          output: { type: "compaction", encrypted_content: "opaque-state" },
+        }),
+      ]),
+    ).resolves.toEqual({
+      input: [{ role: "user" }],
+      output: [{ type: "compaction", encrypted_content: "opaque-state" }],
+    })
+  })
+
+  test("rejects explicit compaction failure and protocol terminals", async () => {
+    for (const type of ["failed", "incomplete"] as const) {
+      const error = await collectCompaction([
+        compactionTerminal({ type, cause: { response: {} } }),
+      ]).then(
+        () => undefined,
+        (error) => error,
+      )
+      expect(error).toMatchObject({ _tag: "ExplicitCompactionError", retryable: true })
+    }
+
+    const cardinality = await collectCompaction([
+      compactionTerminal({
+        type: "protocol-error",
+        message: "OpenAI Responses explicit compaction expected exactly one compaction output item, got 2",
+      }),
+    ]).then(
+      () => undefined,
+      (error) => error,
+    )
+    expect(cardinality).toMatchObject({
+      _tag: "ExplicitCompactionError",
+      retryable: false,
+      message: expect.stringContaining("got 2"),
+    })
+
+    const permanent = await collectCompaction([
+      compactionTerminal({
+        type: "failed",
+        cause: { response: { error: { code: "context_length_exceeded", message: "too large" } } },
+      }),
+    ]).then(
+      () => undefined,
+      (error) => error,
+    )
+    expect(permanent).toMatchObject({ _tag: "ExplicitCompactionError", retryable: false })
+  })
+
+  test("ignores unvalidated raw compaction terminal events", async () => {
+    const error = await collectCompaction([
+      { type: "start-step", request: { body: { input: [{ role: "user" }] } } },
+      {
+        type: "raw",
+        rawValue: {
+          type: "response.output_item.done",
+          item: { type: "compaction", encrypted_content: "unvalidated" },
+        },
+      },
+      { type: "raw", rawValue: { type: "response.completed", response: {} } },
+    ]).then(
+      () => undefined,
+      (error) => error,
+    )
+    expect(error).toMatchObject({ _tag: "ExplicitCompactionError", retryable: true })
+  })
+
+  test("treats async iterator transport failures as retryable", async () => {
+    const error = await LLMAISDK.collectExplicitCompaction({
+      fullStream: {
+        async *[Symbol.asyncIterator]() {
+          throw new TypeError("terminated")
+        },
+      },
+    }).then(
+      () => undefined,
+      (error) => error,
+    )
+    expect(error).toMatchObject({ _tag: "ExplicitCompactionError", retryable: true })
+  })
+
+  test("cancels and stops after an AI SDK error event", async () => {
+    let canceled = false
+    const events = [
+      compactionTerminal({ type: "stream-error", cause: { isRetryable: true } }, undefined, () => {
+        canceled = true
+      }),
+    ]
+    const error = await Promise.race([
+      LLMAISDK.collectExplicitCompaction({
+        fullStream: {
+          async *[Symbol.asyncIterator]() {
+            for (const event of events) yield uncheckedAdapterEvent(event)
+            await new Promise<never>(() => {})
+          },
+        },
+      }).then(
+        () => undefined,
+        (error) => error,
+      ),
+      new Promise<"hung">((resolve) => setTimeout(() => resolve("hung"), 200)),
+    ])
+
+    expect(error).not.toBe("hung")
+    expect(error).toMatchObject({ _tag: "ExplicitCompactionError", retryable: true })
+    expect(canceled).toBe(true)
+  })
+
+  test("classifies provider codes consistently for HTTP errors", async () => {
+    for (const [code, retryable] of [
+      ["server_is_overloaded", true],
+      ["slow_down", true],
+      ["invalid_request_error", false],
+      ["internal_error", true],
+    ] as const) {
+      const error = await collectCompaction([
+        {
+          type: "error",
+          error: new APICallError({
+            message: code,
+            url: "https://example.test/v1/responses",
+            requestBodyValues: {},
+            statusCode: 503,
+            data: { error: { code, message: code } },
+          }),
+        },
+      ]).then(
+        () => undefined,
+        (error) => error,
+      )
+      expect(error).toMatchObject({ _tag: "ExplicitCompactionError", retryable })
+    }
+
+    const bodyOnly = await collectCompaction([
+      {
+        type: "error",
+        error: new APICallError({
+          message: "Service Unavailable",
+          url: "https://example.test/v1/responses",
+          requestBodyValues: {},
+          statusCode: 503,
+          responseBody: JSON.stringify({ error: { code: "server_is_overloaded", message: "later" } }),
+        }),
+      },
+    ]).then(
+      () => undefined,
+      (error) => error,
+    )
+    expect(bodyOnly).toMatchObject({ _tag: "ExplicitCompactionError", retryable: true })
+
+    const notFound = await collectCompaction([
+      {
+        type: "error",
+        error: new APICallError({
+          message: "Not Found",
+          url: "https://example.test/v1/responses",
+          requestBodyValues: {},
+          statusCode: 404,
+        }),
+      },
+    ]).then(
+      () => undefined,
+      (error) => error,
+    )
+    expect(notFound).toMatchObject({ _tag: "ExplicitCompactionError", retryable: true })
+  })
+
+  test("retries OpenAI transport errors and captures provider retry delays", async () => {
+    for (const error of [
+      new ProviderError.ResponseStreamError("WebSocket closed before response.completed"),
+      new ProviderError.HeaderTimeoutError(1000),
+    ]) {
+      const result = await collectCompaction([{ type: "error", error }]).then(
+        () => undefined,
+        (error) => error,
+      )
+      expect(result).toMatchObject({ _tag: "ExplicitCompactionError", retryable: true })
+    }
+
+    const rateLimit = await collectCompaction([
+      {
+        type: "error",
+        error: new APICallError({
+          message: "Please try again in 12s",
+          url: "https://example.test/v1/responses",
+          requestBodyValues: {},
+          statusCode: 429,
+          responseHeaders: { "retry-after": "12" },
+          data: { error: { code: "rate_limit_exceeded", message: "Please try again in 12s" } },
+        }),
+      },
+    ]).then(
+      () => undefined,
+      (error) => error,
+    )
+    expect(rateLimit).toMatchObject({
+      _tag: "ExplicitCompactionError",
+      retryable: true,
+      retryAfterMs: 12_000,
+    })
+
+    const streamRateLimit = await collectCompaction([
+      compactionTerminal({
+        type: "failed",
+        cause: {
+          response: {
+            error: { code: "rate_limit_exceeded", message: "Please try again in 28ms" },
+          },
+        },
+      }),
+    ]).then(
+      () => undefined,
+      (error) => error,
+    )
+    expect(streamRateLimit).toMatchObject({
+      _tag: "ExplicitCompactionError",
+      retryable: true,
+      retryAfterMs: 28,
+    })
+  })
+
+  test("does not retry deterministic response.incomplete reasons", async () => {
+    for (const [reason, retryable] of [
+      ["max_output_tokens", false],
+      ["content_filter", false],
+      ["unknown", true],
+    ] as const) {
+      const error = await collectCompaction([
+        compactionTerminal({
+          type: "incomplete",
+          cause: { response: { incomplete_details: { reason } } },
+        }),
+      ]).then(
+        () => undefined,
+        (error) => error,
+      )
+      expect(error).toMatchObject({ _tag: "ExplicitCompactionError", retryable })
+    }
+  })
+
+  test("rejects AI SDK error and abort events during explicit compaction", async () => {
+    for (const event of [
+      { type: "error", error: { isRetryable: true } },
+      { type: "abort", reason: "cancelled" },
+    ]) {
+      const error = await collectCompaction([
+        { type: "raw", rawValue: { type: "opencode.compaction.terminal", version: 1 } },
+        event,
+      ]).then(
+        () => undefined,
+        (error) => error,
+      )
+      expect(error).toMatchObject({
+        _tag: "ExplicitCompactionError",
+        retryable: event.type === "error",
+      })
+    }
+  })
 })
 
 type Capture = {
@@ -601,6 +916,18 @@ function deferred<T>() {
 function waitRequest(pathname: string, response: Response) {
   const pending = deferred<Capture>()
   state.queue.push({ path: pathname, response, resolve: pending.resolve })
+  return pending.promise
+}
+
+function waitTimedRequest(pathname: string, response: Response) {
+  const pending = deferred<{ capture: Capture; time: number }>()
+  state.queue.push({
+    path: pathname,
+    response,
+    resolve(capture) {
+      pending.resolve({ capture, time: performance.now() })
+    },
+  })
   return pending.promise
 }
 
@@ -654,6 +981,188 @@ function waitStreamingRequest(pathname: string) {
     requestAborted: requestAborted.promise,
     responseCanceled: responseCanceled.promise,
   }
+}
+
+function waitCompactionStreamingRequest(pathname: string) {
+  const request = deferred<Capture>()
+  const requestAborted = deferred<void>()
+  const responseCanceled = deferred<void>()
+  const encoder = new TextEncoder()
+
+  state.queue.push({
+    path: pathname,
+    resolve: request.resolve,
+    response(req: Request) {
+      req.signal.addEventListener("abort", () => requestAborted.resolve(), { once: true })
+      return new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(
+              encoder.encode(
+                `data: ${JSON.stringify({
+                  type: "response.output_item.done",
+                  output_index: 0,
+                  item: { type: "compaction", id: "cmp_partial", encrypted_content: "partial-state" },
+                })}\n\n`,
+              ),
+            )
+          },
+          cancel() {
+            responseCanceled.resolve()
+          },
+        }),
+        { status: 200, headers: { "Content-Type": "text/event-stream" } },
+      )
+    },
+  })
+
+  return {
+    request: request.promise,
+    requestAborted: requestAborted.promise,
+    responseCanceled: responseCanceled.promise,
+  }
+}
+
+function waitCompletedCompactionStreamingRequest(pathname: string) {
+  const request = deferred<Capture>()
+  const responseCanceled = deferred<void>()
+  const encoder = new TextEncoder()
+
+  state.queue.push({
+    path: pathname,
+    resolve: request.resolve,
+    response() {
+      return new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(
+              encoder.encode(
+                [
+                  {
+                    type: "response.output_item.done",
+                    output_index: 0,
+                    item: { type: "compaction", id: "cmp_completed", encrypted_content: "completed-state" },
+                  },
+                  {
+                    type: "response.completed",
+                    response: {
+                      incomplete_details: null,
+                      usage: {
+                        input_tokens: 1,
+                        input_tokens_details: null,
+                        output_tokens: 1,
+                        output_tokens_details: null,
+                      },
+                      service_tier: null,
+                    },
+                  },
+                ]
+                  .map((event) => `data: ${JSON.stringify(event)}`)
+                  .join("\n\n") + "\n\n",
+              ),
+            )
+          },
+          cancel() {
+            responseCanceled.resolve()
+          },
+        }),
+        {
+          status: 200,
+          headers: {
+            "Content-Type": "text/event-stream",
+            "x-codex-turn-state": "completed-turn",
+          },
+        },
+      )
+    },
+  })
+
+  return { request: request.promise, responseCanceled: responseCanceled.promise }
+}
+
+function waitFailedCompactionStreamingRequest(pathname: string) {
+  const request = deferred<Capture>()
+  const responseCanceled = deferred<void>()
+  const encoder = new TextEncoder()
+
+  state.queue.push({
+    path: pathname,
+    resolve: request.resolve,
+    response() {
+      return new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(
+              encoder.encode(
+                [
+                  {
+                    type: "response.output_item.done",
+                    output_index: 0,
+                    item: { type: "compaction", id: "cmp_partial", encrypted_content: "partial-state" },
+                  },
+                  {
+                    type: "error",
+                    sequence_number: 1,
+                    code: "invalid_prompt",
+                    message: "invalid compaction input",
+                    param: null,
+                  },
+                ]
+                  .map((event) => `data: ${JSON.stringify(event)}`)
+                  .join("\n\n") + "\n\n",
+              ),
+            )
+          },
+          cancel() {
+            responseCanceled.resolve()
+          },
+        }),
+        { status: 200, headers: { "Content-Type": "text/event-stream" } },
+      )
+    },
+  })
+
+  return { request: request.promise, responseCanceled: responseCanceled.promise }
+}
+
+function waitNullErrorFailedCompactionStreamingRequest(pathname: string) {
+  const request = deferred<Capture>()
+  const responseCanceled = deferred<void>()
+  const encoder = new TextEncoder()
+
+  state.queue.push({
+    path: pathname,
+    resolve: request.resolve,
+    response() {
+      return new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(
+              encoder.encode(
+                `data: ${JSON.stringify({
+                  type: "response.failed",
+                  sequence_number: 1,
+                  response: {
+                    error: null,
+                    incomplete_details: null,
+                    usage: null,
+                    reasoning: null,
+                    service_tier: null,
+                  },
+                })}\n\n`,
+              ),
+            )
+          },
+          cancel() {
+            responseCanceled.resolve()
+          },
+        }),
+        { status: 200, headers: { "Content-Type": "text/event-stream" } },
+      )
+    },
+  })
+
+  return { request: request.promise, responseCanceled: responseCanceled.promise }
 }
 
 beforeAll(() => {
@@ -1396,7 +1905,7 @@ describe("session.llm.stream", () => {
   )
 
   it.instance(
-    "keeps supported OpenAI models on AI SDK path when native flag is off",
+    "keeps supported OpenAI models on AI SDK path and ignores compaction items when the native flag is off",
     () =>
       Effect.gen(function* () {
         const model = loadFixture("openai", "gpt-5.2").model
@@ -1432,6 +1941,11 @@ describe("session.llm.stream", () => {
                 logprobs: null,
               },
               {
+                type: "response.output_item.done",
+                output_index: 1,
+                item: { type: "compaction", id: "cmp-ignored", encrypted_content: "ignored-state" },
+              },
+              {
                 type: "response.completed",
                 response: {
                   incomplete_details: null,
@@ -1452,8 +1966,6 @@ describe("session.llm.stream", () => {
           LLMClient.Service,
           LLMClient.Service.of({
             prepare: () => Effect.die(new Error("native LLM client should not be used when the flag is off")),
-            compact: () => Effect.die(new Error("native LLM client should not be used when the flag is off")),
-            compactWithInput: () => Effect.die(new Error("native LLM client should not be used when the flag is off")),
             stream: () => Stream.die(new Error("native LLM client should not be used when the flag is off")),
             generate: () => Effect.die(new Error("native LLM client should not be used when the flag is off")),
           }),
@@ -1495,13 +2007,14 @@ describe("session.llm.stream", () => {
         const capture = yield* Effect.promise(() => request)
         expect(capture.url.pathname.endsWith("/responses")).toBe(true)
         expect(capture.headers.get("x-codex-turn-state")).toBe("turn-1")
+        expect(capture.headers.get("x-codex-beta-features")).toBe("remote_compaction_v2")
         expect(capture.body.model).toBe(resolved.api.id)
       }),
     { config: () => openAIConfig(loadFixture("openai", "gpt-5.2").model, `${state.server!.url.origin}/v1`) },
   )
 
   it.instance(
-    "forces native OpenAI replay when a native compaction window is present",
+    "replays an OpenAI compaction window through the AI SDK",
     () =>
       Effect.gen(function* () {
         const model = loadFixture("openai", "gpt-5.2").model
@@ -1561,9 +2074,742 @@ describe("session.llm.stream", () => {
 
         const capture = yield* Effect.promise(() => request)
         const input = capture.body.input as Array<Record<string, unknown>>
-        expect(input[0]).toMatchObject({ role: "system" })
-        expect(input[1]).toEqual({ type: "compaction", encrypted_content: "opaque-window" })
-        expect(input[2]).toMatchObject({ role: "user" })
+        expect(capture.body.instructions).toContain("System baseline")
+        expect(input[0]).toEqual({ type: "compaction", encrypted_content: "opaque-window" })
+        expect(input[1]).toMatchObject({ role: "user" })
+        expect(capture.headers.get("x-codex-beta-features")).toBe("remote_compaction_v2")
+      }),
+    { config: () => openAIConfig(loadFixture("openai", "gpt-5.2").model, `${state.server!.url.origin}/v1`) },
+  )
+
+  it.instance(
+    "replays an OpenAI compaction window with no OAuth messages",
+    () =>
+      Effect.gen(function* () {
+        const model = loadFixture("openai", "gpt-5.2").model
+        const request = waitRequest(
+          "/responses",
+          createEventResponse(
+            [
+              {
+                type: "response.completed",
+                response: {
+                  incomplete_details: null,
+                  usage: {
+                    input_tokens: 1,
+                    input_tokens_details: null,
+                    output_tokens: 1,
+                    output_tokens_details: null,
+                  },
+                  service_tier: null,
+                },
+              },
+            ],
+            true,
+          ),
+        )
+        const oauth = {
+          type: "oauth",
+          refresh: "test-refresh",
+          access: "test-access",
+          expires: Date.now() + 60_000,
+          accountId: "test-account",
+        } satisfies Auth.Info
+        const resolved = yield* Provider.use.getModel(ProviderV2.ID.openai, ModelV2.ID.make(model.id))
+        const sessionID = SessionID.make("session-test-native-replay-oauth-empty")
+        const agent = {
+          name: "test",
+          mode: "primary",
+          options: {},
+          permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        } satisfies Agent.Info
+
+        yield* drainWith(
+          llmLayerWithExecutor({
+            executor: RequestExecutor.fetchLayer,
+            flags: { experimentalNativeLlm: false },
+            auth: Layer.mock(Auth.Service)({
+              get: (providerID) => Effect.succeed(providerID === "openai" ? oauth : undefined),
+              all: () => Effect.succeed({ openai: oauth }),
+            }),
+            plugin: Layer.mock(Plugin.Service)({
+              trigger: (_name, _input, output) => Effect.succeed(output),
+              list: () => Effect.succeed([]),
+              init: () => Effect.void,
+            }),
+          }),
+          {
+            user: {
+              id: MessageID.make("msg_user-native-replay-oauth-empty"),
+              sessionID,
+              role: "user",
+              time: { created: Date.now() },
+              agent: agent.name,
+              model: { providerID: ProviderV2.ID.openai, modelID: resolved.id },
+            } satisfies SessionV1.User,
+            sessionID,
+            model: resolved,
+            agent,
+            system: ["System baseline"],
+            messages: [],
+            tools: {},
+            nativeCompactionWindow: {
+              version: 2,
+              output: [
+                { role: "user", content: [{ type: "input_text", text: "Before overflow" }] },
+                { type: "compaction", encrypted_content: "opaque-window" },
+              ],
+              compactOutput: [{ type: "compaction", encrypted_content: "opaque-window" }],
+            },
+          },
+        )
+
+        const capture = yield* Effect.promise(() => request)
+        expect(capture.body.instructions).toContain("System baseline")
+        expect(capture.body.input).toEqual([
+          { role: "user", content: [{ type: "input_text", text: "Before overflow" }] },
+          { type: "compaction", encrypted_content: "opaque-window" },
+        ])
+      }),
+    { config: () => openAIConfig(loadFixture("openai", "gpt-5.2").model, `${state.server!.url.origin}/v1`) },
+  )
+
+  it.instance(
+    "uses the OpenAI Responses compaction trigger through the AI SDK",
+    () =>
+      Effect.gen(function* () {
+        const model = loadFixture("openai", "gpt-5.2").model
+        const request = waitRequest(
+          "/responses",
+          createEventResponse(
+            [
+              {
+                type: "response.metadata",
+                headers: { "x-codex-turn-state": "compact-turn" },
+              },
+              {
+                type: "response.output_item.done",
+                item: { type: "compaction", id: "cmp_1", encrypted_content: "opaque-state" },
+              },
+              {
+                type: "response.completed",
+                response: { id: "resp_compact" },
+              },
+            ],
+            true,
+          ),
+        )
+        const resolved = yield* Provider.use.getModel(ProviderV2.ID.openai, ModelV2.ID.make(model.id))
+        const sessionID = SessionID.make("session-test-explicit-compaction")
+        const agent = {
+          name: "test",
+          mode: "primary",
+          prompt: "Hidden summary prompt must not be sent to explicit compaction",
+          options: { instructions: "Legacy summary option must not be sent to explicit compaction" },
+          permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        } satisfies Agent.Info
+        const turnState: { value?: string } = {}
+
+        const result = yield* compactWith(
+          llmLayerWithExecutor({ executor: RequestExecutor.fetchLayer, flags: { experimentalNativeLlm: false } }),
+          {
+            user: {
+              id: MessageID.make("msg_user-explicit-compaction"),
+              sessionID,
+              role: "user",
+              time: { created: Date.now() },
+              agent: agent.name,
+              model: { providerID: ProviderV2.ID.make("openai"), modelID: resolved.id },
+            } satisfies SessionV1.User,
+            sessionID,
+            model: resolved,
+            agent,
+            system: ["System baseline"],
+            messages: [{ role: "user", content: "Before compaction" }],
+            tools: {},
+            turnState,
+          },
+        )
+
+        const capture = yield* Effect.promise(() => request)
+        const input = capture.body.input as Array<Record<string, unknown>>
+        expect(capture.body.instructions).toBeUndefined()
+        expect(JSON.stringify(capture.body)).not.toContain("Hidden summary prompt")
+        expect(JSON.stringify(capture.body)).not.toContain("Legacy summary option")
+        expect(JSON.stringify(capture.body)).not.toContain("System baseline")
+        expect(capture.body.store).toBe(false)
+        expect(capture.headers.get("x-codex-beta-features")).toBe("existing,remote_compaction_v2")
+        expect(input.at(-1)).toEqual({ type: "compaction_trigger" })
+        expect(input.filter((item) => item.type === "compaction_trigger")).toHaveLength(1)
+        expect(result).toEqual({
+          output: [{ type: "compaction", id: "cmp_1", encrypted_content: "opaque-state" }],
+          input: input.slice(0, -1),
+          providerMetadata: { openai: { headers: { "x-codex-turn-state": "compact-turn" } } },
+        })
+        expect(turnState.value).toBe("compact-turn")
+      }),
+    {
+      config: () =>
+        openAIConfig(loadFixture("openai", "gpt-5.2").model, `${state.server!.url.origin}/v1`, {
+          "X-Codex-Beta-Features": "existing",
+        }),
+    },
+  )
+
+  it.instance(
+    "retries explicit compaction after EOF and reuses captured turn state",
+    () =>
+      Effect.gen(function* () {
+        const model = loadFixture("openai", "gpt-5.2").model
+        const first = waitRequest(
+          "/responses",
+          createEventResponse(
+            [
+              { type: "response.metadata", headers: { "x-codex-turn-state": "retry-turn" } },
+              {
+                type: "response.output_item.done",
+                output_index: 0,
+                item: { type: "compaction", id: "cmp_partial", encrypted_content: "partial-state" },
+              },
+            ],
+          ),
+        )
+        const second = waitRequest(
+          "/responses",
+          createEventResponse(
+            [
+              {
+                type: "response.output_item.done",
+                output_index: 0,
+                item: { type: "compaction", id: "cmp_retry", encrypted_content: "retry-state" },
+              },
+              {
+                type: "response.completed",
+                response: {
+                  incomplete_details: null,
+                  usage: {
+                    input_tokens: 1,
+                    input_tokens_details: null,
+                    output_tokens: 1,
+                    output_tokens_details: null,
+                  },
+                  service_tier: null,
+                },
+              },
+            ],
+            true,
+          ),
+        )
+        const resolved = yield* Provider.use.getModel(ProviderV2.ID.openai, ModelV2.ID.make(model.id))
+        const sessionID = SessionID.make("session-test-explicit-compaction-retry")
+        const agent = {
+          name: "test",
+          mode: "primary",
+          options: {},
+          permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        } satisfies Agent.Info
+        const turnState: { value?: string } = {}
+
+        const result = yield* compactWith(
+          llmLayerWithExecutor({ executor: RequestExecutor.fetchLayer, flags: { experimentalNativeLlm: false } }),
+          {
+            user: {
+              id: MessageID.make("msg_user-explicit-compaction-retry"),
+              sessionID,
+              role: "user",
+              time: { created: Date.now() },
+              agent: agent.name,
+              model: { providerID: ProviderV2.ID.make("openai"), modelID: resolved.id },
+            } satisfies SessionV1.User,
+            sessionID,
+            model: resolved,
+            agent,
+            system: ["System baseline"],
+            messages: [{ role: "user", content: "Before compaction" }],
+            tools: {},
+            turnState,
+          },
+        )
+
+        const captures = yield* Effect.promise(() => Promise.all([first, second]))
+        expect(captures[0].headers.get("x-codex-turn-state")).toBeNull()
+        expect(captures[1].headers.get("x-codex-turn-state")).toBe("retry-turn")
+        expect(captures[1].headers.get("x-codex-beta-features")).toBe("remote_compaction_v2")
+        expect(result.output).toEqual([{ type: "compaction", id: "cmp_retry", encrypted_content: "retry-state" }])
+        expect(turnState.value).toBe("retry-turn")
+      }),
+    { config: () => openAIConfig(loadFixture("openai", "gpt-5.2").model, `${state.server!.url.origin}/v1`) },
+  )
+
+  it.instance(
+    "retries minimal response.incomplete and response.failed terminal events",
+    () =>
+      Effect.gen(function* () {
+        const model = loadFixture("openai", "gpt-5.2").model
+        const first = waitRequest(
+          "/responses",
+          createEventResponse(
+            [
+              {
+                type: "response.output_item.done",
+                output_index: 0,
+                item: { type: "compaction", id: "cmp_partial", encrypted_content: "partial-state" },
+              },
+              {
+                type: "response.incomplete",
+                response: { id: "resp_incomplete" },
+              },
+            ],
+            true,
+          ),
+        )
+        const second = waitRequest(
+          "/responses",
+          createEventResponse(
+            [
+              {
+                type: "response.output_item.done",
+                output_index: 0,
+                item: { type: "compaction", id: "cmp_partial_failed", encrypted_content: "partial-failed-state" },
+              },
+              {
+                type: "response.failed",
+                response: {
+                  id: "resp_failed",
+                  error: { code: "rate_limit_exceeded", message: "retry later" },
+                },
+              },
+            ],
+            true,
+          ),
+        )
+        const third = waitRequest(
+          "/responses",
+          createEventResponse(
+            [
+              {
+                type: "response.output_item.done",
+                output_index: 0,
+                item: { type: "compaction", id: "cmp_retry", encrypted_content: "retry-state" },
+              },
+              {
+                type: "response.completed",
+                response: { id: "resp_completed" },
+              },
+            ],
+            true,
+          ),
+        )
+        const resolved = yield* Provider.use.getModel(ProviderV2.ID.openai, ModelV2.ID.make(model.id))
+        const sessionID = SessionID.make("session-test-explicit-compaction-failed-retry")
+        const agent = {
+          name: "test",
+          mode: "primary",
+          options: {},
+          permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        } satisfies Agent.Info
+
+        const result = yield* compactWith(
+          llmLayerWithExecutor({ executor: RequestExecutor.fetchLayer, flags: { experimentalNativeLlm: false } }),
+          {
+            user: {
+              id: MessageID.make("msg_user-explicit-compaction-failed-retry"),
+              sessionID,
+              role: "user",
+              time: { created: Date.now() },
+              agent: agent.name,
+              model: { providerID: ProviderV2.ID.make("openai"), modelID: resolved.id },
+            } satisfies SessionV1.User,
+            sessionID,
+            model: resolved,
+            agent,
+            system: ["System baseline"],
+            messages: [{ role: "user", content: "Before compaction" }],
+            tools: {},
+          },
+        )
+
+        yield* Effect.promise(() => Promise.all([first, second, third]))
+        expect(result.output).toEqual([{ type: "compaction", id: "cmp_retry", encrypted_content: "retry-state" }])
+      }),
+    { config: () => openAIConfig(loadFixture("openai", "gpt-5.2").model, `${state.server!.url.origin}/v1`) },
+  )
+
+  it.instance(
+    "retries and cancels response.failed when the response error is null",
+    () =>
+      Effect.gen(function* () {
+        const model = loadFixture("openai", "gpt-5.2").model
+        const first = waitNullErrorFailedCompactionStreamingRequest("/responses")
+        const second = waitRequest(
+          "/responses",
+          createEventResponse(
+            [
+              {
+                type: "response.output_item.done",
+                output_index: 0,
+                item: { type: "compaction", id: "cmp_retry", encrypted_content: "retry-state" },
+              },
+              {
+                type: "response.completed",
+                response: {
+                  incomplete_details: null,
+                  usage: {
+                    input_tokens: 1,
+                    input_tokens_details: null,
+                    output_tokens: 1,
+                    output_tokens_details: null,
+                  },
+                  service_tier: null,
+                },
+              },
+            ],
+            true,
+          ),
+        )
+        const resolved = yield* Provider.use.getModel(ProviderV2.ID.openai, ModelV2.ID.make(model.id))
+        const sessionID = SessionID.make("session-test-explicit-compaction-null-error-retry")
+        const agent = {
+          name: "test",
+          mode: "primary",
+          options: {},
+          permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        } satisfies Agent.Info
+
+        const result = yield* compactWith(
+          llmLayerWithExecutor({ executor: RequestExecutor.fetchLayer, flags: { experimentalNativeLlm: false } }),
+          {
+            user: {
+              id: MessageID.make("msg_user-explicit-compaction-null-error-retry"),
+              sessionID,
+              role: "user",
+              time: { created: Date.now() },
+              agent: agent.name,
+              model: { providerID: ProviderV2.ID.make("openai"), modelID: resolved.id },
+            } satisfies SessionV1.User,
+            sessionID,
+            model: resolved,
+            agent,
+            system: ["System baseline"],
+            messages: [{ role: "user", content: "Before compaction" }],
+            tools: {},
+          },
+        )
+
+        yield* Effect.promise(() => Promise.all([first.request, second]))
+        yield* Effect.promise(() => Promise.race([first.responseCanceled, timeout(500)]))
+        expect(result.output).toEqual([{ type: "compaction", id: "cmp_retry", encrypted_content: "retry-state" }])
+      }),
+    { config: () => openAIConfig(loadFixture("openai", "gpt-5.2").model, `${state.server!.url.origin}/v1`) },
+  )
+
+  it.instance(
+    "does not retry a minimal response.failed with a permanent error code",
+    () =>
+      Effect.gen(function* () {
+        const model = loadFixture("openai", "gpt-5.2").model
+        const first = waitRequest(
+          "/responses",
+          createEventResponse(
+            [
+              {
+                type: "response.failed",
+                response: { id: "resp_failed", error: { code: "context_length_exceeded" } },
+              },
+            ],
+            true,
+          ),
+        )
+        waitRequest(
+          "/responses",
+          createEventResponse(
+            [
+              {
+                type: "response.output_item.done",
+                item: { type: "compaction", id: "cmp_unexpected", encrypted_content: "unexpected-state" },
+              },
+              { type: "response.completed", response: { id: "resp_unexpected" } },
+            ],
+            true,
+          ),
+        )
+        const resolved = yield* Provider.use.getModel(ProviderV2.ID.openai, ModelV2.ID.make(model.id))
+        const sessionID = SessionID.make("session-test-explicit-compaction-code-only-failure")
+        const agent = {
+          name: "test",
+          mode: "primary",
+          options: {},
+          permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        } satisfies Agent.Info
+
+        const exit = yield* compactWith(
+          llmLayerWithExecutor({ executor: RequestExecutor.fetchLayer, flags: { experimentalNativeLlm: false } }),
+          {
+            user: {
+              id: MessageID.make("msg_user-explicit-compaction-code-only-failure"),
+              sessionID,
+              role: "user",
+              time: { created: Date.now() },
+              agent: agent.name,
+              model: { providerID: ProviderV2.ID.make("openai"), modelID: resolved.id },
+            } satisfies SessionV1.User,
+            sessionID,
+            model: resolved,
+            agent,
+            system: [],
+            messages: [{ role: "user", content: "Before compaction" }],
+            tools: {},
+          },
+        ).pipe(Effect.exit)
+
+        yield* Effect.promise(() => first)
+        expect(Exit.isFailure(exit)).toBe(true)
+        if (Exit.isFailure(exit))
+          expect(Cause.squash(exit.cause)).toMatchObject({
+            _tag: "ExplicitCompactionError",
+            retryable: false,
+          })
+        expect(state.queue).toHaveLength(1)
+      }),
+    { config: () => openAIConfig(loadFixture("openai", "gpt-5.2").model, `${state.server!.url.origin}/v1`) },
+  )
+
+  it.instance(
+    "retries OpenAI 404 and honors the provider retry delay",
+    () =>
+      Effect.gen(function* () {
+        const model = loadFixture("openai", "gpt-5.2").model
+        const first = waitTimedRequest(
+          "/responses",
+          new Response(
+            JSON.stringify({
+              error: {
+                message: "Model temporarily unavailable",
+                type: "not_found_error",
+                param: null,
+                code: "model_not_found",
+              },
+            }),
+            { status: 404, headers: { "Content-Type": "application/json" } },
+          ),
+        )
+        const second = waitTimedRequest(
+          "/responses",
+          new Response(
+            JSON.stringify({
+              error: {
+                message: "Please try again later",
+                type: "rate_limit_error",
+                param: null,
+                code: "rate_limit_exceeded",
+              },
+            }),
+            {
+              status: 429,
+              headers: { "Content-Type": "application/json", "retry-after-ms": "120" },
+            },
+          ),
+        )
+        const third = waitTimedRequest(
+          "/responses",
+          createEventResponse(
+            [
+              {
+                type: "response.output_item.done",
+                item: { type: "compaction", id: "cmp_retry", encrypted_content: "retry-state" },
+              },
+              {
+                type: "response.completed",
+                response: {
+                  incomplete_details: null,
+                  usage: {
+                    input_tokens: 1,
+                    input_tokens_details: null,
+                    output_tokens: 1,
+                    output_tokens_details: null,
+                  },
+                  service_tier: null,
+                },
+              },
+            ],
+            true,
+          ),
+        )
+        const resolved = yield* Provider.use.getModel(ProviderV2.ID.openai, ModelV2.ID.make(model.id))
+        const sessionID = SessionID.make("session-test-explicit-compaction-retry-delay")
+        const agent = {
+          name: "test",
+          mode: "primary",
+          options: {},
+          permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        } satisfies Agent.Info
+
+        const result = yield* compactWith(
+          llmLayerWithExecutor({ executor: RequestExecutor.fetchLayer, flags: { experimentalNativeLlm: false } }),
+          {
+            user: {
+              id: MessageID.make("msg_user-explicit-compaction-retry-delay"),
+              sessionID,
+              role: "user",
+              time: { created: Date.now() },
+              agent: agent.name,
+              model: { providerID: ProviderV2.ID.make("openai"), modelID: resolved.id },
+            } satisfies SessionV1.User,
+            sessionID,
+            model: resolved,
+            agent,
+            system: ["System baseline"],
+            messages: [{ role: "user", content: "Before compaction" }],
+            tools: {},
+          },
+        )
+
+        const requests = yield* Effect.promise(() => Promise.all([first, second, third]))
+        expect(requests[1].time - requests[0].time).toBeGreaterThanOrEqual(180)
+        expect(requests[2].time - requests[1].time).toBeGreaterThanOrEqual(100)
+        expect(result.output).toEqual([{ type: "compaction", id: "cmp_retry", encrypted_content: "retry-state" }])
+      }),
+    { config: () => openAIConfig(loadFixture("openai", "gpt-5.2").model, `${state.server!.url.origin}/v1`) },
+  )
+
+  it.instance(
+    "aborts the explicit compaction request when interrupted",
+    () =>
+      Effect.gen(function* () {
+        const model = loadFixture("openai", "gpt-5.2").model
+        const pending = waitCompactionStreamingRequest("/responses")
+        const resolved = yield* Provider.use.getModel(ProviderV2.ID.openai, ModelV2.ID.make(model.id))
+        const sessionID = SessionID.make("session-test-explicit-compaction-abort")
+        const agent = {
+          name: "test",
+          mode: "primary",
+          options: {},
+          permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        } satisfies Agent.Info
+
+        const ctx = yield* InstanceRef
+        if (!ctx) return yield* Effect.die("InstanceRef not provided")
+        const fiber = yield* LLM.Service.use((svc) =>
+          svc.compact({
+            user: {
+              id: MessageID.make("msg_user-explicit-compaction-abort"),
+              sessionID,
+              role: "user",
+              time: { created: Date.now() },
+              agent: agent.name,
+              model: { providerID: ProviderV2.ID.make("openai"), modelID: resolved.id },
+            } satisfies SessionV1.User,
+            sessionID,
+            model: resolved,
+            agent,
+            system: ["System baseline"],
+            messages: [{ role: "user", content: "Before compaction" }],
+            tools: {},
+          }),
+        ).pipe(
+          Effect.provide(
+            llmLayerWithExecutor({ executor: RequestExecutor.fetchLayer, flags: { experimentalNativeLlm: false } }),
+          ),
+          Effect.provideService(InstanceRef, ctx),
+          Effect.forkScoped,
+        )
+
+        yield* Effect.promise(() => pending.request)
+        yield* Fiber.interrupt(fiber)
+        yield* Effect.promise(() => Promise.race([pending.responseCanceled, timeout(500)]))
+        yield* Effect.promise(() => Promise.race([pending.requestAborted, timeout(500)]).catch(() => undefined))
+      }),
+    { config: () => openAIConfig(loadFixture("openai", "gpt-5.2").model, `${state.server!.url.origin}/v1`) },
+  )
+
+  it.instance(
+    "returns and cancels the stream immediately after validated response.completed",
+    () =>
+      Effect.gen(function* () {
+        const model = loadFixture("openai", "gpt-5.2").model
+        const pending = waitCompletedCompactionStreamingRequest("/responses")
+        const resolved = yield* Provider.use.getModel(ProviderV2.ID.openai, ModelV2.ID.make(model.id))
+        const sessionID = SessionID.make("session-test-explicit-compaction-completed-stream")
+        const agent = {
+          name: "test",
+          mode: "primary",
+          options: {},
+          permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        } satisfies Agent.Info
+        const turnState: { value?: string } = {}
+
+        const result = yield* compactWith(
+          llmLayerWithExecutor({ executor: RequestExecutor.fetchLayer, flags: { experimentalNativeLlm: false } }),
+          {
+            user: {
+              id: MessageID.make("msg_user-explicit-compaction-completed-stream"),
+              sessionID,
+              role: "user",
+              time: { created: Date.now() },
+              agent: agent.name,
+              model: { providerID: ProviderV2.ID.make("openai"), modelID: resolved.id },
+            } satisfies SessionV1.User,
+            sessionID,
+            model: resolved,
+            agent,
+            system: ["System baseline"],
+            messages: [{ role: "user", content: "Before compaction" }],
+            tools: {},
+            turnState,
+          },
+        )
+
+        yield* Effect.promise(() => pending.request)
+        yield* Effect.promise(() => Promise.race([pending.responseCanceled, timeout(500)]))
+        expect(result.output).toEqual([
+          { type: "compaction", id: "cmp_completed", encrypted_content: "completed-state" },
+        ])
+        expect(result.providerMetadata).toMatchObject({
+          openai: { headers: { "x-codex-turn-state": "completed-turn" } },
+        })
+        expect(turnState.value).toBe("completed-turn")
+      }),
+    { config: () => openAIConfig(loadFixture("openai", "gpt-5.2").model, `${state.server!.url.origin}/v1`) },
+  )
+
+  it.instance(
+    "cancels an open compaction stream after a non-retryable error event",
+    () =>
+      Effect.gen(function* () {
+        const model = loadFixture("openai", "gpt-5.2").model
+        const pending = waitFailedCompactionStreamingRequest("/responses")
+        const resolved = yield* Provider.use.getModel(ProviderV2.ID.openai, ModelV2.ID.make(model.id))
+        const sessionID = SessionID.make("session-test-explicit-compaction-error-stream")
+        const agent = {
+          name: "test",
+          mode: "primary",
+          options: {},
+          permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        } satisfies Agent.Info
+
+        const exit = yield* compactWith(
+          llmLayerWithExecutor({ executor: RequestExecutor.fetchLayer, flags: { experimentalNativeLlm: false } }),
+          {
+            user: {
+              id: MessageID.make("msg_user-explicit-compaction-error-stream"),
+              sessionID,
+              role: "user",
+              time: { created: Date.now() },
+              agent: agent.name,
+              model: { providerID: ProviderV2.ID.make("openai"), modelID: resolved.id },
+            } satisfies SessionV1.User,
+            sessionID,
+            model: resolved,
+            agent,
+            system: ["System baseline"],
+            messages: [{ role: "user", content: "Before compaction" }],
+            tools: {},
+          },
+        ).pipe(Effect.exit)
+
+        yield* Effect.promise(() => pending.request)
+        yield* Effect.promise(() => Promise.race([pending.responseCanceled, timeout(500)]))
+        expect(Exit.isFailure(exit)).toBe(true)
       }),
     { config: () => openAIConfig(loadFixture("openai", "gpt-5.2").model, `${state.server!.url.origin}/v1`) },
   )
@@ -1625,6 +2871,7 @@ describe("session.llm.stream", () => {
         const capture = yield* Effect.promise(() => request)
         expect(capture.url.pathname.endsWith("/responses")).toBe(true)
         expect(capture.headers.get("Authorization")).toBe("Bearer test-openai-key")
+        expect(capture.headers.get("x-codex-beta-features")).toBe("remote_compaction_v2")
         expect(capture.body.model).toBe(model.id)
         expect(capture.body.stream).toBe(true)
         expect((capture.body.reasoning as { effort?: string } | undefined)?.effort).toBe("high")

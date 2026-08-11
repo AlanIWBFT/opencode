@@ -1,4 +1,8 @@
-# OpenAI Native Codex-Parity Compaction Implementation Plan
+# OpenAI Explicit Compaction Design And Implementation Notes
+
+> The explicit compaction request is implemented in the OpenAI AI SDK adapter.
+> The old native `@opencode-ai/llm` compact route was intentionally removed;
+> the session checkpoint and replay semantics described here remain active.
 
 ## Goal
 
@@ -14,10 +18,11 @@ The target behavior is:
 
 ## Current State
 
-opencode already has the transport pieces for Codex-style native compaction:
+opencode now has the following pieces for Codex-style explicit compaction:
 
-- `packages/llm/src/protocols/openai-responses-compact.ts` sends compact requests to `/responses`, forces `store: false`, enables streaming, and appends a unique `{ type: "compaction_trigger" }` item.
-- `packages/llm/src/protocols/openai-responses.ts` accepts replay input through `providerOptions.openai.responsesReplayInput` and prepends that replay input before lowered session messages.
+- The patched `@ai-sdk/openai` provider sends explicit compaction through ordinary `/responses`, forces `store: false`, enables streaming, and appends a unique `{ type: "compaction_trigger" }` item.
+- `packages/opencode/src/session/llm/ai-sdk.ts` owns the private terminal envelope and returns the normalized request input plus the opaque output item.
+- `packages/opencode/src/session/llm.ts` passes replay input through the AI SDK provider options rather than through the native LLM route.
 - `packages/opencode/src/session/openai-native-compaction.ts` stores encrypted compaction output in checkpoint metadata.
 - `packages/opencode/src/session/compaction.ts` skips synthetic auto-continue prompts for native compaction.
 - `packages/opencode/src/session/prompt.ts` can resume after an auto native checkpoint with no retained tail by using an old user only as execution metadata.
@@ -107,7 +112,7 @@ const Window = Schema.Struct({
 
 Field semantics:
 
-- `output` is the provider replay window to pass as `responsesReplayInput`.
+- `output` is the provider replay window passed through the OpenAI AI SDK adapter.
 - `compactOutput` is the raw compact response output for diagnostics. It is optional because `output` is enough to replay.
 - Version `1` means legacy metadata where `output` is raw compact output, usually just `[compaction]`.
 - Version `2` means `output` is already Codex-style replacement replay history.
@@ -119,61 +124,35 @@ Compatibility rules:
 - If a v1 checkpoint has retained tail, synthesize using the durable messages before the marker and the legacy compaction item.
 - If synthesis cannot find a real user for an auto no-tail checkpoint, keep existing safe behavior: log and stop instead of creating a synthetic user prompt.
 
-## LLM Package Work
+## LLM Package Boundary
 
-### 1. Expose compact request input
+The low-level `@opencode-ai/llm` package remains responsible for ordinary
+OpenAI Responses parsing and native LLM streaming. It does not own explicit
+compaction. The old `openai-responses-compact` protocol, `LLMClient.compact`,
+and `LLMClient.compactWithInput` APIs were removed because they duplicated the
+AI SDK provider path without serving another runtime.
 
-The session layer needs to build Codex replacement history from the actual compact request input after protocol lowering and provider transforms. Avoid duplicating provider wire lowering in session code.
-
-Add an LLM compact result shape that includes the normalized compact request input:
+The session-owned AI SDK adapter now exposes the narrow result needed by
+checkpoint installation:
 
 ```ts
-type OpenAIResponsesCompactResult = {
-  readonly output: readonly OutputItem[]
+type ExplicitCompactionResult = {
+  readonly output: readonly Record<string, unknown>[]
   readonly input: readonly unknown[]
+  readonly providerMetadata?: ProviderMetadata
 }
 ```
 
-Implementation notes:
+`collectExplicitCompaction(...)` validates the private terminal envelope,
+returns the request input without the trigger, captures turn state, and maps
+failed, incomplete, aborted, and prematurely closed streams into the session
+retry policy. Ordinary Responses streams continue to ignore unexpected
+server-sent compaction items.
 
-- In `packages/llm/src/protocols/openai-responses-compact.ts`, `compactRequestBody(...)` already constructs the compact body with the final trigger.
-- Return the compact response output and the body input before sending, or return the input with the trailing `compaction_trigger` removed.
-- Prefer returning `inputWithoutTrigger`, because Codex replacement history is based on `prompt_input`, not `prompt_input + compaction_trigger`.
-- Keep existing `LLMClient.compact(request)` API stable if public callers expect only output. Add a narrow internal API only if changing the return type would ripple too far.
-
-Possible approaches:
-
-- Add `LLMClient.compactWithInput(request)` for opencode native compaction.
-- Or change `LLMClient.compact` return type and adapt all callsites in one commit if it is only used internally.
-- Or add `metadata` to the existing compact output result if the route client already has a generic response envelope.
-
-### 2. Preserve replay item decoding
-
-Ensure `packages/llm/src/protocols/openai-responses.ts` continues to accept these replay input item types:
-
-- `{ role: "user", content: [...] }`
-- `{ role: "system", content: string }`
-- `{ role: "assistant", content: [...] }`
-- `{ type: "compaction", encrypted_content: string, id?: string, ... }`
-- `{ type: "function_call" | "function_call_output" }` only if we intentionally retain them later.
-
-Do not include `compaction_trigger` in normal replay windows. It belongs only to compact requests.
-
-### 3. Turn-state parity
-
-Codex reuses turn-state headers for ChatGPT/OAuth Responses flows:
-
-- Initial sampling mints turn state.
-- RemoteCompactionV2 compact request replays that same state.
-- Post-compact continuation also replays that same state.
-
-If exact Codex parity includes ChatGPT/OAuth transport behavior, add a scoped turn-state holder to the native OpenAI runtime:
-
-- Capture response metadata/header state from `LLMClient.stream`.
-- Pass it into `LLMClient.compactWithInput`.
-- Preserve the first state value across compact and continuation requests.
-
-This should be a separate phase if the current `@opencode-ai/llm` route stack does not expose provider response metadata yet.
+Turn-state headers are owned by the session LLM service for both ordinary
+OpenAI requests and explicit compaction requests. The native runtime continues
+to support ordinary opt-in streaming and tool dispatch, but no longer carries
+checkpoint replay or compaction transport state.
 
 ## Session Work
 
@@ -262,7 +241,7 @@ Preserve opencode's existing `tail_start_id` semantics:
 
 - The replacement window represents compacted head.
 - Messages at or after `tail_start_id` remain as normal session messages.
-- Native replay input is `replacement window + lowered tail messages` because `openai-responses.ts` prepends replay input before normal lowered messages.
+- Replay input is `replacement window + lowered tail messages`; the patched OpenAI AI SDK provider places the replay window before the ordinary session messages.
 - Do not include tail messages in `replacement window`, or they will be duplicated.
 
 ### 6. Manual compaction behavior
@@ -285,28 +264,19 @@ opencode does not store canonical context as raw `ResponseItem`s in the same way
 
 - Rely on `LLMRequestPrep.prepare` to inject current system/context before replay input.
 - Do not store opencode system/context in the native replay window initially.
-- If OpenAI behavior requires the compaction item to be physically last for mid-turn continuation, add a phase-aware option in `openai-responses.ts` to place `responsesReplayInput` after system but before or after specific context messages. Do this only with a failing test or live provider evidence.
+- If OpenAI behavior requires the compaction item to be physically last for mid-turn continuation, add a phase-aware option to the patched AI SDK provider. Do this only with a failing test or live provider evidence.
 
 ## Tests
 
-### LLM package tests
+### LLM and adapter tests
 
-Update `packages/llm/test/provider/openai-responses.test.ts`:
-
-- Compact request still goes to `/responses`.
-- Compact request input ends with exactly one `compaction_trigger`.
-- `compactWithInput` returns compact input without the trigger.
-- Prior `responsesReplayInput` appears before current compact messages and before the final trigger.
-- Normal stream requests never include `compaction_trigger` unless explicitly passed as replay input for a compact request.
-- Stream compact response must include `response.completed` and exactly one compaction item.
-
-### Native runtime tests
-
-Update `packages/opencode/test/session/llm-native.test.ts`:
-
-- Native compact returns both raw output and compact input.
-- Native compact with prior compaction window includes prior replay input, current compact messages, then trigger.
-- Native compact exposes compact input in the exact order sent to OpenAI, excluding the final trigger if that is the chosen API.
+`packages/llm/test/provider/openai-responses.test.ts` covers ordinary
+Responses lowering, stream parsing, and ignoring unexpected server compaction
+items. `packages/opencode/test/session/llm.test.ts` covers the AI SDK explicit
+compaction trigger, private terminal envelope, replay input, retries, and turn
+state. `packages/opencode/test/session/llm-native.test.ts` covers only the
+ordinary opt-in native stream and tool bridge; it intentionally has no compact
+transport tests.
 
 ### Session compaction tests
 
@@ -336,8 +306,8 @@ Update `packages/opencode/test/session/prompt.test.ts`:
 
 Add compact request shape snapshots mirroring Codex scenarios:
 
-- Pre-turn native compaction excludes incoming user from compact request, then follow-up includes `retained users + compaction + incoming user`.
-- Mid-turn continuation compaction after tool output includes tool artifacts in the compact request, then continuation includes `retained user + compaction` and retained tail if needed.
+- Pre-turn explicit compaction excludes incoming user from the compact request, then follow-up includes `retained users + compaction + incoming user`.
+- Mid-turn explicit compaction after tool output includes the selected history in the compact request, then continuation includes the replacement window and retained tail if needed.
 - Manual compaction with prior history installs checkpoint, then follow-up includes `compaction + new user` or `retained user + compaction + new user` depending on the retention phase decision.
 
 ## Migration And Compatibility
@@ -359,28 +329,28 @@ Potential compatibility risk:
 
 ## Rollout Phases
 
-### Phase 1: Build and store replacement windows
+### Completed: Build and store replacement windows
 
-- Add compact input exposure in the LLM compact route.
-- Build v2 replacement windows in native compaction.
+- Collect compact input in the AI SDK adapter.
+- Build v2 replacement windows in session compaction.
 - Store v2 checkpoint metadata for new native compactions.
-- Keep legacy v1 replay unchanged for the first commit if needed.
-- Update focused LLM/native compact tests.
+- Keep legacy v1 replay compatible.
+- Remove the unused low-level native compact route and its tests.
 
-### Phase 2: Replay replacement windows in prompt loop
+### Completed: Replay replacement windows in prompt loop
 
 - Change no-tail auto native continuation to rely on v2 replay window containing retained user messages.
 - Update prompt tests to assert original user text is in provider input.
 - Preserve no synthetic prompt behavior.
 - Preserve marker-parent UI grouping.
 
-### Phase 3: Legacy synthesis and retained budget
+### Completed: Legacy synthesis and retained budget
 
 - Add v1 checkpoint in-memory synthesis.
 - Implement Codex-style retained-message token budget and truncation.
 - Add tests for over-budget retained history.
 
-### Phase 4: Codex edge parity
+### Future: Codex edge parity
 
 - Add phase-aware initial-context placement if needed.
 - Add turn-state replay for OpenAI OAuth/ChatGPT if route metadata exposes it.

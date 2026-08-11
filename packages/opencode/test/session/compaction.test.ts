@@ -55,6 +55,153 @@ const usage = (input: ConstructorParameters<typeof Usage>[0]) => new Usage(input
 
 const basicUsage = () => usage({ inputTokens: 1, outputTokens: 1, totalTokens: 2 })
 
+describe("OpenAI native compaction replay", () => {
+  const sessionID = SessionID.make("ses_native_replay")
+  const model = { providerID: ProviderV2.ID.make("openai"), modelID: ModelV2.ID.make("gpt-5") }
+  const user = (id: string, seq: number): SessionV1.StoredWithParts => ({
+    info: {
+      id: MessageID.make(id),
+      sessionID,
+      role: "user",
+      seq,
+      agent: "build",
+      model,
+      time: { created: seq },
+    },
+    parts: [],
+  })
+  const checkpoint = (input: {
+    tailStartID?: MessageID
+    markerID?: string
+    summaryID?: string
+    markerSeq?: number
+    summarySeq?: number
+    partSeq?: number
+  } = {}): SessionV1.StoredWithParts[] => {
+    const markerID = MessageID.make(input.markerID ?? "msg_a_marker")
+    const summaryID = MessageID.make(input.summaryID ?? "msg_b_summary")
+    return [
+      {
+        ...user(markerID, input.markerSeq ?? 2),
+        parts: [
+          {
+            id: PartID.make(`prt_marker_${markerID}`),
+            messageID: markerID,
+            sessionID,
+            seq: input.partSeq ?? 1,
+            type: "compaction",
+            auto: true,
+            tail_start_id: input.tailStartID,
+          },
+        ],
+      },
+      {
+        info: {
+          id: summaryID,
+          sessionID,
+          role: "assistant",
+          seq: input.summarySeq ?? 3,
+          parentID: markerID,
+          mode: "compaction",
+          agent: "compaction",
+          modelID: model.modelID,
+          providerID: model.providerID,
+          path: { cwd: "/tmp", root: "/tmp" },
+          cost: 0,
+          tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+          summary: true,
+          finish: "stop",
+          time: { created: input.summarySeq ?? 3, completed: input.summarySeq ?? 3 },
+        },
+        parts: [
+          {
+            id: PartID.make(`prt_summary_${summaryID}`),
+            messageID: summaryID,
+            sessionID,
+            seq: (input.partSeq ?? 1) + 1,
+            type: "text",
+            text: OpenAINativeCompaction.PLACEHOLDER,
+            metadata: OpenAINativeCompaction.metadata({
+              model,
+              output: [{ type: "compaction", encrypted_content: "opaque" }],
+            }),
+          },
+        ],
+      },
+    ]
+  }
+
+  test("uses durable sequence when replay message IDs are nonmonotonic", () => {
+    const tail = user("msg_z_tail", 1)
+    const followUp = user("msg_0_followup", 4)
+    const replay = OpenAINativeCompaction.replayMessages([
+      tail,
+      ...checkpoint({ tailStartID: tail.info.id }),
+      followUp,
+    ])
+
+    expect(replay.messages.map((message) => message.info.id)).toEqual([tail.info.id, followUp.info.id])
+  })
+
+  test("falls back to the checkpoint sequence when the retained tail is missing", () => {
+    const followUp = user("msg_0_followup", 4)
+    const replay = OpenAINativeCompaction.replayMessages([
+      ...checkpoint({ tailStartID: MessageID.make("msg_missing_tail") }),
+      followUp,
+    ])
+
+    expect(replay.messages.map((message) => message.info.id)).toEqual([followUp.info.id])
+  })
+
+  test("selects the newest checkpoint by sequence after compaction reorders retained history", () => {
+    const tail = user("msg_z_tail", 1)
+    const older = checkpoint({
+      tailStartID: tail.info.id,
+      markerID: "msg_z_old_marker",
+      summaryID: "msg_z_old_summary",
+      markerSeq: 2,
+      summarySeq: 3,
+      partSeq: 1,
+    })
+    const latest = checkpoint({
+      tailStartID: tail.info.id,
+      markerID: "msg_a_latest_marker",
+      summaryID: "msg_a_latest_summary",
+      markerSeq: 4,
+      summarySeq: 5,
+      partSeq: 3,
+    })
+    const followUp = user("msg_0_followup", 6)
+    const replay = OpenAINativeCompaction.replayMessages([...latest, tail, ...older, followUp])
+
+    expect(replay.checkpoint?.markerID).toBe(MessageID.make("msg_a_latest_marker"))
+    expect(replay.messages.map((message) => message.info.id)).toEqual([tail.info.id, followUp.info.id])
+  })
+
+  test("filters a retained native summary after its marker was compacted away", () => {
+    const [latestMarker, latestSummary] = checkpoint({
+      tailStartID: MessageID.make("msg_old_summary"),
+      markerID: "msg_latest_marker",
+      summaryID: "msg_latest_summary",
+      markerSeq: 4,
+      summarySeq: 5,
+      partSeq: 3,
+    })
+    const [, oldSummary] = checkpoint({
+      markerID: "msg_missing_old_marker",
+      summaryID: "msg_old_summary",
+      markerSeq: 2,
+      summarySeq: 3,
+      partSeq: 1,
+    })
+    const followUp = user("msg_followup", 6)
+    const replay = OpenAINativeCompaction.replayMessages([latestMarker!, latestSummary!, oldSummary!, followUp])
+
+    expect(replay.checkpoint?.markerID).toBe(latestMarker!.info.id)
+    expect(replay.messages.map((message) => message.info.id)).toEqual([followUp.info.id])
+  })
+})
+
 afterEach(() => {
   mock.restore()
 })
@@ -1225,6 +1372,190 @@ describe("session.compaction.process", () => {
               message.parts.some((part) => part.type === "text" && part.synthetic && part.text.includes("Continue if")),
           ),
         ).toBe(false)
+      }).pipe(
+        withCompaction({
+          llm: stub.layer,
+          provider: ProviderTest.fake({ model: nativeModel, info: ProviderTest.info({}, nativeModel) }),
+        }),
+      )
+    },
+    { git: true },
+  )
+
+  itCompaction.instance(
+    "continues native overflow in the same user turn without replaying completed tool work",
+    () => {
+      const stub = llm()
+      let compactMessages = ""
+      stub.compact((input) => {
+        compactMessages = JSON.stringify(input.messages)
+        return {
+          input: [
+            { role: "user", content: [{ type: "input_text", text: "root context" }] },
+            { role: "user", content: [{ type: "input_text", text: "retry the ps1 script" }] },
+            { type: "function_call", call_id: "call-ps1", name: "bash", arguments: "{}" },
+            { type: "function_call_output", call_id: "call-ps1", output: "ps1 succeeded" },
+          ],
+          output: [{ type: "compaction", encrypted_content: "overflow-window" }],
+        }
+      })
+      const nativeRef = {
+        providerID: ProviderV2.ID.make("openai"),
+        modelID: ModelV2.ID.make("gpt-5-mini"),
+      }
+      const nativeModel = ProviderTest.model({
+        id: nativeRef.modelID,
+        providerID: nativeRef.providerID,
+        api: { id: nativeRef.modelID, url: "https://api.openai.com/v1", npm: "@ai-sdk/openai" },
+      })
+
+      return Effect.gen(function* () {
+        const test = yield* TestInstance
+        const ssn = yield* SessionNs.Service
+        const session = yield* ssn.create({})
+        yield* createUserMessage(session.id, "root context", nativeRef)
+        const active = yield* createUserMessage(session.id, "retry the ps1 script", nativeRef)
+        const tool = yield* ssn.updateMessage({
+          id: MessageID.ascending(),
+          role: "assistant",
+          sessionID: session.id,
+          parentID: active.id,
+          mode: "build",
+          agent: "build",
+          providerID: nativeRef.providerID,
+          modelID: nativeRef.modelID,
+          path: { cwd: test.directory, root: test.directory },
+          cost: 0,
+          tokens: { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } },
+          finish: "tool-calls",
+          time: { created: Date.now(), completed: Date.now() },
+        } satisfies SessionV1.Assistant)
+        yield* ssn.updatePart({
+          id: PartID.ascending(),
+          messageID: tool.id,
+          sessionID: session.id,
+          type: "tool",
+          callID: "call-ps1",
+          tool: "bash",
+          state: {
+            status: "completed",
+            input: { command: "test.ps1" },
+            output: "ps1 succeeded",
+            title: "test.ps1",
+            metadata: {},
+            time: { start: Date.now(), end: Date.now() },
+          },
+        })
+        const overflow = yield* ssn.updateMessage({
+          id: MessageID.ascending(),
+          role: "assistant",
+          sessionID: session.id,
+          parentID: active.id,
+          mode: "build",
+          agent: "build",
+          providerID: nativeRef.providerID,
+          modelID: nativeRef.modelID,
+          path: { cwd: test.directory, root: test.directory },
+          cost: 0,
+          tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+          time: { created: Date.now(), completed: Date.now() },
+        } satisfies SessionV1.Assistant)
+        yield* SessionCompaction.use.create({
+          sessionID: session.id,
+          agent: "build",
+          model: nativeRef,
+          auto: true,
+          overflow: true,
+        })
+        const before = yield* ssn.messages({ sessionID: session.id })
+        const marker = before.at(-1)
+        expect(marker?.info.role).toBe("user")
+
+        const result = yield* SessionCompaction.use.process({
+          parentID: marker!.info.id,
+          messages: before,
+          sessionID: session.id,
+          auto: true,
+          overflow: true,
+        })
+
+        const all = yield* ssn.messages({ sessionID: session.id })
+        const matchingUsers = all.filter(
+          (message) =>
+            message.info.role === "user" &&
+            message.parts.some((part) => part.type === "text" && part.text === "retry the ps1 script"),
+        )
+        const checkpoint = all.find((message) => OpenAINativeCompaction.checkpointMetadata(message))
+        const window = OpenAINativeCompaction.checkpointMetadata(checkpoint)?.openaiNativeCompactionWindow
+        const compaction = all.flatMap((message) => message.parts).find((part) => part.type === "compaction")
+
+        expect(result).toBe("continue")
+        expect(compactMessages).toContain("retry the ps1 script")
+        expect(compactMessages).toContain("ps1 succeeded")
+        expect(matchingUsers.map((message) => message.info.id)).toEqual([active.id])
+        expect(compaction?.tail_start_id).toBe(overflow.id)
+        expect(window?.version).toBe(2)
+        expect(JSON.stringify(window?.output)).toContain("retry the ps1 script")
+        expect(window?.output.filter((item) => item.type === "compaction")).toHaveLength(1)
+      }).pipe(
+        withCompaction({
+          llm: stub.layer,
+          provider: ProviderTest.fake({ model: nativeModel, info: ProviderTest.info({}, nativeModel) }),
+          config: cfg({ tail_turns: 1, preserve_recent_tokens: 1 }),
+        }),
+      )
+    },
+    { git: true },
+  )
+
+  itCompaction.instance(
+    "keeps legacy overflow replay when native compaction falls back to summary",
+    () => {
+      const stub = llm()
+      stub.compact([{ type: "message", role: "assistant", content: [] }])
+      stub.push(reply("summary fallback"))
+      const nativeRef = {
+        providerID: ProviderV2.ID.make("openai"),
+        modelID: ModelV2.ID.make("gpt-5-mini"),
+      }
+      const nativeModel = ProviderTest.model({
+        id: nativeRef.modelID,
+        providerID: nativeRef.providerID,
+        api: { id: nativeRef.modelID, url: "https://api.openai.com/v1", npm: "@ai-sdk/openai" },
+      })
+
+      return Effect.gen(function* () {
+        const ssn = yield* SessionNs.Service
+        const session = yield* ssn.create({})
+        yield* createUserMessage(session.id, "root context", nativeRef)
+        const active = yield* createUserMessage(session.id, "retry after fallback", nativeRef)
+        yield* SessionCompaction.use.create({
+          sessionID: session.id,
+          agent: "build",
+          model: nativeRef,
+          auto: true,
+          overflow: true,
+        })
+        const before = yield* ssn.messages({ sessionID: session.id })
+        const marker = before.at(-1)!
+
+        const result = yield* SessionCompaction.use.process({
+          parentID: marker.info.id,
+          messages: before,
+          sessionID: session.id,
+          auto: true,
+          overflow: true,
+        })
+
+        const matchingUsers = (yield* ssn.messages({ sessionID: session.id })).filter(
+          (message) =>
+            message.info.role === "user" &&
+            message.parts.some((part) => part.type === "text" && part.text === "retry after fallback"),
+        )
+        expect(result).toBe("continue")
+        expect(matchingUsers).toHaveLength(2)
+        expect(matchingUsers[0]?.info.id).toBe(active.id)
+        expect(matchingUsers[1]?.info.id).not.toBe(active.id)
       }).pipe(
         withCompaction({
           llm: stub.layer,

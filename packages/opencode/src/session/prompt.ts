@@ -481,17 +481,16 @@ const layer = Layer.effect(
     }) {
       // The native checkpoint is the provider-visible context; this user only supplies
       // session metadata when the active history has no user after removing the checkpoint.
-      const match = yield* sessions
-        .findMessage(
-          input.sessionID,
-          (message) =>
-            message.info.role === "user" &&
-            message.info.id < input.markerID &&
-            !message.parts.some((part) => part.type === "compaction") &&
-            !message.parts.some((part) => part.type === "text" && part.metadata?.compaction_continue),
-        )
-        .pipe(Effect.orDie)
-      if (Option.isSome(match) && match.value.info.role === "user") return match.value.info
+      const messages = yield* sessions.messages({ sessionID: input.sessionID }).pipe(Effect.orDie)
+      const marker = messages.findIndex((message) => message.info.id === input.markerID)
+      if (marker < 0) return undefined
+      const match = messages.slice(0, marker).findLast(
+        (message) =>
+          message.info.role === "user" &&
+          !message.parts.some((part) => part.type === "compaction") &&
+          !message.parts.some((part) => part.type === "text" && part.metadata?.compaction_continue),
+      )
+      if (match?.info.role === "user") return match.info
       return undefined
     })
 
@@ -1399,6 +1398,9 @@ const layer = Layer.effect(
           const nativeCompactionWindow = nativeReplay.checkpoint
             ? OpenAINativeCompaction.replayWindow({ checkpoint: nativeReplay.checkpoint })
             : undefined
+          const nativeMarker = nativeReplay.checkpoint
+            ? compacted.find((message) => message.info.id === nativeReplay.checkpoint?.markerID)?.info
+            : undefined
 
           const durableLatest = MessageV2.latest(compacted)
           const { tasks } = durableLatest
@@ -1465,7 +1467,8 @@ const layer = Layer.effect(
             })
           }
           const assistantParentID =
-            nativeReplay.checkpoint && lastUser.id < nativeReplay.checkpoint.markerID
+            nativeReplay.checkpoint &&
+            (continuationUser || (nativeMarker && MessageV2.compareOrder(lastUser, nativeMarker) < 0))
               ? nativeReplay.checkpoint.markerID
               : lastUser.id
 
@@ -1513,7 +1516,7 @@ const layer = Layer.effect(
 
           if (
             lastFinished &&
-            !(nativeReplay.checkpoint && lastFinished.id < nativeReplay.checkpoint.markerID) &&
+            !(nativeMarker && MessageV2.compareOrder(lastFinished, nativeMarker) < 0) &&
             lastFinished.summary !== true &&
             (yield* compaction.isOverflow({ tokens: lastFinished.tokens, model }))
           ) {

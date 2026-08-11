@@ -1,5 +1,5 @@
 diff --git a/dist/index.js b/dist/index.js
-index 5fc82d7ca0f5fba1da3b24c15bb714f51b5aa178..e1a3e2c97774af3a5688c7052bd9a07d692fcc8f 100644
+index 5fc82d7ca0f5fba1da3b24c15bb714f51b5aa178..fb9a0f83fa5b53d85d3501c90ac4d4c1c017023d 100644
 --- a/dist/index.js
 +++ b/dist/index.js
 @@ -1035,22 +1035,6 @@ var OpenAIChatLanguageModel = class {
@@ -25,7 +25,197 @@ index 5fc82d7ca0f5fba1da3b24c15bb714f51b5aa178..e1a3e2c97774af3a5688c7052bd9a07d
      const {
        tools: openaiTools2,
        toolChoice: openaiToolChoice,
-@@ -5454,22 +5438,6 @@ var OpenAIResponsesLanguageModel = class {
+@@ -3722,6 +3706,54 @@ var jsonValueSchema2 = import_v422.z.lazy(
+     import_v422.z.record(import_v422.z.string(), jsonValueSchema2.optional())
+   ])
+ );
++var openaiResponsesCompactionSchema = import_v422.z.object({
++  type: import_v422.z.literal("compaction"),
++  id: import_v422.z.string().optional(),
++  encrypted_content: import_v422.z.string(),
++  internal_chat_message_metadata_passthrough: jsonValueSchema2.optional()
++}).loose();
++var openaiResponsesCompactionDoneSchema = import_v422.z.object({
++  type: import_v422.z.literal("response.output_item.done"),
++  output_index: import_v422.z.number().optional(),
++  item: openaiResponsesCompactionSchema
++});
++var openaiResponsesCompactionUsageSchema = import_v422.z.object({
++  input_tokens: import_v422.z.number(),
++  input_tokens_details: import_v422.z.object({
++    cached_tokens: import_v422.z.number().nullish(),
++    cache_write_tokens: import_v422.z.number().nullish(),
++    orchestration_input_tokens: import_v422.z.number().nullish(),
++    orchestration_input_cached_tokens: import_v422.z.number().nullish()
++  }).nullish(),
++  output_tokens: import_v422.z.number(),
++  output_tokens_details: import_v422.z.object({
++    reasoning_tokens: import_v422.z.number().nullish(),
++    orchestration_output_tokens: import_v422.z.number().nullish()
++  }).nullish()
++});
++var openaiResponsesCompactionFinishedSchema = import_v422.z.object({
++  type: import_v422.z.enum(["response.completed", "response.incomplete"]),
++  response: import_v422.z.object({
++    id: import_v422.z.string(),
++    incomplete_details: import_v422.z.object({ reason: import_v422.z.string() }).nullish(),
++    usage: openaiResponsesCompactionUsageSchema.nullish(),
++    reasoning: import_v422.z.object({ context: import_v422.z.string().nullish() }).nullish(),
++    service_tier: import_v422.z.string().nullish(),
++    output: import_v422.z.array(jsonValueSchema2).optional()
++  }).loose()
++});
++var openaiResponsesCompactionFailedSchema = import_v422.z.object({
++  type: import_v422.z.literal("response.failed"),
++  sequence_number: import_v422.z.number().optional(),
++  response: import_v422.z.object({
++    id: import_v422.z.string(),
++    error: import_v422.z.object({ code: import_v422.z.string().nullish(), message: import_v422.z.string().nullish() }).nullish(),
++    incomplete_details: import_v422.z.object({ reason: import_v422.z.string() }).nullish(),
++    usage: openaiResponsesCompactionUsageSchema.nullish(),
++    reasoning: import_v422.z.object({ context: import_v422.z.string().nullish() }).nullish(),
++    service_tier: import_v422.z.string().nullish()
++  }).loose()
++});
+ var openaiResponsesNestedErrorChunkSchema = import_v422.z.object({
+   type: import_v422.z.literal("error"),
+   sequence_number: import_v422.z.number(),
+@@ -3742,6 +3774,12 @@ var openaiResponsesErrorChunkSchema = import_v422.z.object({
+ var openaiResponsesChunkSchema = (0, import_provider_utils27.lazySchema)(
+   () => (0, import_provider_utils27.zodSchema)(
+     import_v422.z.union([
++      import_v422.z.object({
++        type: import_v422.z.literal("response.metadata"),
++        headers: import_v422.z.record(import_v422.z.string(), import_v422.z.unknown()).optional(),
++        metadata: import_v422.z.record(import_v422.z.string(), import_v422.z.unknown()).optional(),
++        response: import_v422.z.record(import_v422.z.string(), import_v422.z.unknown()).optional()
++      }),
+       import_v422.z.object({
+         type: import_v422.z.literal("response.output_text.delta"),
+         item_id: import_v422.z.string(),
+@@ -3780,7 +3818,8 @@ var openaiResponsesChunkSchema = (0, import_provider_utils27.lazySchema)(
+           reasoning: import_v422.z.object({
+             context: import_v422.z.string().nullish()
+           }).nullish(),
+-          service_tier: import_v422.z.string().nullish()
++          service_tier: import_v422.z.string().nullish(),
++          output: import_v422.z.array(jsonValueSchema2).optional()
+         })
+       }),
+       import_v422.z.object({
+@@ -3812,6 +3851,8 @@ var openaiResponsesChunkSchema = (0, import_provider_utils27.lazySchema)(
+           service_tier: import_v422.z.string().nullish()
+         })
+       }),
++      openaiResponsesCompactionFinishedSchema,
++      openaiResponsesCompactionFailedSchema,
+       import_v422.z.object({
+         type: import_v422.z.literal("response.created"),
+         response: import_v422.z.object({
+@@ -3825,6 +3866,7 @@ var openaiResponsesChunkSchema = (0, import_provider_utils27.lazySchema)(
+         type: import_v422.z.literal("response.output_item.added"),
+         output_index: import_v422.z.number(),
+         item: import_v422.z.discriminatedUnion("type", [
++          openaiResponsesCompactionSchema,
+           import_v422.z.object({
+             type: import_v422.z.literal("message"),
+             id: import_v422.z.string(),
+@@ -3963,10 +4005,12 @@ var openaiResponsesChunkSchema = (0, import_provider_utils27.lazySchema)(
+           })
+         ])
+       }),
++      openaiResponsesCompactionDoneSchema,
+       import_v422.z.object({
+         type: import_v422.z.literal("response.output_item.done"),
+         output_index: import_v422.z.number(),
+         item: import_v422.z.discriminatedUnion("type", [
++          openaiResponsesCompactionSchema,
+           import_v422.z.object({
+             type: import_v422.z.literal("message"),
+             id: import_v422.z.string(),
+@@ -4464,6 +4508,7 @@ var openaiResponsesResponseSchema = (0, import_provider_utils27.lazySchema)(
+               })
+             )
+           }),
++          openaiResponsesCompactionSchema,
+           import_v422.z.object({
+             type: import_v422.z.literal("mcp_call"),
+             id: import_v422.z.string(),
+@@ -4853,6 +4898,12 @@ var openaiLanguageModelResponsesOptionsSchema = (0, import_provider_utils28.lazy
+        * and defaults `systemMessageMode` to `developer` unless overridden.
+        */
+       forceReasoning: import_v423.z.boolean().optional(),
++      opencode: import_v423.z.object({
++        version: import_v423.z.literal(1),
++        instructions: import_v423.z.string().optional(),
++        replayInput: import_v423.z.array(import_v423.z.unknown()).optional(),
++        explicitCompaction: import_v423.z.literal(true).optional()
++      }).optional(),
+       /**
+        * Restrict the callable tools to a subset while keeping the full tools
+        * list intact, so prompt caching is preserved across requests with
+@@ -5267,6 +5318,8 @@ var OpenAIResponsesLanguageModel = class {
+         schema: openaiLanguageModelResponsesOptionsSchema
+       });
+     }
++    const opencodeOptions = openaiOptions == null ? void 0 : openaiOptions.opencode;
++    const isExplicitCompaction = (opencodeOptions == null ? void 0 : opencodeOptions.explicitCompaction) === true;
+     const isReasoningModel = (_a = openaiOptions == null ? void 0 : openaiOptions.forceReasoning) != null ? _a : modelCapabilities.isReasoningModel;
+     if ((openaiOptions == null ? void 0 : openaiOptions.conversation) && (openaiOptions == null ? void 0 : openaiOptions.previousResponseId)) {
+       warnings.push({
+@@ -5303,14 +5356,14 @@ var OpenAIResponsesLanguageModel = class {
+       toolNameMapping,
+       customProviderToolNames
+     });
+-    const { input, warnings: inputWarnings } = await convertToOpenAIResponsesInput({
++    const { input: convertedInput, warnings: inputWarnings } = await convertToOpenAIResponsesInput({
+       prompt,
+       toolNameMapping,
+       systemMessageMode: (_c = openaiOptions == null ? void 0 : openaiOptions.systemMessageMode) != null ? _c : isReasoningModel ? "developer" : modelCapabilities.systemMessageMode,
+       providerOptionsName,
+       fileIdPrefixes: this.config.fileIdPrefixes,
+       passThroughUnsupportedFiles: (_d = openaiOptions == null ? void 0 : openaiOptions.passThroughUnsupportedFiles) != null ? _d : false,
+-      store: (_e = openaiOptions == null ? void 0 : openaiOptions.store) != null ? _e : true,
++      store: isExplicitCompaction ? false : (openaiOptions == null ? void 0 : openaiOptions.store) ?? true,
+       hasConversation: (openaiOptions == null ? void 0 : openaiOptions.conversation) != null,
+       hasPreviousResponseId: (openaiOptions == null ? void 0 : openaiOptions.previousResponseId) != null,
+       hasLocalShellTool: hasOpenAITool("openai.local_shell"),
+@@ -5318,6 +5371,16 @@ var OpenAIResponsesLanguageModel = class {
+       hasApplyPatchTool: hasOpenAITool("openai.apply_patch"),
+       customProviderToolNames: customProviderToolNames.size > 0 ? customProviderToolNames : void 0
+     });
++    const replayInput = (opencodeOptions == null ? void 0 : opencodeOptions.replayInput) ?? [];
++    const hasOpenCodeInput = (opencodeOptions == null ? void 0 : opencodeOptions.instructions) !== void 0 || (opencodeOptions == null ? void 0 : opencodeOptions.replayInput) !== void 0 || isExplicitCompaction;
++    const systemInput = convertedInput.filter(isSystemInput);
++    const conversationInput = convertedInput.filter((item) => !isSystemInput(item) && !isCompactionTrigger(item));
++    const input = hasOpenCodeInput ? [
++      ...((opencodeOptions == null ? void 0 : opencodeOptions.instructions) === void 0 ? systemInput : []),
++      ...replayInput.filter((item) => !isCompactionTrigger(item)),
++      ...conversationInput,
++      ...isExplicitCompaction ? [{ type: "compaction_trigger" }] : []
++    ] : convertedInput;
+     warnings.push(...inputWarnings);
+     const strictJsonSchema = (_f = openaiOptions == null ? void 0 : openaiOptions.strictJsonSchema) != null ? _f : true;
+     let include = openaiOptions == null ? void 0 : openaiOptions.include;
+@@ -5344,7 +5407,7 @@ var OpenAIResponsesLanguageModel = class {
+     if (hasOpenAITool("openai.code_interpreter")) {
+       addInclude("code_interpreter_call.outputs");
+     }
+-    const store = openaiOptions == null ? void 0 : openaiOptions.store;
++    const store = isExplicitCompaction ? false : openaiOptions == null ? void 0 : openaiOptions.store;
+     if (store === false && isReasoningModel) {
+       addInclude("reasoning.encrypted_content");
+     }
+@@ -5378,7 +5441,7 @@ var OpenAIResponsesLanguageModel = class {
+       previous_response_id: openaiOptions == null ? void 0 : openaiOptions.previousResponseId,
+       store,
+       user: openaiOptions == null ? void 0 : openaiOptions.user,
+-      instructions: openaiOptions == null ? void 0 : openaiOptions.instructions,
++      instructions: (opencodeOptions == null ? void 0 : opencodeOptions.instructions) ?? (openaiOptions == null ? void 0 : openaiOptions.instructions),
+       service_tier: openaiOptions == null ? void 0 : openaiOptions.serviceTier,
+       include,
+       prompt_cache_key: openaiOptions == null ? void 0 : openaiOptions.promptCacheKey,
+@@ -5454,22 +5517,6 @@ var OpenAIResponsesLanguageModel = class {
          });
        }
      }
@@ -48,8 +238,196 @@ index 5fc82d7ca0f5fba1da3b24c15bb714f51b5aa178..e1a3e2c97774af3a5688c7052bd9a07d
      const shellToolEnvType = (_k = (_j = (_i = tools == null ? void 0 : tools.find(
        (tool) => tool.type === "provider" && tool.id === "openai.shell"
      )) == null ? void 0 : _i.args) == null ? void 0 : _j.environment) == null ? void 0 : _k.type;
+@@ -5485,7 +5532,8 @@ var OpenAIResponsesLanguageModel = class {
+       store,
+       toolNameMapping,
+       providerOptionsName,
+-      isShellProviderExecuted
++      isShellProviderExecuted,
++      isExplicitCompaction
+     };
+   }
+   async doGenerate(options) {
+@@ -5973,12 +6021,14 @@ var OpenAIResponsesLanguageModel = class {
+       toolNameMapping,
+       store,
+       providerOptionsName,
+-      isShellProviderExecuted
++      isShellProviderExecuted,
++      isExplicitCompaction
+     } = await this.getArgs(options);
+     const url = this.config.url({
+       path: "/responses",
+       modelId: this.modelId
+     });
++    const explicitCompactionAbortController = isExplicitCompaction ? new AbortController() : void 0;
+     const { responseHeaders, value: response } = await (0, import_provider_utils30.postJsonToApi)({
+       url,
+       headers: (0, import_provider_utils30.combineHeaders)(this.config.headers(), options.headers),
+@@ -5990,13 +6040,16 @@ var OpenAIResponsesLanguageModel = class {
+       successfulResponseHandler: (0, import_provider_utils30.createEventSourceResponseHandler)(
+         openaiResponsesChunkSchema
+       ),
+-      abortSignal: options.abortSignal,
++      abortSignal: explicitCompactionAbortController == null ? options.abortSignal : options.abortSignal == null ? explicitCompactionAbortController.signal : AbortSignal.any([
++        options.abortSignal,
++        explicitCompactionAbortController.signal
++      ]),
+       fetch: this.config.fetch
+     });
+     const checkedResponse = await throwIfOpenAIStreamErrorBeforeOutput({
+       stream: response,
+-      getError: (chunk) => isErrorChunk(chunk) || isResponseFailedChunk(chunk) && chunk.response.error != null ? chunk : void 0,
+-      isOutputChunk: isResponseOutputChunk,
++      getError: (chunk) => isExplicitCompaction ? void 0 : isErrorChunk(chunk) || isResponseFailedChunk(chunk) && chunk.response.error != null ? chunk : void 0,
++      isOutputChunk: (chunk) => isExplicitCompaction || isResponseOutputChunk(chunk),
+       url,
+       requestBodyValues: body,
+       responseHeaders
+@@ -6020,6 +6073,29 @@ var OpenAIResponsesLanguageModel = class {
+     let reasoningContext;
+     const hostedToolSearchCallIds = [];
+     let encounteredStreamError = false;
++    let explicitCompactionOutput;
++    let explicitCompactionOutputCount = 0;
++    let explicitCompactionTerminal = false;
++    let explicitCompactionHeaders = responseHeaders;
++    const emitExplicitCompactionTerminal = (controller, outcome) => {
++      if (explicitCompactionTerminal) return;
++      explicitCompactionTerminal = true;
++      const terminal = {
++        type: "opencode.compaction.terminal",
++        version: 1,
++        headers: explicitCompactionHeaders,
++        cancel: () => explicitCompactionAbortController == null ? void 0 : explicitCompactionAbortController.abort(),
++        outcome
++      };
++      if (options.includeRawChunks) {
++        controller.enqueue({ type: "raw", rawValue: terminal });
++      } else {
++        controller.enqueue({
++          type: "error",
++          error: new Error("OpenAI Responses explicit compaction requires includeRawChunks")
++        });
++      }
++    };
+     const result = {
+       stream: checkedResponse.pipeThrough(
+         new TransformStream({
+@@ -6028,6 +6104,60 @@ var OpenAIResponsesLanguageModel = class {
+           },
+           transform(chunk, controller) {
+             var _a, _b, _c, _d, _e, _f, _g, _h, _i, _j, _k, _l, _m, _n, _o, _p, _q, _r, _s, _t, _u, _v, _w, _x, _y, _z, _A, _B, _C, _D, _E, _F, _G, _H, _I, _J, _K, _L, _M, _N;
++            if (isExplicitCompaction) {
++              if (explicitCompactionTerminal) return;
++              if (!chunk.success) {
++                emitExplicitCompactionTerminal(controller, {
++                  type: "protocol-error",
++                  message: "OpenAI Responses explicit compaction stream event was invalid",
++                  cause: chunk.error
++                });
++                return;
++              }
++              const value2 = chunk.value;
++              const metadataHeaders = explicitCompactionHeadersFromChunk(value2);
++              if (metadataHeaders) {
++                explicitCompactionHeaders = {
++                  ...explicitCompactionHeaders,
++                  ...metadataHeaders
++                };
++              }
++              if (isResponseOutputItemDoneChunk(value2)) {
++                if (value2.item.type === "compaction") {
++                  explicitCompactionOutputCount += 1;
++                  explicitCompactionOutput ??= value2.item;
++                }
++                return;
++              }
++              if (value2.type === "response.completed") {
++                if (explicitCompactionOutputCount !== 1 || explicitCompactionOutput == null) {
++                  emitExplicitCompactionTerminal(controller, {
++                    type: "protocol-error",
++                    message: `OpenAI Responses explicit compaction expected exactly one compaction output item, got ${explicitCompactionOutputCount}`,
++                    cause: value2
++                  });
++                } else {
++                  emitExplicitCompactionTerminal(controller, {
++                    type: "completed",
++                    input: body.input.filter((item) => !isCompactionTrigger(item)),
++                    output: explicitCompactionOutput
++                  });
++                }
++                return;
++              }
++              if (value2.type === "response.incomplete") {
++                emitExplicitCompactionTerminal(controller, { type: "incomplete", cause: value2 });
++                return;
++              }
++              if (value2.type === "response.failed") {
++                emitExplicitCompactionTerminal(controller, { type: "failed", cause: value2 });
++                return;
++              }
++              if (value2.type === "error") {
++                emitExplicitCompactionTerminal(controller, { type: "stream-error", cause: value2 });
++              }
++              return;
++            }
+             if (options.includeRawChunks) {
+               controller.enqueue({ type: "raw", rawValue: chunk.rawValue });
+             }
+@@ -6765,7 +6895,7 @@ var OpenAIResponsesLanguageModel = class {
+                 }),
+                 raw: (_x = (_w = value.response.incomplete_details) == null ? void 0 : _w.reason) != null ? _x : void 0
+               };
+-              usage = value.response.usage;
++              usage = value.response.usage ?? void 0;
+               if (typeof value.response.service_tier === "string") {
+                 serviceTier = value.response.service_tier;
+               }
+@@ -6866,6 +6996,12 @@ var OpenAIResponsesLanguageModel = class {
+             }
+           },
+           flush(controller) {
++            if (isExplicitCompaction) {
++              if (!explicitCompactionTerminal) {
++                emitExplicitCompactionTerminal(controller, { type: "stream-closed" });
++              }
++              return;
++            }
+             const providerMetadata = {
+               [providerOptionsName]: {
+                 responseId,
+@@ -6917,6 +7053,28 @@ function createOpenAIResponsesChatCompletionsMismatchError({
+ function asRecord2(value) {
+   return typeof value === "object" && value != null ? value : void 0;
+ }
++function isSystemInput(value) {
++  if (typeof value !== "object" || value == null) return false;
++  const role = value.role;
++  return role === "system" || role === "developer";
++}
++function isCompactionTrigger(value) {
++  return typeof value === "object" && value != null && value.type === "compaction_trigger";
++}
++function explicitCompactionHeadersFromChunk(value) {
++  const raw = asRecord2(value);
++  const response = asRecord2(raw == null ? void 0 : raw.response);
++  const metadata = asRecord2(raw == null ? void 0 : raw.metadata);
++  const responseMetadata = asRecord2(response == null ? void 0 : response.metadata);
++  const candidates = [raw == null ? void 0 : raw.headers, metadata == null ? void 0 : metadata.headers, response == null ? void 0 : response.headers, responseMetadata == null ? void 0 : responseMetadata.headers];
++  for (const candidate of candidates) {
++    const headers = asRecord2(candidate);
++    if (!headers) continue;
++    const stringHeaders = Object.fromEntries(Object.entries(headers).filter((entry) => typeof entry[1] === "string"));
++    if (Object.keys(stringHeaders).length > 0) return stringHeaders;
++  }
++  return void 0;
++}
+ function isResponseOutputItemDoneChunk(chunk) {
+   return chunk.type === "response.output_item.done";
+ }
 diff --git a/dist/index.mjs b/dist/index.mjs
-index 589c4f76955bee692b8af36ea1d9a15121695d4a..6838ea0a362c8fe774527bb1126b8031ebfd3fab 100644
+index 589c4f76955bee692b8af36ea1d9a15121695d4a..35b02e8e1e9f5e592ff0e4deae29c3e7953ec69e 100644
 --- a/dist/index.mjs
 +++ b/dist/index.mjs
 @@ -1031,22 +1031,6 @@ var OpenAIChatLanguageModel = class {
@@ -75,7 +453,197 @@ index 589c4f76955bee692b8af36ea1d9a15121695d4a..6838ea0a362c8fe774527bb1126b8031
      const {
        tools: openaiTools2,
        toolChoice: openaiToolChoice,
-@@ -5557,22 +5541,6 @@ var OpenAIResponsesLanguageModel = class {
+@@ -3820,6 +3804,54 @@ var jsonValueSchema2 = z22.lazy(
+     z22.record(z22.string(), jsonValueSchema2.optional())
+   ])
+ );
++var openaiResponsesCompactionSchema = z22.object({
++  type: z22.literal("compaction"),
++  id: z22.string().optional(),
++  encrypted_content: z22.string(),
++  internal_chat_message_metadata_passthrough: jsonValueSchema2.optional()
++}).loose();
++var openaiResponsesCompactionDoneSchema = z22.object({
++  type: z22.literal("response.output_item.done"),
++  output_index: z22.number().optional(),
++  item: openaiResponsesCompactionSchema
++});
++var openaiResponsesCompactionUsageSchema = z22.object({
++  input_tokens: z22.number(),
++  input_tokens_details: z22.object({
++    cached_tokens: z22.number().nullish(),
++    cache_write_tokens: z22.number().nullish(),
++    orchestration_input_tokens: z22.number().nullish(),
++    orchestration_input_cached_tokens: z22.number().nullish()
++  }).nullish(),
++  output_tokens: z22.number(),
++  output_tokens_details: z22.object({
++    reasoning_tokens: z22.number().nullish(),
++    orchestration_output_tokens: z22.number().nullish()
++  }).nullish()
++});
++var openaiResponsesCompactionFinishedSchema = z22.object({
++  type: z22.enum(["response.completed", "response.incomplete"]),
++  response: z22.object({
++    id: z22.string(),
++    incomplete_details: z22.object({ reason: z22.string() }).nullish(),
++    usage: openaiResponsesCompactionUsageSchema.nullish(),
++    reasoning: z22.object({ context: z22.string().nullish() }).nullish(),
++    service_tier: z22.string().nullish(),
++    output: z22.array(jsonValueSchema2).optional()
++  }).loose()
++});
++var openaiResponsesCompactionFailedSchema = z22.object({
++  type: z22.literal("response.failed"),
++  sequence_number: z22.number().optional(),
++  response: z22.object({
++    id: z22.string(),
++    error: z22.object({ code: z22.string().nullish(), message: z22.string().nullish() }).nullish(),
++    incomplete_details: z22.object({ reason: z22.string() }).nullish(),
++    usage: openaiResponsesCompactionUsageSchema.nullish(),
++    reasoning: z22.object({ context: z22.string().nullish() }).nullish(),
++    service_tier: z22.string().nullish()
++  }).loose()
++});
+ var openaiResponsesNestedErrorChunkSchema = z22.object({
+   type: z22.literal("error"),
+   sequence_number: z22.number(),
+@@ -3840,6 +3872,12 @@ var openaiResponsesErrorChunkSchema = z22.object({
+ var openaiResponsesChunkSchema = lazySchema20(
+   () => zodSchema20(
+     z22.union([
++      z22.object({
++        type: z22.literal("response.metadata"),
++        headers: z22.record(z22.string(), z22.unknown()).optional(),
++        metadata: z22.record(z22.string(), z22.unknown()).optional(),
++        response: z22.record(z22.string(), z22.unknown()).optional()
++      }),
+       z22.object({
+         type: z22.literal("response.output_text.delta"),
+         item_id: z22.string(),
+@@ -3878,7 +3916,8 @@ var openaiResponsesChunkSchema = lazySchema20(
+           reasoning: z22.object({
+             context: z22.string().nullish()
+           }).nullish(),
+-          service_tier: z22.string().nullish()
++          service_tier: z22.string().nullish(),
++          output: z22.array(jsonValueSchema2).optional()
+         })
+       }),
+       z22.object({
+@@ -3910,6 +3949,8 @@ var openaiResponsesChunkSchema = lazySchema20(
+           service_tier: z22.string().nullish()
+         })
+       }),
++      openaiResponsesCompactionFinishedSchema,
++      openaiResponsesCompactionFailedSchema,
+       z22.object({
+         type: z22.literal("response.created"),
+         response: z22.object({
+@@ -3923,6 +3964,7 @@ var openaiResponsesChunkSchema = lazySchema20(
+         type: z22.literal("response.output_item.added"),
+         output_index: z22.number(),
+         item: z22.discriminatedUnion("type", [
++          openaiResponsesCompactionSchema,
+           z22.object({
+             type: z22.literal("message"),
+             id: z22.string(),
+@@ -4061,10 +4103,12 @@ var openaiResponsesChunkSchema = lazySchema20(
+           })
+         ])
+       }),
++      openaiResponsesCompactionDoneSchema,
+       z22.object({
+         type: z22.literal("response.output_item.done"),
+         output_index: z22.number(),
+         item: z22.discriminatedUnion("type", [
++          openaiResponsesCompactionSchema,
+           z22.object({
+             type: z22.literal("message"),
+             id: z22.string(),
+@@ -4562,6 +4606,7 @@ var openaiResponsesResponseSchema = lazySchema20(
+               })
+             )
+           }),
++          openaiResponsesCompactionSchema,
+           z22.object({
+             type: z22.literal("mcp_call"),
+             id: z22.string(),
+@@ -4954,6 +4999,12 @@ var openaiLanguageModelResponsesOptionsSchema = lazySchema21(
+        * and defaults `systemMessageMode` to `developer` unless overridden.
+        */
+       forceReasoning: z23.boolean().optional(),
++      opencode: z23.object({
++        version: z23.literal(1),
++        instructions: z23.string().optional(),
++        replayInput: z23.array(z23.unknown()).optional(),
++        explicitCompaction: z23.literal(true).optional()
++      }).optional(),
+       /**
+        * Restrict the callable tools to a subset while keeping the full tools
+        * list intact, so prompt caching is preserved across requests with
+@@ -5370,6 +5421,8 @@ var OpenAIResponsesLanguageModel = class {
+         schema: openaiLanguageModelResponsesOptionsSchema
+       });
+     }
++    const opencodeOptions = openaiOptions == null ? void 0 : openaiOptions.opencode;
++    const isExplicitCompaction = (opencodeOptions == null ? void 0 : opencodeOptions.explicitCompaction) === true;
+     const isReasoningModel = (_a = openaiOptions == null ? void 0 : openaiOptions.forceReasoning) != null ? _a : modelCapabilities.isReasoningModel;
+     if ((openaiOptions == null ? void 0 : openaiOptions.conversation) && (openaiOptions == null ? void 0 : openaiOptions.previousResponseId)) {
+       warnings.push({
+@@ -5406,14 +5459,14 @@ var OpenAIResponsesLanguageModel = class {
+       toolNameMapping,
+       customProviderToolNames
+     });
+-    const { input, warnings: inputWarnings } = await convertToOpenAIResponsesInput({
++    const { input: convertedInput, warnings: inputWarnings } = await convertToOpenAIResponsesInput({
+       prompt,
+       toolNameMapping,
+       systemMessageMode: (_c = openaiOptions == null ? void 0 : openaiOptions.systemMessageMode) != null ? _c : isReasoningModel ? "developer" : modelCapabilities.systemMessageMode,
+       providerOptionsName,
+       fileIdPrefixes: this.config.fileIdPrefixes,
+       passThroughUnsupportedFiles: (_d = openaiOptions == null ? void 0 : openaiOptions.passThroughUnsupportedFiles) != null ? _d : false,
+-      store: (_e = openaiOptions == null ? void 0 : openaiOptions.store) != null ? _e : true,
++      store: isExplicitCompaction ? false : (openaiOptions == null ? void 0 : openaiOptions.store) ?? true,
+       hasConversation: (openaiOptions == null ? void 0 : openaiOptions.conversation) != null,
+       hasPreviousResponseId: (openaiOptions == null ? void 0 : openaiOptions.previousResponseId) != null,
+       hasLocalShellTool: hasOpenAITool("openai.local_shell"),
+@@ -5421,6 +5474,16 @@ var OpenAIResponsesLanguageModel = class {
+       hasApplyPatchTool: hasOpenAITool("openai.apply_patch"),
+       customProviderToolNames: customProviderToolNames.size > 0 ? customProviderToolNames : void 0
+     });
++    const replayInput = (opencodeOptions == null ? void 0 : opencodeOptions.replayInput) ?? [];
++    const hasOpenCodeInput = (opencodeOptions == null ? void 0 : opencodeOptions.instructions) !== void 0 || (opencodeOptions == null ? void 0 : opencodeOptions.replayInput) !== void 0 || isExplicitCompaction;
++    const systemInput = convertedInput.filter(isSystemInput);
++    const conversationInput = convertedInput.filter((item) => !isSystemInput(item) && !isCompactionTrigger(item));
++    const input = hasOpenCodeInput ? [
++      ...((opencodeOptions == null ? void 0 : opencodeOptions.instructions) === void 0 ? systemInput : []),
++      ...replayInput.filter((item) => !isCompactionTrigger(item)),
++      ...conversationInput,
++      ...isExplicitCompaction ? [{ type: "compaction_trigger" }] : []
++    ] : convertedInput;
+     warnings.push(...inputWarnings);
+     const strictJsonSchema = (_f = openaiOptions == null ? void 0 : openaiOptions.strictJsonSchema) != null ? _f : true;
+     let include = openaiOptions == null ? void 0 : openaiOptions.include;
+@@ -5447,7 +5510,7 @@ var OpenAIResponsesLanguageModel = class {
+     if (hasOpenAITool("openai.code_interpreter")) {
+       addInclude("code_interpreter_call.outputs");
+     }
+-    const store = openaiOptions == null ? void 0 : openaiOptions.store;
++    const store = isExplicitCompaction ? false : openaiOptions == null ? void 0 : openaiOptions.store;
+     if (store === false && isReasoningModel) {
+       addInclude("reasoning.encrypted_content");
+     }
+@@ -5481,7 +5544,7 @@ var OpenAIResponsesLanguageModel = class {
+       previous_response_id: openaiOptions == null ? void 0 : openaiOptions.previousResponseId,
+       store,
+       user: openaiOptions == null ? void 0 : openaiOptions.user,
+-      instructions: openaiOptions == null ? void 0 : openaiOptions.instructions,
++      instructions: (opencodeOptions == null ? void 0 : opencodeOptions.instructions) ?? (openaiOptions == null ? void 0 : openaiOptions.instructions),
+       service_tier: openaiOptions == null ? void 0 : openaiOptions.serviceTier,
+       include,
+       prompt_cache_key: openaiOptions == null ? void 0 : openaiOptions.promptCacheKey,
+@@ -5557,22 +5620,6 @@ var OpenAIResponsesLanguageModel = class {
          });
        }
      }
@@ -98,8 +666,196 @@ index 589c4f76955bee692b8af36ea1d9a15121695d4a..6838ea0a362c8fe774527bb1126b8031
      const shellToolEnvType = (_k = (_j = (_i = tools == null ? void 0 : tools.find(
        (tool) => tool.type === "provider" && tool.id === "openai.shell"
      )) == null ? void 0 : _i.args) == null ? void 0 : _j.environment) == null ? void 0 : _k.type;
+@@ -5588,7 +5635,8 @@ var OpenAIResponsesLanguageModel = class {
+       store,
+       toolNameMapping,
+       providerOptionsName,
+-      isShellProviderExecuted
++      isShellProviderExecuted,
++      isExplicitCompaction
+     };
+   }
+   async doGenerate(options) {
+@@ -6076,12 +6124,14 @@ var OpenAIResponsesLanguageModel = class {
+       toolNameMapping,
+       store,
+       providerOptionsName,
+-      isShellProviderExecuted
++      isShellProviderExecuted,
++      isExplicitCompaction
+     } = await this.getArgs(options);
+     const url = this.config.url({
+       path: "/responses",
+       modelId: this.modelId
+     });
++    const explicitCompactionAbortController = isExplicitCompaction ? new AbortController() : void 0;
+     const { responseHeaders, value: response } = await postJsonToApi5({
+       url,
+       headers: combineHeaders5(this.config.headers(), options.headers),
+@@ -6093,13 +6143,16 @@ var OpenAIResponsesLanguageModel = class {
+       successfulResponseHandler: createEventSourceResponseHandler3(
+         openaiResponsesChunkSchema
+       ),
+-      abortSignal: options.abortSignal,
++      abortSignal: explicitCompactionAbortController == null ? options.abortSignal : options.abortSignal == null ? explicitCompactionAbortController.signal : AbortSignal.any([
++        options.abortSignal,
++        explicitCompactionAbortController.signal
++      ]),
+       fetch: this.config.fetch
+     });
+     const checkedResponse = await throwIfOpenAIStreamErrorBeforeOutput({
+       stream: response,
+-      getError: (chunk) => isErrorChunk(chunk) || isResponseFailedChunk(chunk) && chunk.response.error != null ? chunk : void 0,
+-      isOutputChunk: isResponseOutputChunk,
++      getError: (chunk) => isExplicitCompaction ? void 0 : isErrorChunk(chunk) || isResponseFailedChunk(chunk) && chunk.response.error != null ? chunk : void 0,
++      isOutputChunk: (chunk) => isExplicitCompaction || isResponseOutputChunk(chunk),
+       url,
+       requestBodyValues: body,
+       responseHeaders
+@@ -6123,6 +6176,29 @@ var OpenAIResponsesLanguageModel = class {
+     let reasoningContext;
+     const hostedToolSearchCallIds = [];
+     let encounteredStreamError = false;
++    let explicitCompactionOutput;
++    let explicitCompactionOutputCount = 0;
++    let explicitCompactionTerminal = false;
++    let explicitCompactionHeaders = responseHeaders;
++    const emitExplicitCompactionTerminal = (controller, outcome) => {
++      if (explicitCompactionTerminal) return;
++      explicitCompactionTerminal = true;
++      const terminal = {
++        type: "opencode.compaction.terminal",
++        version: 1,
++        headers: explicitCompactionHeaders,
++        cancel: () => explicitCompactionAbortController == null ? void 0 : explicitCompactionAbortController.abort(),
++        outcome
++      };
++      if (options.includeRawChunks) {
++        controller.enqueue({ type: "raw", rawValue: terminal });
++      } else {
++        controller.enqueue({
++          type: "error",
++          error: new Error("OpenAI Responses explicit compaction requires includeRawChunks")
++        });
++      }
++    };
+     const result = {
+       stream: checkedResponse.pipeThrough(
+         new TransformStream({
+@@ -6131,6 +6207,60 @@ var OpenAIResponsesLanguageModel = class {
+           },
+           transform(chunk, controller) {
+             var _a, _b, _c, _d, _e, _f, _g, _h, _i, _j, _k, _l, _m, _n, _o, _p, _q, _r, _s, _t, _u, _v, _w, _x, _y, _z, _A, _B, _C, _D, _E, _F, _G, _H, _I, _J, _K, _L, _M, _N;
++            if (isExplicitCompaction) {
++              if (explicitCompactionTerminal) return;
++              if (!chunk.success) {
++                emitExplicitCompactionTerminal(controller, {
++                  type: "protocol-error",
++                  message: "OpenAI Responses explicit compaction stream event was invalid",
++                  cause: chunk.error
++                });
++                return;
++              }
++              const value2 = chunk.value;
++              const metadataHeaders = explicitCompactionHeadersFromChunk(value2);
++              if (metadataHeaders) {
++                explicitCompactionHeaders = {
++                  ...explicitCompactionHeaders,
++                  ...metadataHeaders
++                };
++              }
++              if (isResponseOutputItemDoneChunk(value2)) {
++                if (value2.item.type === "compaction") {
++                  explicitCompactionOutputCount += 1;
++                  explicitCompactionOutput ??= value2.item;
++                }
++                return;
++              }
++              if (value2.type === "response.completed") {
++                if (explicitCompactionOutputCount !== 1 || explicitCompactionOutput == null) {
++                  emitExplicitCompactionTerminal(controller, {
++                    type: "protocol-error",
++                    message: `OpenAI Responses explicit compaction expected exactly one compaction output item, got ${explicitCompactionOutputCount}`,
++                    cause: value2
++                  });
++                } else {
++                  emitExplicitCompactionTerminal(controller, {
++                    type: "completed",
++                    input: body.input.filter((item) => !isCompactionTrigger(item)),
++                    output: explicitCompactionOutput
++                  });
++                }
++                return;
++              }
++              if (value2.type === "response.incomplete") {
++                emitExplicitCompactionTerminal(controller, { type: "incomplete", cause: value2 });
++                return;
++              }
++              if (value2.type === "response.failed") {
++                emitExplicitCompactionTerminal(controller, { type: "failed", cause: value2 });
++                return;
++              }
++              if (value2.type === "error") {
++                emitExplicitCompactionTerminal(controller, { type: "stream-error", cause: value2 });
++              }
++              return;
++            }
+             if (options.includeRawChunks) {
+               controller.enqueue({ type: "raw", rawValue: chunk.rawValue });
+             }
+@@ -6868,7 +6998,7 @@ var OpenAIResponsesLanguageModel = class {
+                 }),
+                 raw: (_x = (_w = value.response.incomplete_details) == null ? void 0 : _w.reason) != null ? _x : void 0
+               };
+-              usage = value.response.usage;
++              usage = value.response.usage ?? void 0;
+               if (typeof value.response.service_tier === "string") {
+                 serviceTier = value.response.service_tier;
+               }
+@@ -6969,6 +7099,12 @@ var OpenAIResponsesLanguageModel = class {
+             }
+           },
+           flush(controller) {
++            if (isExplicitCompaction) {
++              if (!explicitCompactionTerminal) {
++                emitExplicitCompactionTerminal(controller, { type: "stream-closed" });
++              }
++              return;
++            }
+             const providerMetadata = {
+               [providerOptionsName]: {
+                 responseId,
+@@ -7020,6 +7156,28 @@ function createOpenAIResponsesChatCompletionsMismatchError({
+ function asRecord2(value) {
+   return typeof value === "object" && value != null ? value : void 0;
+ }
++function isSystemInput(value) {
++  if (typeof value !== "object" || value == null) return false;
++  const role = value.role;
++  return role === "system" || role === "developer";
++}
++function isCompactionTrigger(value) {
++  return typeof value === "object" && value != null && value.type === "compaction_trigger";
++}
++function explicitCompactionHeadersFromChunk(value) {
++  const raw = asRecord2(value);
++  const response = asRecord2(raw == null ? void 0 : raw.response);
++  const metadata = asRecord2(raw == null ? void 0 : raw.metadata);
++  const responseMetadata = asRecord2(response == null ? void 0 : response.metadata);
++  const candidates = [raw == null ? void 0 : raw.headers, metadata == null ? void 0 : metadata.headers, response == null ? void 0 : response.headers, responseMetadata == null ? void 0 : responseMetadata.headers];
++  for (const candidate of candidates) {
++    const headers = asRecord2(candidate);
++    if (!headers) continue;
++    const stringHeaders = Object.fromEntries(Object.entries(headers).filter((entry) => typeof entry[1] === "string"));
++    if (Object.keys(stringHeaders).length > 0) return stringHeaders;
++  }
++  return void 0;
++}
+ function isResponseOutputItemDoneChunk(chunk) {
+   return chunk.type === "response.output_item.done";
+ }
 diff --git a/dist/internal/index.js b/dist/internal/index.js
-index ad78b5df9359509091f4b8a1751dc34c03c74e32..ed92f56d8fe9c1442f741ef8d42d592ce9b28643 100644
+index ad78b5df9359509091f4b8a1751dc34c03c74e32..8f9d7c8e5947b44e8ed8e5951afeb6de7e5be188 100644
 --- a/dist/internal/index.js
 +++ b/dist/internal/index.js
 @@ -1070,22 +1070,6 @@ var OpenAIChatLanguageModel = class {
@@ -125,7 +881,197 @@ index ad78b5df9359509091f4b8a1751dc34c03c74e32..ed92f56d8fe9c1442f741ef8d42d592c
      const {
        tools: openaiTools,
        toolChoice: openaiToolChoice,
-@@ -5724,22 +5708,6 @@ var OpenAIResponsesLanguageModel = class {
+@@ -3671,6 +3655,54 @@ var jsonValueSchema = import_v418.z.lazy(
+     import_v418.z.record(import_v418.z.string(), jsonValueSchema.optional())
+   ])
+ );
++var openaiResponsesCompactionSchema = import_v418.z.object({
++  type: import_v418.z.literal("compaction"),
++  id: import_v418.z.string().optional(),
++  encrypted_content: import_v418.z.string(),
++  internal_chat_message_metadata_passthrough: jsonValueSchema.optional()
++}).loose();
++var openaiResponsesCompactionDoneSchema = import_v418.z.object({
++  type: import_v418.z.literal("response.output_item.done"),
++  output_index: import_v418.z.number().optional(),
++  item: openaiResponsesCompactionSchema
++});
++var openaiResponsesCompactionUsageSchema = import_v418.z.object({
++  input_tokens: import_v418.z.number(),
++  input_tokens_details: import_v418.z.object({
++    cached_tokens: import_v418.z.number().nullish(),
++    cache_write_tokens: import_v418.z.number().nullish(),
++    orchestration_input_tokens: import_v418.z.number().nullish(),
++    orchestration_input_cached_tokens: import_v418.z.number().nullish()
++  }).nullish(),
++  output_tokens: import_v418.z.number(),
++  output_tokens_details: import_v418.z.object({
++    reasoning_tokens: import_v418.z.number().nullish(),
++    orchestration_output_tokens: import_v418.z.number().nullish()
++  }).nullish()
++});
++var openaiResponsesCompactionFinishedSchema = import_v418.z.object({
++  type: import_v418.z.enum(["response.completed", "response.incomplete"]),
++  response: import_v418.z.object({
++    id: import_v418.z.string(),
++    incomplete_details: import_v418.z.object({ reason: import_v418.z.string() }).nullish(),
++    usage: openaiResponsesCompactionUsageSchema.nullish(),
++    reasoning: import_v418.z.object({ context: import_v418.z.string().nullish() }).nullish(),
++    service_tier: import_v418.z.string().nullish(),
++    output: import_v418.z.array(jsonValueSchema).optional()
++  }).loose()
++});
++var openaiResponsesCompactionFailedSchema = import_v418.z.object({
++  type: import_v418.z.literal("response.failed"),
++  sequence_number: import_v418.z.number().optional(),
++  response: import_v418.z.object({
++    id: import_v418.z.string(),
++    error: import_v418.z.object({ code: import_v418.z.string().nullish(), message: import_v418.z.string().nullish() }).nullish(),
++    incomplete_details: import_v418.z.object({ reason: import_v418.z.string() }).nullish(),
++    usage: openaiResponsesCompactionUsageSchema.nullish(),
++    reasoning: import_v418.z.object({ context: import_v418.z.string().nullish() }).nullish(),
++    service_tier: import_v418.z.string().nullish()
++  }).loose()
++});
+ var openaiResponsesNestedErrorChunkSchema = import_v418.z.object({
+   type: import_v418.z.literal("error"),
+   sequence_number: import_v418.z.number(),
+@@ -3691,6 +3723,12 @@ var openaiResponsesErrorChunkSchema = import_v418.z.object({
+ var openaiResponsesChunkSchema = (0, import_provider_utils25.lazySchema)(
+   () => (0, import_provider_utils25.zodSchema)(
+     import_v418.z.union([
++      import_v418.z.object({
++        type: import_v418.z.literal("response.metadata"),
++        headers: import_v418.z.record(import_v418.z.string(), import_v418.z.unknown()).optional(),
++        metadata: import_v418.z.record(import_v418.z.string(), import_v418.z.unknown()).optional(),
++        response: import_v418.z.record(import_v418.z.string(), import_v418.z.unknown()).optional()
++      }),
+       import_v418.z.object({
+         type: import_v418.z.literal("response.output_text.delta"),
+         item_id: import_v418.z.string(),
+@@ -3729,7 +3767,8 @@ var openaiResponsesChunkSchema = (0, import_provider_utils25.lazySchema)(
+           reasoning: import_v418.z.object({
+             context: import_v418.z.string().nullish()
+           }).nullish(),
+-          service_tier: import_v418.z.string().nullish()
++          service_tier: import_v418.z.string().nullish(),
++          output: import_v418.z.array(jsonValueSchema).optional()
+         })
+       }),
+       import_v418.z.object({
+@@ -3761,6 +3800,8 @@ var openaiResponsesChunkSchema = (0, import_provider_utils25.lazySchema)(
+           service_tier: import_v418.z.string().nullish()
+         })
+       }),
++      openaiResponsesCompactionFinishedSchema,
++      openaiResponsesCompactionFailedSchema,
+       import_v418.z.object({
+         type: import_v418.z.literal("response.created"),
+         response: import_v418.z.object({
+@@ -3774,6 +3815,7 @@ var openaiResponsesChunkSchema = (0, import_provider_utils25.lazySchema)(
+         type: import_v418.z.literal("response.output_item.added"),
+         output_index: import_v418.z.number(),
+         item: import_v418.z.discriminatedUnion("type", [
++          openaiResponsesCompactionSchema,
+           import_v418.z.object({
+             type: import_v418.z.literal("message"),
+             id: import_v418.z.string(),
+@@ -3912,10 +3954,12 @@ var openaiResponsesChunkSchema = (0, import_provider_utils25.lazySchema)(
+           })
+         ])
+       }),
++      openaiResponsesCompactionDoneSchema,
+       import_v418.z.object({
+         type: import_v418.z.literal("response.output_item.done"),
+         output_index: import_v418.z.number(),
+         item: import_v418.z.discriminatedUnion("type", [
++          openaiResponsesCompactionSchema,
+           import_v418.z.object({
+             type: import_v418.z.literal("message"),
+             id: import_v418.z.string(),
+@@ -4413,6 +4457,7 @@ var openaiResponsesResponseSchema = (0, import_provider_utils25.lazySchema)(
+               })
+             )
+           }),
++          openaiResponsesCompactionSchema,
+           import_v418.z.object({
+             type: import_v418.z.literal("mcp_call"),
+             id: import_v418.z.string(),
+@@ -4802,6 +4847,12 @@ var openaiLanguageModelResponsesOptionsSchema = (0, import_provider_utils26.lazy
+        * and defaults `systemMessageMode` to `developer` unless overridden.
+        */
+       forceReasoning: import_v419.z.boolean().optional(),
++      opencode: import_v419.z.object({
++        version: import_v419.z.literal(1),
++        instructions: import_v419.z.string().optional(),
++        replayInput: import_v419.z.array(import_v419.z.unknown()).optional(),
++        explicitCompaction: import_v419.z.literal(true).optional()
++      }).optional(),
+       /**
+        * Restrict the callable tools to a subset while keeping the full tools
+        * list intact, so prompt caching is preserved across requests with
+@@ -5537,6 +5588,8 @@ var OpenAIResponsesLanguageModel = class {
+         schema: openaiLanguageModelResponsesOptionsSchema
+       });
+     }
++    const opencodeOptions = openaiOptions == null ? void 0 : openaiOptions.opencode;
++    const isExplicitCompaction = (opencodeOptions == null ? void 0 : opencodeOptions.explicitCompaction) === true;
+     const isReasoningModel = (_a = openaiOptions == null ? void 0 : openaiOptions.forceReasoning) != null ? _a : modelCapabilities.isReasoningModel;
+     if ((openaiOptions == null ? void 0 : openaiOptions.conversation) && (openaiOptions == null ? void 0 : openaiOptions.previousResponseId)) {
+       warnings.push({
+@@ -5573,14 +5626,14 @@ var OpenAIResponsesLanguageModel = class {
+       toolNameMapping,
+       customProviderToolNames
+     });
+-    const { input, warnings: inputWarnings } = await convertToOpenAIResponsesInput({
++    const { input: convertedInput, warnings: inputWarnings } = await convertToOpenAIResponsesInput({
+       prompt,
+       toolNameMapping,
+       systemMessageMode: (_c = openaiOptions == null ? void 0 : openaiOptions.systemMessageMode) != null ? _c : isReasoningModel ? "developer" : modelCapabilities.systemMessageMode,
+       providerOptionsName,
+       fileIdPrefixes: this.config.fileIdPrefixes,
+       passThroughUnsupportedFiles: (_d = openaiOptions == null ? void 0 : openaiOptions.passThroughUnsupportedFiles) != null ? _d : false,
+-      store: (_e = openaiOptions == null ? void 0 : openaiOptions.store) != null ? _e : true,
++      store: isExplicitCompaction ? false : (openaiOptions == null ? void 0 : openaiOptions.store) ?? true,
+       hasConversation: (openaiOptions == null ? void 0 : openaiOptions.conversation) != null,
+       hasPreviousResponseId: (openaiOptions == null ? void 0 : openaiOptions.previousResponseId) != null,
+       hasLocalShellTool: hasOpenAITool("openai.local_shell"),
+@@ -5588,6 +5641,16 @@ var OpenAIResponsesLanguageModel = class {
+       hasApplyPatchTool: hasOpenAITool("openai.apply_patch"),
+       customProviderToolNames: customProviderToolNames.size > 0 ? customProviderToolNames : void 0
+     });
++    const replayInput = (opencodeOptions == null ? void 0 : opencodeOptions.replayInput) ?? [];
++    const hasOpenCodeInput = (opencodeOptions == null ? void 0 : opencodeOptions.instructions) !== void 0 || (opencodeOptions == null ? void 0 : opencodeOptions.replayInput) !== void 0 || isExplicitCompaction;
++    const systemInput = convertedInput.filter(isSystemInput);
++    const conversationInput = convertedInput.filter((item) => !isSystemInput(item) && !isCompactionTrigger(item));
++    const input = hasOpenCodeInput ? [
++      ...((opencodeOptions == null ? void 0 : opencodeOptions.instructions) === void 0 ? systemInput : []),
++      ...replayInput.filter((item) => !isCompactionTrigger(item)),
++      ...conversationInput,
++      ...isExplicitCompaction ? [{ type: "compaction_trigger" }] : []
++    ] : convertedInput;
+     warnings.push(...inputWarnings);
+     const strictJsonSchema = (_f = openaiOptions == null ? void 0 : openaiOptions.strictJsonSchema) != null ? _f : true;
+     let include = openaiOptions == null ? void 0 : openaiOptions.include;
+@@ -5614,7 +5677,7 @@ var OpenAIResponsesLanguageModel = class {
+     if (hasOpenAITool("openai.code_interpreter")) {
+       addInclude("code_interpreter_call.outputs");
+     }
+-    const store = openaiOptions == null ? void 0 : openaiOptions.store;
++    const store = isExplicitCompaction ? false : openaiOptions == null ? void 0 : openaiOptions.store;
+     if (store === false && isReasoningModel) {
+       addInclude("reasoning.encrypted_content");
+     }
+@@ -5648,7 +5711,7 @@ var OpenAIResponsesLanguageModel = class {
+       previous_response_id: openaiOptions == null ? void 0 : openaiOptions.previousResponseId,
+       store,
+       user: openaiOptions == null ? void 0 : openaiOptions.user,
+-      instructions: openaiOptions == null ? void 0 : openaiOptions.instructions,
++      instructions: (opencodeOptions == null ? void 0 : opencodeOptions.instructions) ?? (openaiOptions == null ? void 0 : openaiOptions.instructions),
+       service_tier: openaiOptions == null ? void 0 : openaiOptions.serviceTier,
+       include,
+       prompt_cache_key: openaiOptions == null ? void 0 : openaiOptions.promptCacheKey,
+@@ -5724,22 +5787,6 @@ var OpenAIResponsesLanguageModel = class {
          });
        }
      }
@@ -148,8 +1094,196 @@ index ad78b5df9359509091f4b8a1751dc34c03c74e32..ed92f56d8fe9c1442f741ef8d42d592c
      const shellToolEnvType = (_k = (_j = (_i = tools == null ? void 0 : tools.find(
        (tool) => tool.type === "provider" && tool.id === "openai.shell"
      )) == null ? void 0 : _i.args) == null ? void 0 : _j.environment) == null ? void 0 : _k.type;
+@@ -5755,7 +5802,8 @@ var OpenAIResponsesLanguageModel = class {
+       store,
+       toolNameMapping,
+       providerOptionsName,
+-      isShellProviderExecuted
++      isShellProviderExecuted,
++      isExplicitCompaction
+     };
+   }
+   async doGenerate(options) {
+@@ -6243,12 +6291,14 @@ var OpenAIResponsesLanguageModel = class {
+       toolNameMapping,
+       store,
+       providerOptionsName,
+-      isShellProviderExecuted
++      isShellProviderExecuted,
++      isExplicitCompaction
+     } = await this.getArgs(options);
+     const url = this.config.url({
+       path: "/responses",
+       modelId: this.modelId
+     });
++    const explicitCompactionAbortController = isExplicitCompaction ? new AbortController() : void 0;
+     const { responseHeaders, value: response } = await (0, import_provider_utils35.postJsonToApi)({
+       url,
+       headers: (0, import_provider_utils35.combineHeaders)(this.config.headers(), options.headers),
+@@ -6260,13 +6310,16 @@ var OpenAIResponsesLanguageModel = class {
+       successfulResponseHandler: (0, import_provider_utils35.createEventSourceResponseHandler)(
+         openaiResponsesChunkSchema
+       ),
+-      abortSignal: options.abortSignal,
++      abortSignal: explicitCompactionAbortController == null ? options.abortSignal : options.abortSignal == null ? explicitCompactionAbortController.signal : AbortSignal.any([
++        options.abortSignal,
++        explicitCompactionAbortController.signal
++      ]),
+       fetch: this.config.fetch
+     });
+     const checkedResponse = await throwIfOpenAIStreamErrorBeforeOutput({
+       stream: response,
+-      getError: (chunk) => isErrorChunk(chunk) || isResponseFailedChunk(chunk) && chunk.response.error != null ? chunk : void 0,
+-      isOutputChunk: isResponseOutputChunk,
++      getError: (chunk) => isExplicitCompaction ? void 0 : isErrorChunk(chunk) || isResponseFailedChunk(chunk) && chunk.response.error != null ? chunk : void 0,
++      isOutputChunk: (chunk) => isExplicitCompaction || isResponseOutputChunk(chunk),
+       url,
+       requestBodyValues: body,
+       responseHeaders
+@@ -6290,6 +6343,29 @@ var OpenAIResponsesLanguageModel = class {
+     let reasoningContext;
+     const hostedToolSearchCallIds = [];
+     let encounteredStreamError = false;
++    let explicitCompactionOutput;
++    let explicitCompactionOutputCount = 0;
++    let explicitCompactionTerminal = false;
++    let explicitCompactionHeaders = responseHeaders;
++    const emitExplicitCompactionTerminal = (controller, outcome) => {
++      if (explicitCompactionTerminal) return;
++      explicitCompactionTerminal = true;
++      const terminal = {
++        type: "opencode.compaction.terminal",
++        version: 1,
++        headers: explicitCompactionHeaders,
++        cancel: () => explicitCompactionAbortController == null ? void 0 : explicitCompactionAbortController.abort(),
++        outcome
++      };
++      if (options.includeRawChunks) {
++        controller.enqueue({ type: "raw", rawValue: terminal });
++      } else {
++        controller.enqueue({
++          type: "error",
++          error: new Error("OpenAI Responses explicit compaction requires includeRawChunks")
++        });
++      }
++    };
+     const result = {
+       stream: checkedResponse.pipeThrough(
+         new TransformStream({
+@@ -6298,6 +6374,60 @@ var OpenAIResponsesLanguageModel = class {
+           },
+           transform(chunk, controller) {
+             var _a, _b, _c, _d, _e, _f, _g, _h, _i, _j, _k, _l, _m, _n, _o, _p, _q, _r, _s, _t, _u, _v, _w, _x, _y, _z, _A, _B, _C, _D, _E, _F, _G, _H, _I, _J, _K, _L, _M, _N;
++            if (isExplicitCompaction) {
++              if (explicitCompactionTerminal) return;
++              if (!chunk.success) {
++                emitExplicitCompactionTerminal(controller, {
++                  type: "protocol-error",
++                  message: "OpenAI Responses explicit compaction stream event was invalid",
++                  cause: chunk.error
++                });
++                return;
++              }
++              const value2 = chunk.value;
++              const metadataHeaders = explicitCompactionHeadersFromChunk(value2);
++              if (metadataHeaders) {
++                explicitCompactionHeaders = {
++                  ...explicitCompactionHeaders,
++                  ...metadataHeaders
++                };
++              }
++              if (isResponseOutputItemDoneChunk(value2)) {
++                if (value2.item.type === "compaction") {
++                  explicitCompactionOutputCount += 1;
++                  explicitCompactionOutput ??= value2.item;
++                }
++                return;
++              }
++              if (value2.type === "response.completed") {
++                if (explicitCompactionOutputCount !== 1 || explicitCompactionOutput == null) {
++                  emitExplicitCompactionTerminal(controller, {
++                    type: "protocol-error",
++                    message: `OpenAI Responses explicit compaction expected exactly one compaction output item, got ${explicitCompactionOutputCount}`,
++                    cause: value2
++                  });
++                } else {
++                  emitExplicitCompactionTerminal(controller, {
++                    type: "completed",
++                    input: body.input.filter((item) => !isCompactionTrigger(item)),
++                    output: explicitCompactionOutput
++                  });
++                }
++                return;
++              }
++              if (value2.type === "response.incomplete") {
++                emitExplicitCompactionTerminal(controller, { type: "incomplete", cause: value2 });
++                return;
++              }
++              if (value2.type === "response.failed") {
++                emitExplicitCompactionTerminal(controller, { type: "failed", cause: value2 });
++                return;
++              }
++              if (value2.type === "error") {
++                emitExplicitCompactionTerminal(controller, { type: "stream-error", cause: value2 });
++              }
++              return;
++            }
+             if (options.includeRawChunks) {
+               controller.enqueue({ type: "raw", rawValue: chunk.rawValue });
+             }
+@@ -7035,7 +7165,7 @@ var OpenAIResponsesLanguageModel = class {
+                 }),
+                 raw: (_x = (_w = value.response.incomplete_details) == null ? void 0 : _w.reason) != null ? _x : void 0
+               };
+-              usage = value.response.usage;
++              usage = value.response.usage ?? void 0;
+               if (typeof value.response.service_tier === "string") {
+                 serviceTier = value.response.service_tier;
+               }
+@@ -7136,6 +7266,12 @@ var OpenAIResponsesLanguageModel = class {
+             }
+           },
+           flush(controller) {
++            if (isExplicitCompaction) {
++              if (!explicitCompactionTerminal) {
++                emitExplicitCompactionTerminal(controller, { type: "stream-closed" });
++              }
++              return;
++            }
+             const providerMetadata = {
+               [providerOptionsName]: {
+                 responseId,
+@@ -7187,6 +7323,28 @@ function createOpenAIResponsesChatCompletionsMismatchError({
+ function asRecord2(value) {
+   return typeof value === "object" && value != null ? value : void 0;
+ }
++function isSystemInput(value) {
++  if (typeof value !== "object" || value == null) return false;
++  const role = value.role;
++  return role === "system" || role === "developer";
++}
++function isCompactionTrigger(value) {
++  return typeof value === "object" && value != null && value.type === "compaction_trigger";
++}
++function explicitCompactionHeadersFromChunk(value) {
++  const raw = asRecord2(value);
++  const response = asRecord2(raw == null ? void 0 : raw.response);
++  const metadata = asRecord2(raw == null ? void 0 : raw.metadata);
++  const responseMetadata = asRecord2(response == null ? void 0 : response.metadata);
++  const candidates = [raw == null ? void 0 : raw.headers, metadata == null ? void 0 : metadata.headers, response == null ? void 0 : response.headers, responseMetadata == null ? void 0 : responseMetadata.headers];
++  for (const candidate of candidates) {
++    const headers = asRecord2(candidate);
++    if (!headers) continue;
++    const stringHeaders = Object.fromEntries(Object.entries(headers).filter((entry) => typeof entry[1] === "string"));
++    if (Object.keys(stringHeaders).length > 0) return stringHeaders;
++  }
++  return void 0;
++}
+ function isResponseOutputItemDoneChunk(chunk) {
+   return chunk.type === "response.output_item.done";
+ }
 diff --git a/dist/internal/index.mjs b/dist/internal/index.mjs
-index db7d6741c9ea615d577ea07722b469c144066268..f6b41b2832d2c8392072e0ecc1612e9e18b1b48e 100644
+index db7d6741c9ea615d577ea07722b469c144066268..6aad9c1f808985d1e68a714620b516df4df1198b 100644
 --- a/dist/internal/index.mjs
 +++ b/dist/internal/index.mjs
 @@ -1023,22 +1023,6 @@ var OpenAIChatLanguageModel = class {
@@ -175,7 +1309,197 @@ index db7d6741c9ea615d577ea07722b469c144066268..f6b41b2832d2c8392072e0ecc1612e9e
      const {
        tools: openaiTools,
        toolChoice: openaiToolChoice,
-@@ -5802,22 +5786,6 @@ var OpenAIResponsesLanguageModel = class {
+@@ -3716,6 +3700,54 @@ var jsonValueSchema = z18.lazy(
+     z18.record(z18.string(), jsonValueSchema.optional())
+   ])
+ );
++var openaiResponsesCompactionSchema = z18.object({
++  type: z18.literal("compaction"),
++  id: z18.string().optional(),
++  encrypted_content: z18.string(),
++  internal_chat_message_metadata_passthrough: jsonValueSchema.optional()
++}).loose();
++var openaiResponsesCompactionDoneSchema = z18.object({
++  type: z18.literal("response.output_item.done"),
++  output_index: z18.number().optional(),
++  item: openaiResponsesCompactionSchema
++});
++var openaiResponsesCompactionUsageSchema = z18.object({
++  input_tokens: z18.number(),
++  input_tokens_details: z18.object({
++    cached_tokens: z18.number().nullish(),
++    cache_write_tokens: z18.number().nullish(),
++    orchestration_input_tokens: z18.number().nullish(),
++    orchestration_input_cached_tokens: z18.number().nullish()
++  }).nullish(),
++  output_tokens: z18.number(),
++  output_tokens_details: z18.object({
++    reasoning_tokens: z18.number().nullish(),
++    orchestration_output_tokens: z18.number().nullish()
++  }).nullish()
++});
++var openaiResponsesCompactionFinishedSchema = z18.object({
++  type: z18.enum(["response.completed", "response.incomplete"]),
++  response: z18.object({
++    id: z18.string(),
++    incomplete_details: z18.object({ reason: z18.string() }).nullish(),
++    usage: openaiResponsesCompactionUsageSchema.nullish(),
++    reasoning: z18.object({ context: z18.string().nullish() }).nullish(),
++    service_tier: z18.string().nullish(),
++    output: z18.array(jsonValueSchema).optional()
++  }).loose()
++});
++var openaiResponsesCompactionFailedSchema = z18.object({
++  type: z18.literal("response.failed"),
++  sequence_number: z18.number().optional(),
++  response: z18.object({
++    id: z18.string(),
++    error: z18.object({ code: z18.string().nullish(), message: z18.string().nullish() }).nullish(),
++    incomplete_details: z18.object({ reason: z18.string() }).nullish(),
++    usage: openaiResponsesCompactionUsageSchema.nullish(),
++    reasoning: z18.object({ context: z18.string().nullish() }).nullish(),
++    service_tier: z18.string().nullish()
++  }).loose()
++});
+ var openaiResponsesNestedErrorChunkSchema = z18.object({
+   type: z18.literal("error"),
+   sequence_number: z18.number(),
+@@ -3736,6 +3768,12 @@ var openaiResponsesErrorChunkSchema = z18.object({
+ var openaiResponsesChunkSchema = lazySchema16(
+   () => zodSchema16(
+     z18.union([
++      z18.object({
++        type: z18.literal("response.metadata"),
++        headers: z18.record(z18.string(), z18.unknown()).optional(),
++        metadata: z18.record(z18.string(), z18.unknown()).optional(),
++        response: z18.record(z18.string(), z18.unknown()).optional()
++      }),
+       z18.object({
+         type: z18.literal("response.output_text.delta"),
+         item_id: z18.string(),
+@@ -3774,7 +3812,8 @@ var openaiResponsesChunkSchema = lazySchema16(
+           reasoning: z18.object({
+             context: z18.string().nullish()
+           }).nullish(),
+-          service_tier: z18.string().nullish()
++          service_tier: z18.string().nullish(),
++          output: z18.array(jsonValueSchema).optional()
+         })
+       }),
+       z18.object({
+@@ -3806,6 +3845,8 @@ var openaiResponsesChunkSchema = lazySchema16(
+           service_tier: z18.string().nullish()
+         })
+       }),
++      openaiResponsesCompactionFinishedSchema,
++      openaiResponsesCompactionFailedSchema,
+       z18.object({
+         type: z18.literal("response.created"),
+         response: z18.object({
+@@ -3819,6 +3860,7 @@ var openaiResponsesChunkSchema = lazySchema16(
+         type: z18.literal("response.output_item.added"),
+         output_index: z18.number(),
+         item: z18.discriminatedUnion("type", [
++          openaiResponsesCompactionSchema,
+           z18.object({
+             type: z18.literal("message"),
+             id: z18.string(),
+@@ -3957,10 +3999,12 @@ var openaiResponsesChunkSchema = lazySchema16(
+           })
+         ])
+       }),
++      openaiResponsesCompactionDoneSchema,
+       z18.object({
+         type: z18.literal("response.output_item.done"),
+         output_index: z18.number(),
+         item: z18.discriminatedUnion("type", [
++          openaiResponsesCompactionSchema,
+           z18.object({
+             type: z18.literal("message"),
+             id: z18.string(),
+@@ -4458,6 +4502,7 @@ var openaiResponsesResponseSchema = lazySchema16(
+               })
+             )
+           }),
++          openaiResponsesCompactionSchema,
+           z18.object({
+             type: z18.literal("mcp_call"),
+             id: z18.string(),
+@@ -4850,6 +4895,12 @@ var openaiLanguageModelResponsesOptionsSchema = lazySchema17(
+        * and defaults `systemMessageMode` to `developer` unless overridden.
+        */
+       forceReasoning: z19.boolean().optional(),
++      opencode: z19.object({
++        version: z19.literal(1),
++        instructions: z19.string().optional(),
++        replayInput: z19.array(z19.unknown()).optional(),
++        explicitCompaction: z19.literal(true).optional()
++      }).optional(),
+       /**
+        * Restrict the callable tools to a subset while keeping the full tools
+        * list intact, so prompt caching is preserved across requests with
+@@ -5615,6 +5666,8 @@ var OpenAIResponsesLanguageModel = class {
+         schema: openaiLanguageModelResponsesOptionsSchema
+       });
+     }
++    const opencodeOptions = openaiOptions == null ? void 0 : openaiOptions.opencode;
++    const isExplicitCompaction = (opencodeOptions == null ? void 0 : opencodeOptions.explicitCompaction) === true;
+     const isReasoningModel = (_a = openaiOptions == null ? void 0 : openaiOptions.forceReasoning) != null ? _a : modelCapabilities.isReasoningModel;
+     if ((openaiOptions == null ? void 0 : openaiOptions.conversation) && (openaiOptions == null ? void 0 : openaiOptions.previousResponseId)) {
+       warnings.push({
+@@ -5651,14 +5704,14 @@ var OpenAIResponsesLanguageModel = class {
+       toolNameMapping,
+       customProviderToolNames
+     });
+-    const { input, warnings: inputWarnings } = await convertToOpenAIResponsesInput({
++    const { input: convertedInput, warnings: inputWarnings } = await convertToOpenAIResponsesInput({
+       prompt,
+       toolNameMapping,
+       systemMessageMode: (_c = openaiOptions == null ? void 0 : openaiOptions.systemMessageMode) != null ? _c : isReasoningModel ? "developer" : modelCapabilities.systemMessageMode,
+       providerOptionsName,
+       fileIdPrefixes: this.config.fileIdPrefixes,
+       passThroughUnsupportedFiles: (_d = openaiOptions == null ? void 0 : openaiOptions.passThroughUnsupportedFiles) != null ? _d : false,
+-      store: (_e = openaiOptions == null ? void 0 : openaiOptions.store) != null ? _e : true,
++      store: isExplicitCompaction ? false : (openaiOptions == null ? void 0 : openaiOptions.store) ?? true,
+       hasConversation: (openaiOptions == null ? void 0 : openaiOptions.conversation) != null,
+       hasPreviousResponseId: (openaiOptions == null ? void 0 : openaiOptions.previousResponseId) != null,
+       hasLocalShellTool: hasOpenAITool("openai.local_shell"),
+@@ -5666,6 +5719,16 @@ var OpenAIResponsesLanguageModel = class {
+       hasApplyPatchTool: hasOpenAITool("openai.apply_patch"),
+       customProviderToolNames: customProviderToolNames.size > 0 ? customProviderToolNames : void 0
+     });
++    const replayInput = (opencodeOptions == null ? void 0 : opencodeOptions.replayInput) ?? [];
++    const hasOpenCodeInput = (opencodeOptions == null ? void 0 : opencodeOptions.instructions) !== void 0 || (opencodeOptions == null ? void 0 : opencodeOptions.replayInput) !== void 0 || isExplicitCompaction;
++    const systemInput = convertedInput.filter(isSystemInput);
++    const conversationInput = convertedInput.filter((item) => !isSystemInput(item) && !isCompactionTrigger(item));
++    const input = hasOpenCodeInput ? [
++      ...((opencodeOptions == null ? void 0 : opencodeOptions.instructions) === void 0 ? systemInput : []),
++      ...replayInput.filter((item) => !isCompactionTrigger(item)),
++      ...conversationInput,
++      ...isExplicitCompaction ? [{ type: "compaction_trigger" }] : []
++    ] : convertedInput;
+     warnings.push(...inputWarnings);
+     const strictJsonSchema = (_f = openaiOptions == null ? void 0 : openaiOptions.strictJsonSchema) != null ? _f : true;
+     let include = openaiOptions == null ? void 0 : openaiOptions.include;
+@@ -5692,7 +5755,7 @@ var OpenAIResponsesLanguageModel = class {
+     if (hasOpenAITool("openai.code_interpreter")) {
+       addInclude("code_interpreter_call.outputs");
+     }
+-    const store = openaiOptions == null ? void 0 : openaiOptions.store;
++    const store = isExplicitCompaction ? false : openaiOptions == null ? void 0 : openaiOptions.store;
+     if (store === false && isReasoningModel) {
+       addInclude("reasoning.encrypted_content");
+     }
+@@ -5726,7 +5789,7 @@ var OpenAIResponsesLanguageModel = class {
+       previous_response_id: openaiOptions == null ? void 0 : openaiOptions.previousResponseId,
+       store,
+       user: openaiOptions == null ? void 0 : openaiOptions.user,
+-      instructions: openaiOptions == null ? void 0 : openaiOptions.instructions,
++      instructions: (opencodeOptions == null ? void 0 : opencodeOptions.instructions) ?? (openaiOptions == null ? void 0 : openaiOptions.instructions),
+       service_tier: openaiOptions == null ? void 0 : openaiOptions.serviceTier,
+       include,
+       prompt_cache_key: openaiOptions == null ? void 0 : openaiOptions.promptCacheKey,
+@@ -5802,22 +5865,6 @@ var OpenAIResponsesLanguageModel = class {
          });
        }
      }
@@ -198,6 +1522,194 @@ index db7d6741c9ea615d577ea07722b469c144066268..f6b41b2832d2c8392072e0ecc1612e9e
      const shellToolEnvType = (_k = (_j = (_i = tools == null ? void 0 : tools.find(
        (tool) => tool.type === "provider" && tool.id === "openai.shell"
      )) == null ? void 0 : _i.args) == null ? void 0 : _j.environment) == null ? void 0 : _k.type;
+@@ -5833,7 +5880,8 @@ var OpenAIResponsesLanguageModel = class {
+       store,
+       toolNameMapping,
+       providerOptionsName,
+-      isShellProviderExecuted
++      isShellProviderExecuted,
++      isExplicitCompaction
+     };
+   }
+   async doGenerate(options) {
+@@ -6321,12 +6369,14 @@ var OpenAIResponsesLanguageModel = class {
+       toolNameMapping,
+       store,
+       providerOptionsName,
+-      isShellProviderExecuted
++      isShellProviderExecuted,
++      isExplicitCompaction
+     } = await this.getArgs(options);
+     const url = this.config.url({
+       path: "/responses",
+       modelId: this.modelId
+     });
++    const explicitCompactionAbortController = isExplicitCompaction ? new AbortController() : void 0;
+     const { responseHeaders, value: response } = await postJsonToApi6({
+       url,
+       headers: combineHeaders7(this.config.headers(), options.headers),
+@@ -6338,13 +6388,16 @@ var OpenAIResponsesLanguageModel = class {
+       successfulResponseHandler: createEventSourceResponseHandler3(
+         openaiResponsesChunkSchema
+       ),
+-      abortSignal: options.abortSignal,
++      abortSignal: explicitCompactionAbortController == null ? options.abortSignal : options.abortSignal == null ? explicitCompactionAbortController.signal : AbortSignal.any([
++        options.abortSignal,
++        explicitCompactionAbortController.signal
++      ]),
+       fetch: this.config.fetch
+     });
+     const checkedResponse = await throwIfOpenAIStreamErrorBeforeOutput({
+       stream: response,
+-      getError: (chunk) => isErrorChunk(chunk) || isResponseFailedChunk(chunk) && chunk.response.error != null ? chunk : void 0,
+-      isOutputChunk: isResponseOutputChunk,
++      getError: (chunk) => isExplicitCompaction ? void 0 : isErrorChunk(chunk) || isResponseFailedChunk(chunk) && chunk.response.error != null ? chunk : void 0,
++      isOutputChunk: (chunk) => isExplicitCompaction || isResponseOutputChunk(chunk),
+       url,
+       requestBodyValues: body,
+       responseHeaders
+@@ -6368,6 +6421,29 @@ var OpenAIResponsesLanguageModel = class {
+     let reasoningContext;
+     const hostedToolSearchCallIds = [];
+     let encounteredStreamError = false;
++    let explicitCompactionOutput;
++    let explicitCompactionOutputCount = 0;
++    let explicitCompactionTerminal = false;
++    let explicitCompactionHeaders = responseHeaders;
++    const emitExplicitCompactionTerminal = (controller, outcome) => {
++      if (explicitCompactionTerminal) return;
++      explicitCompactionTerminal = true;
++      const terminal = {
++        type: "opencode.compaction.terminal",
++        version: 1,
++        headers: explicitCompactionHeaders,
++        cancel: () => explicitCompactionAbortController == null ? void 0 : explicitCompactionAbortController.abort(),
++        outcome
++      };
++      if (options.includeRawChunks) {
++        controller.enqueue({ type: "raw", rawValue: terminal });
++      } else {
++        controller.enqueue({
++          type: "error",
++          error: new Error("OpenAI Responses explicit compaction requires includeRawChunks")
++        });
++      }
++    };
+     const result = {
+       stream: checkedResponse.pipeThrough(
+         new TransformStream({
+@@ -6376,6 +6452,60 @@ var OpenAIResponsesLanguageModel = class {
+           },
+           transform(chunk, controller) {
+             var _a, _b, _c, _d, _e, _f, _g, _h, _i, _j, _k, _l, _m, _n, _o, _p, _q, _r, _s, _t, _u, _v, _w, _x, _y, _z, _A, _B, _C, _D, _E, _F, _G, _H, _I, _J, _K, _L, _M, _N;
++            if (isExplicitCompaction) {
++              if (explicitCompactionTerminal) return;
++              if (!chunk.success) {
++                emitExplicitCompactionTerminal(controller, {
++                  type: "protocol-error",
++                  message: "OpenAI Responses explicit compaction stream event was invalid",
++                  cause: chunk.error
++                });
++                return;
++              }
++              const value2 = chunk.value;
++              const metadataHeaders = explicitCompactionHeadersFromChunk(value2);
++              if (metadataHeaders) {
++                explicitCompactionHeaders = {
++                  ...explicitCompactionHeaders,
++                  ...metadataHeaders
++                };
++              }
++              if (isResponseOutputItemDoneChunk(value2)) {
++                if (value2.item.type === "compaction") {
++                  explicitCompactionOutputCount += 1;
++                  explicitCompactionOutput ??= value2.item;
++                }
++                return;
++              }
++              if (value2.type === "response.completed") {
++                if (explicitCompactionOutputCount !== 1 || explicitCompactionOutput == null) {
++                  emitExplicitCompactionTerminal(controller, {
++                    type: "protocol-error",
++                    message: `OpenAI Responses explicit compaction expected exactly one compaction output item, got ${explicitCompactionOutputCount}`,
++                    cause: value2
++                  });
++                } else {
++                  emitExplicitCompactionTerminal(controller, {
++                    type: "completed",
++                    input: body.input.filter((item) => !isCompactionTrigger(item)),
++                    output: explicitCompactionOutput
++                  });
++                }
++                return;
++              }
++              if (value2.type === "response.incomplete") {
++                emitExplicitCompactionTerminal(controller, { type: "incomplete", cause: value2 });
++                return;
++              }
++              if (value2.type === "response.failed") {
++                emitExplicitCompactionTerminal(controller, { type: "failed", cause: value2 });
++                return;
++              }
++              if (value2.type === "error") {
++                emitExplicitCompactionTerminal(controller, { type: "stream-error", cause: value2 });
++              }
++              return;
++            }
+             if (options.includeRawChunks) {
+               controller.enqueue({ type: "raw", rawValue: chunk.rawValue });
+             }
+@@ -7113,7 +7243,7 @@ var OpenAIResponsesLanguageModel = class {
+                 }),
+                 raw: (_x = (_w = value.response.incomplete_details) == null ? void 0 : _w.reason) != null ? _x : void 0
+               };
+-              usage = value.response.usage;
++              usage = value.response.usage ?? void 0;
+               if (typeof value.response.service_tier === "string") {
+                 serviceTier = value.response.service_tier;
+               }
+@@ -7214,6 +7344,12 @@ var OpenAIResponsesLanguageModel = class {
+             }
+           },
+           flush(controller) {
++            if (isExplicitCompaction) {
++              if (!explicitCompactionTerminal) {
++                emitExplicitCompactionTerminal(controller, { type: "stream-closed" });
++              }
++              return;
++            }
+             const providerMetadata = {
+               [providerOptionsName]: {
+                 responseId,
+@@ -7265,6 +7401,28 @@ function createOpenAIResponsesChatCompletionsMismatchError({
+ function asRecord2(value) {
+   return typeof value === "object" && value != null ? value : void 0;
+ }
++function isSystemInput(value) {
++  if (typeof value !== "object" || value == null) return false;
++  const role = value.role;
++  return role === "system" || role === "developer";
++}
++function isCompactionTrigger(value) {
++  return typeof value === "object" && value != null && value.type === "compaction_trigger";
++}
++function explicitCompactionHeadersFromChunk(value) {
++  const raw = asRecord2(value);
++  const response = asRecord2(raw == null ? void 0 : raw.response);
++  const metadata = asRecord2(raw == null ? void 0 : raw.metadata);
++  const responseMetadata = asRecord2(response == null ? void 0 : response.metadata);
++  const candidates = [raw == null ? void 0 : raw.headers, metadata == null ? void 0 : metadata.headers, response == null ? void 0 : response.headers, responseMetadata == null ? void 0 : responseMetadata.headers];
++  for (const candidate of candidates) {
++    const headers = asRecord2(candidate);
++    if (!headers) continue;
++    const stringHeaders = Object.fromEntries(Object.entries(headers).filter((entry) => typeof entry[1] === "string"));
++    if (Object.keys(stringHeaders).length > 0) return stringHeaders;
++  }
++  return void 0;
++}
+ function isResponseOutputItemDoneChunk(chunk) {
+   return chunk.type === "response.output_item.done";
+ }
 diff --git a/src/chat/openai-chat-language-model.ts b/src/chat/openai-chat-language-model.ts
 index 009a58deea236c2be03adc5cd03f98ed9050fd7b..a606675d82fc72a0bab8d52ac99866100e7ffb1d 100644
 --- a/src/chat/openai-chat-language-model.ts
@@ -237,11 +1749,291 @@ index 009a58deea236c2be03adc5cd03f98ed9050fd7b..a606675d82fc72a0bab8d52ac9986610
      const {
        tools: openaiTools,
        toolChoice: openaiToolChoice,
+diff --git a/src/responses/openai-responses-api.ts b/src/responses/openai-responses-api.ts
+index 9ab482d7417c2e547398846b2e44e305d095ef25..31baf302627a27a5ef4a4ea30be6d65bacf393bb 100644
+--- a/src/responses/openai-responses-api.ts
++++ b/src/responses/openai-responses-api.ts
+@@ -38,6 +38,8 @@ export type OpenAIResponsesInputItem =
+   | OpenAIResponsesToolSearchCall
+   | OpenAIResponsesToolSearchOutput
+   | OpenAIResponsesReasoning
++  | OpenAIResponsesCompaction
++  | OpenAIResponsesCompactionTrigger
+   | OpenAIResponsesItemReference;
+ 
+ export type OpenAIResponsesIncludeValue =
+@@ -520,6 +522,80 @@ export type OpenAIResponsesReasoning = {
+   }>;
+ };
+ 
++export type OpenAIResponsesCompaction = {
++  type: 'compaction';
++  id?: string;
++  encrypted_content: string;
++  internal_chat_message_metadata_passthrough?: JSONValue;
++};
++
++export type OpenAIResponsesCompactionTrigger = {
++  type: 'compaction_trigger';
++};
++
++const openaiResponsesCompactionSchema = z
++  .object({
++    type: z.literal('compaction'),
++    id: z.string().optional(),
++    encrypted_content: z.string(),
++    internal_chat_message_metadata_passthrough: jsonValueSchema.optional(),
++  })
++  .loose();
++
++const openaiResponsesCompactionDoneSchema = z.object({
++  type: z.literal('response.output_item.done'),
++  output_index: z.number().optional(),
++  item: openaiResponsesCompactionSchema,
++});
++
++const openaiResponsesCompactionUsageSchema = z.object({
++  input_tokens: z.number(),
++  input_tokens_details: z
++    .object({
++      cached_tokens: z.number().nullish(),
++      cache_write_tokens: z.number().nullish(),
++      orchestration_input_tokens: z.number().nullish(),
++      orchestration_input_cached_tokens: z.number().nullish(),
++    })
++    .nullish(),
++  output_tokens: z.number(),
++  output_tokens_details: z
++    .object({
++      reasoning_tokens: z.number().nullish(),
++      orchestration_output_tokens: z.number().nullish(),
++    })
++    .nullish(),
++});
++
++const openaiResponsesCompactionFinishedSchema = z.object({
++  type: z.enum(['response.completed', 'response.incomplete']),
++  response: z
++    .object({
++      id: z.string(),
++      incomplete_details: z.object({ reason: z.string() }).nullish(),
++      usage: openaiResponsesCompactionUsageSchema.nullish(),
++      reasoning: z.object({ context: z.string().nullish() }).nullish(),
++      service_tier: z.string().nullish(),
++      output: z.array(jsonValueSchema).optional(),
++    })
++    .loose(),
++});
++
++const openaiResponsesCompactionFailedSchema = z.object({
++  type: z.literal('response.failed'),
++  sequence_number: z.number().optional(),
++  response: z
++    .object({
++      id: z.string(),
++      error: z.object({ code: z.string().nullish(), message: z.string().nullish() }).nullish(),
++      incomplete_details: z.object({ reason: z.string() }).nullish(),
++      usage: openaiResponsesCompactionUsageSchema.nullish(),
++      reasoning: z.object({ context: z.string().nullish() }).nullish(),
++      service_tier: z.string().nullish(),
++    })
++    .loose(),
++});
++
+ // Captured from the Responses API when OpenAI returned an early
+ // insufficient_quota stream error after HTTP 200. This shape differs from the
+ // currently documented ResponseErrorEvent below.
+@@ -547,6 +623,12 @@ const openaiResponsesErrorChunkSchema = z.object({
+ export const openaiResponsesChunkSchema = lazySchema(() =>
+   zodSchema(
+     z.union([
++      z.object({
++        type: z.literal('response.metadata'),
++        headers: z.record(z.string(), z.unknown()).optional(),
++        metadata: z.record(z.string(), z.unknown()).optional(),
++        response: z.record(z.string(), z.unknown()).optional(),
++      }),
+       z.object({
+         type: z.literal('response.output_text.delta'),
+         item_id: z.string(),
+@@ -594,6 +676,7 @@ export const openaiResponsesChunkSchema = lazySchema(() =>
+             })
+             .nullish(),
+           service_tier: z.string().nullish(),
++          output: z.array(jsonValueSchema).optional(),
+         }),
+       }),
+       z.object({
+@@ -635,6 +718,8 @@ export const openaiResponsesChunkSchema = lazySchema(() =>
+           service_tier: z.string().nullish(),
+         }),
+       }),
++      openaiResponsesCompactionFinishedSchema,
++      openaiResponsesCompactionFailedSchema,
+       z.object({
+         type: z.literal('response.created'),
+         response: z.object({
+@@ -658,6 +743,7 @@ export const openaiResponsesChunkSchema = lazySchema(() =>
+             id: z.string(),
+             encrypted_content: z.string().nullish(),
+           }),
++          openaiResponsesCompactionSchema,
+           z.object({
+             type: z.literal('function_call'),
+             id: z.string(),
+@@ -788,6 +874,7 @@ export const openaiResponsesChunkSchema = lazySchema(() =>
+           }),
+         ]),
+       }),
++      openaiResponsesCompactionDoneSchema,
+       z.object({
+         type: z.literal('response.output_item.done'),
+         output_index: z.number(),
+@@ -802,6 +889,7 @@ export const openaiResponsesChunkSchema = lazySchema(() =>
+             id: z.string(),
+             encrypted_content: z.string().nullish(),
+           }),
++          openaiResponsesCompactionSchema,
+           z.object({
+             type: z.literal('function_call'),
+             id: z.string(),
+@@ -1339,6 +1427,7 @@ export const openaiResponsesResponseSchema = lazySchema(() =>
+                 }),
+               ),
+             }),
++          openaiResponsesCompactionSchema,
+             z.object({
+               type: z.literal('mcp_call'),
+               id: z.string(),
 diff --git a/src/responses/openai-responses-language-model.ts b/src/responses/openai-responses-language-model.ts
-index 926e7ec713480353b969901f19c5d1d8cc883dab..ed457ce8f07a60ed48c47a3cbf11b2a7c6cf6415 100644
+index 926e7ec713480353b969901f19c5d1d8cc883dab..04381f59ec920e2ed2c479df957577709f9d7c89 100644
 --- a/src/responses/openai-responses-language-model.ts
 +++ b/src/responses/openai-responses-language-model.ts
-@@ -433,36 +433,6 @@ export class OpenAIResponsesLanguageModel implements LanguageModelV3 {
+@@ -60,11 +60,14 @@ import {
+   type OpenAIResponsesWebSearchAction,
+   type OpenAIResponsesApplyPatchOperationDiffDeltaChunk,
+   type OpenAIResponsesApplyPatchOperationDiffDoneChunk,
++  type OpenAIResponsesCompaction,
++  type OpenAIResponsesInput,
+ } from './openai-responses-api';
+ import {
+   openaiLanguageModelResponsesOptionsSchema,
+   TOP_LOGPROBS_MAX,
+   type OpenAIResponsesModelId,
++  type OpenCodeResponsesOptions,
+ } from './openai-responses-options';
+ import { prepareResponsesTools } from './openai-responses-prepare-tools';
+ import type {
+@@ -99,6 +102,33 @@ function extractApprovalRequestIdToToolCallIdMapping(
+   return mapping;
+ }
+ 
++type ExplicitCompactionOutcome =
++  | {
++      type: 'completed';
++      input: OpenAIResponsesInput;
++      output: OpenAIResponsesCompaction;
++    }
++  | {
++      type: 'failed' | 'incomplete' | 'stream-error';
++      cause: unknown;
++    }
++  | {
++      type: 'protocol-error';
++      message: string;
++      cause?: unknown;
++    }
++  | {
++      type: 'stream-closed';
++    };
++
++type ExplicitCompactionTerminal = {
++  type: 'opencode.compaction.terminal';
++  version: 1;
++  headers?: Record<string, string>;
++  cancel: () => void;
++  outcome: ExplicitCompactionOutcome;
++};
++
+ export class OpenAIResponsesLanguageModel implements LanguageModelV3 {
+   readonly specificationVersion = 'v3';
+ 
+@@ -175,6 +205,11 @@ export class OpenAIResponsesLanguageModel implements LanguageModelV3 {
+       });
+     }
+ 
++    const opencodeOptions = openaiOptions?.opencode as
++      | OpenCodeResponsesOptions
++      | undefined;
++    const isExplicitCompaction = opencodeOptions?.explicitCompaction === true;
++
+     const isReasoningModel =
+       openaiOptions?.forceReasoning ?? modelCapabilities.isReasoningModel;
+ 
+@@ -219,7 +254,7 @@ export class OpenAIResponsesLanguageModel implements LanguageModelV3 {
+       customProviderToolNames,
+     });
+ 
+-    const { input, warnings: inputWarnings } =
++    const { input: convertedInput, warnings: inputWarnings } =
+       await convertToOpenAIResponsesInput({
+         prompt,
+         toolNameMapping,
+@@ -232,7 +267,7 @@ export class OpenAIResponsesLanguageModel implements LanguageModelV3 {
+         fileIdPrefixes: this.config.fileIdPrefixes,
+         passThroughUnsupportedFiles:
+           openaiOptions?.passThroughUnsupportedFiles ?? false,
+-        store: openaiOptions?.store ?? true,
++        store: isExplicitCompaction ? false : openaiOptions?.store ?? true,
+         hasConversation: openaiOptions?.conversation != null,
+         hasPreviousResponseId: openaiOptions?.previousResponseId != null,
+         hasLocalShellTool: hasOpenAITool('openai.local_shell'),
+@@ -244,6 +279,26 @@ export class OpenAIResponsesLanguageModel implements LanguageModelV3 {
+             : undefined,
+       });
+ 
++    const replayInput = opencodeOptions?.replayInput ?? [];
++    const hasOpenCodeInput =
++      opencodeOptions?.instructions !== undefined ||
++      opencodeOptions?.replayInput !== undefined ||
++      isExplicitCompaction;
++    const systemInput = convertedInput.filter(isSystemInput);
++    const conversationInput = convertedInput.filter(
++      item => !isSystemInput(item) && !isCompactionTrigger(item),
++    );
++    const input = hasOpenCodeInput
++      ? [
++          ...(opencodeOptions?.instructions === undefined ? systemInput : []),
++          ...replayInput.filter(item => !isCompactionTrigger(item)),
++          ...conversationInput,
++          ...(isExplicitCompaction
++            ? [{ type: 'compaction_trigger' as const }]
++            : []),
++        ]
++      : convertedInput;
++
+     warnings.push(...inputWarnings);
+ 
+     const strictJsonSchema = openaiOptions?.strictJsonSchema ?? true;
+@@ -295,7 +350,7 @@ export class OpenAIResponsesLanguageModel implements LanguageModelV3 {
+       addInclude('code_interpreter_call.outputs');
+     }
+ 
+-    const store = openaiOptions?.store;
++    const store = isExplicitCompaction ? false : openaiOptions?.store;
+ 
+     // store defaults to true in the OpenAI responses API, so check for false exactly:
+     if (store === false && isReasoningModel) {
+@@ -337,7 +392,7 @@ export class OpenAIResponsesLanguageModel implements LanguageModelV3 {
+       previous_response_id: openaiOptions?.previousResponseId,
+       store,
+       user: openaiOptions?.user,
+-      instructions: openaiOptions?.instructions,
++      instructions: opencodeOptions?.instructions ?? openaiOptions?.instructions,
+       service_tier: openaiOptions?.serviceTier,
+       include,
+       prompt_cache_key: openaiOptions?.promptCacheKey,
+@@ -433,36 +488,6 @@ export class OpenAIResponsesLanguageModel implements LanguageModelV3 {
        }
      }
  
@@ -278,3 +2070,290 @@ index 926e7ec713480353b969901f19c5d1d8cc883dab..ed457ce8f07a60ed48c47a3cbf11b2a7
      const shellToolEnvType = (
        tools?.find(
          tool => tool.type === 'provider' && tool.id === 'openai.shell',
+@@ -485,6 +510,7 @@ export class OpenAIResponsesLanguageModel implements LanguageModelV3 {
+       toolNameMapping,
+       providerOptionsName,
+       isShellProviderExecuted,
++      isExplicitCompaction,
+     };
+   }
+ 
+@@ -1064,12 +1090,16 @@ export class OpenAIResponsesLanguageModel implements LanguageModelV3 {
+       store,
+       providerOptionsName,
+       isShellProviderExecuted,
++      isExplicitCompaction,
+     } = await this.getArgs(options);
+ 
+     const url = this.config.url({
+       path: '/responses',
+       modelId: this.modelId,
+     });
++    const explicitCompactionAbortController = isExplicitCompaction
++      ? new AbortController()
++      : undefined;
+ 
+     const { responseHeaders, value: response } = await postJsonToApi({
+       url,
+@@ -1082,18 +1112,29 @@ export class OpenAIResponsesLanguageModel implements LanguageModelV3 {
+       successfulResponseHandler: createEventSourceResponseHandler(
+         openaiResponsesChunkSchema,
+       ),
+-      abortSignal: options.abortSignal,
++      abortSignal:
++        explicitCompactionAbortController == null
++          ? options.abortSignal
++          : options.abortSignal == null
++            ? explicitCompactionAbortController.signal
++            : AbortSignal.any([
++                options.abortSignal,
++                explicitCompactionAbortController.signal,
++              ]),
+       fetch: this.config.fetch,
+     });
+ 
+     const checkedResponse = await throwIfOpenAIStreamErrorBeforeOutput({
+       stream: response,
+       getError: chunk =>
+-        isErrorChunk(chunk) ||
+-        (isResponseFailedChunk(chunk) && chunk.response.error != null)
+-          ? chunk
+-          : undefined,
+-      isOutputChunk: isResponseOutputChunk,
++        isExplicitCompaction
++          ? undefined
++          : isErrorChunk(chunk) ||
++              (isResponseFailedChunk(chunk) && chunk.response.error != null)
++            ? chunk
++            : undefined,
++      isOutputChunk: chunk =>
++        isExplicitCompaction || isResponseOutputChunk(chunk),
+       url,
+       requestBodyValues: body,
+       responseHeaders,
+@@ -1161,6 +1202,35 @@ export class OpenAIResponsesLanguageModel implements LanguageModelV3 {
+     let reasoningContext: ResponsesProviderMetadata['reasoningContext'];
+     const hostedToolSearchCallIds: string[] = [];
+     let encounteredStreamError = false;
++    let explicitCompactionOutput: OpenAIResponsesCompaction | undefined;
++    let explicitCompactionOutputCount = 0;
++    let explicitCompactionTerminal = false;
++    let explicitCompactionHeaders = responseHeaders;
++
++    const emitExplicitCompactionTerminal = (
++      controller: TransformStreamDefaultController<LanguageModelV3StreamPart>,
++      outcome: ExplicitCompactionOutcome,
++    ) => {
++      if (explicitCompactionTerminal) return;
++      explicitCompactionTerminal = true;
++      const terminal: ExplicitCompactionTerminal = {
++        type: 'opencode.compaction.terminal',
++        version: 1,
++        headers: explicitCompactionHeaders,
++        cancel: () => explicitCompactionAbortController?.abort(),
++        outcome,
++      };
++      if (options.includeRawChunks) {
++        controller.enqueue({ type: 'raw', rawValue: terminal });
++      } else {
++        controller.enqueue({
++          type: 'error',
++          error: new Error(
++            'OpenAI Responses explicit compaction requires includeRawChunks',
++          ),
++        });
++      }
++    };
+ 
+     const result = {
+       stream: checkedResponse.pipeThrough(
+@@ -1173,6 +1243,71 @@ export class OpenAIResponsesLanguageModel implements LanguageModelV3 {
+           },
+ 
+           transform(chunk, controller) {
++            if (isExplicitCompaction) {
++              if (explicitCompactionTerminal) return;
++              if (!chunk.success) {
++                emitExplicitCompactionTerminal(controller, {
++                  type: 'protocol-error',
++                  message: 'OpenAI Responses explicit compaction stream event was invalid',
++                  cause: chunk.error,
++                });
++                return;
++              }
++
++              const value = chunk.value;
++              const metadataHeaders = explicitCompactionHeadersFromChunk(value);
++              if (metadataHeaders) {
++                explicitCompactionHeaders = {
++                  ...explicitCompactionHeaders,
++                  ...metadataHeaders,
++                };
++              }
++              if (isResponseOutputItemDoneChunk(value)) {
++                if (value.item.type === 'compaction') {
++                  explicitCompactionOutputCount += 1;
++                  explicitCompactionOutput ??= value.item;
++                }
++                return;
++              }
++              if (value.type === 'response.completed') {
++                if (explicitCompactionOutputCount !== 1 || explicitCompactionOutput == null) {
++                  emitExplicitCompactionTerminal(controller, {
++                    type: 'protocol-error',
++                    message: `OpenAI Responses explicit compaction expected exactly one compaction output item, got ${explicitCompactionOutputCount}`,
++                    cause: value,
++                  });
++                } else {
++                  emitExplicitCompactionTerminal(controller, {
++                    type: 'completed',
++                    input: body.input.filter(item => !isCompactionTrigger(item)),
++                    output: explicitCompactionOutput,
++                  });
++                }
++                return;
++              }
++              if (value.type === 'response.incomplete') {
++                emitExplicitCompactionTerminal(controller, {
++                  type: 'incomplete',
++                  cause: value,
++                });
++                return;
++              }
++              if (value.type === 'response.failed') {
++                emitExplicitCompactionTerminal(controller, {
++                  type: 'failed',
++                  cause: value,
++                });
++                return;
++              }
++              if (value.type === 'error') {
++                emitExplicitCompactionTerminal(controller, {
++                  type: 'stream-error',
++                  cause: value,
++                });
++              }
++              return;
++            }
++
+             if (options.includeRawChunks) {
+               controller.enqueue({ type: 'raw', rawValue: chunk.rawValue });
+             }
+@@ -1195,7 +1330,6 @@ export class OpenAIResponsesLanguageModel implements LanguageModelV3 {
+             }
+ 
+             const value = chunk.value;
+-
+             if (isResponseOutputItemAddedChunk(value)) {
+               if (value.item.type === 'function_call') {
+                 ongoingToolCalls[value.output_index] = {
+@@ -2073,7 +2207,7 @@ export class OpenAIResponsesLanguageModel implements LanguageModelV3 {
+                 }),
+                 raw: value.response.incomplete_details?.reason ?? undefined,
+               };
+-              usage = value.response.usage;
++              usage = value.response.usage ?? undefined;
+               if (typeof value.response.service_tier === 'string') {
+                 serviceTier = value.response.service_tier;
+               }
+@@ -2188,6 +2322,15 @@ export class OpenAIResponsesLanguageModel implements LanguageModelV3 {
+           },
+ 
+           flush(controller) {
++            if (isExplicitCompaction) {
++              if (!explicitCompactionTerminal) {
++                emitExplicitCompactionTerminal(controller, {
++                  type: 'stream-closed',
++                });
++              }
++              return;
++            }
++
+             const providerMetadata: SharedV3ProviderMetadata = {
+               [providerOptionsName]: {
+                 responseId: responseId,
+@@ -2264,6 +2407,20 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
+     : undefined;
+ }
+ 
++function isSystemInput(value: unknown) {
++  if (typeof value !== 'object' || value == null) return false;
++  const role = (value as { role?: unknown }).role;
++  return role === 'system' || role === 'developer';
++}
++
++function isCompactionTrigger(value: unknown) {
++  return (
++    typeof value === 'object' &&
++    value != null &&
++    (value as { type?: unknown }).type === 'compaction_trigger'
++  );
++}
++
+ function isResponseOutputItemDoneChunk(
+   chunk: OpenAIResponsesChunk,
+ ): chunk is OpenAIResponsesChunk & { type: 'response.output_item.done' } {
+@@ -2280,6 +2437,23 @@ function isResponseFinishedChunk(
+   );
+ }
+ 
++function explicitCompactionHeadersFromChunk(value: OpenAIResponsesChunk) {
++  const raw = asRecord(value);
++  const response = asRecord(raw?.response);
++  const metadata = asRecord(raw?.metadata);
++  const responseMetadata = asRecord(response?.metadata);
++  const candidates = [raw?.headers, metadata?.headers, response?.headers, responseMetadata?.headers];
++  for (const candidate of candidates) {
++    const headers = asRecord(candidate);
++    if (!headers) continue;
++    const stringHeaders = Object.fromEntries(
++      Object.entries(headers).filter((entry): entry is [string, string] => typeof entry[1] === 'string'),
++    );
++    if (Object.keys(stringHeaders).length > 0) return stringHeaders;
++  }
++  return undefined;
++}
++
+ function isResponseFailedChunk(
+   chunk: OpenAIResponsesChunk,
+ ): chunk is OpenAIResponsesChunk & { type: 'response.failed' } {
+diff --git a/src/responses/openai-responses-options.ts b/src/responses/openai-responses-options.ts
+index 2fec2c4cc8a2236daa8e3a9807c79a983c49d273..c30f01ab2f1d29e5fe9a12d7b4370e6fedd96bbc 100644
+--- a/src/responses/openai-responses-options.ts
++++ b/src/responses/openai-responses-options.ts
+@@ -4,6 +4,7 @@ import {
+   type InferSchema,
+ } from '@ai-sdk/provider-utils';
+ import { z } from 'zod/v4';
++import type { OpenAIResponsesInputItem } from './openai-responses-api';
+ 
+ /**
+  * `top_logprobs` request body argument can be set to an integer between
+@@ -360,6 +361,16 @@ export const openaiLanguageModelResponsesOptionsSchema = lazySchema(() =>
+        */
+       forceReasoning: z.boolean().optional(),
+ 
++      // Private OpenCode Responses replay and explicit compaction controls.
++      opencode: z
++        .object({
++          version: z.literal(1),
++          instructions: z.string().optional(),
++          replayInput: z.array(z.unknown()).optional(),
++          explicitCompaction: z.literal(true).optional(),
++        })
++        .optional(),
++
+       /**
+        * Restrict the callable tools to a subset while keeping the full tools
+        * list intact, so prompt caching is preserved across requests with
+@@ -383,3 +394,10 @@ export const openaiLanguageModelResponsesOptionsSchema = lazySchema(() =>
+ export type OpenAILanguageModelResponsesOptions = InferSchema<
+   typeof openaiLanguageModelResponsesOptionsSchema
+ >;
++
++export type OpenCodeResponsesOptions = {
++  readonly version: 1;
++  readonly instructions?: string;
++  readonly replayInput?: readonly OpenAIResponsesInputItem[];
++  readonly explicitCompaction?: true;
++};

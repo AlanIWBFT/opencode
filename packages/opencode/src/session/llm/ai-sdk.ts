@@ -1,11 +1,26 @@
 import { FinishReason, LLMEvent, ProviderMetadata, ToolResultValue } from "@opencode-ai/llm"
 import { Effect, Schema } from "effect"
-import { type streamText } from "ai"
+import { APICallError, type streamText } from "ai"
 import { errorMessage } from "@/util/error"
 import { ProviderError } from "@/provider/error"
+import { ProviderV2 } from "@opencode-ai/core/provider"
 
 type Result = Awaited<ReturnType<typeof streamText>>
 type AISDKEvent = Result["fullStream"] extends AsyncIterable<infer T> ? T : never
+
+const NON_RETRYABLE_OPENAI_INCOMPLETE_REASONS = new Set(["max_output_tokens", "content_filter"])
+const OPENAI_RETRY_MAX_DELAY_MS = 2_147_483_647
+const OPENAI_PROVIDER_ID = ProviderV2.ID.make("openai")
+
+export class ExplicitCompactionError extends Schema.TaggedErrorClass<ExplicitCompactionError>()(
+  "ExplicitCompactionError",
+  {
+    message: Schema.String,
+    retryable: Schema.Boolean,
+    retryAfterMs: Schema.optional(Schema.Number),
+    cause: Schema.optional(Schema.Defect()),
+  },
+) {}
 
 export function adapterState() {
   return {
@@ -42,10 +57,48 @@ function copilotTotalNanoAiu(value: unknown) {
   return total
 }
 
+type ExplicitCompactionOutcome =
+  | { readonly type: "completed"; readonly input: readonly unknown[]; readonly output: Record<string, unknown> }
+  | { readonly type: "failed" | "incomplete" | "stream-error"; readonly cause: unknown }
+  | { readonly type: "protocol-error"; readonly message: string; readonly cause?: unknown }
+  | { readonly type: "stream-closed" }
+
+export type ExplicitCompactionResult = {
+  readonly output: readonly Record<string, unknown>[]
+  readonly input: readonly unknown[]
+  readonly providerMetadata?: ProviderMetadata
+}
+
+type ExplicitCompactionTerminal = {
+  readonly type: "opencode.compaction.terminal"
+  readonly version: 1
+  readonly headers?: Record<string, string>
+  readonly cancel?: unknown
+  readonly outcome: ExplicitCompactionOutcome
+}
+
+function explicitCompactionTerminal(value: unknown): ExplicitCompactionTerminal | undefined {
+  const raw = record(value)
+  if (raw?.type !== "opencode.compaction.terminal" || raw.version !== 1) return undefined
+  const outcome = record(raw.outcome)
+  if (!outcome || typeof outcome.type !== "string") return undefined
+  if (
+    outcome.type === "completed" &&
+    Array.isArray(outcome.input) &&
+    record(outcome.output)
+  )
+    return raw as unknown as ExplicitCompactionTerminal
+  if (outcome.type === "failed" || outcome.type === "incomplete" || outcome.type === "stream-error")
+    return raw as unknown as ExplicitCompactionTerminal
+  if (outcome.type === "protocol-error" && typeof outcome.message === "string")
+    return raw as unknown as ExplicitCompactionTerminal
+  if (outcome.type === "stream-closed") return raw as unknown as ExplicitCompactionTerminal
+  return undefined
+}
+
 function rawProviderMetadata(value: unknown): ProviderMetadata | undefined {
-  if (!value || typeof value !== "object") return undefined
-  const raw = value as Record<string, unknown>
-  if (raw.type !== "response.metadata") return undefined
+  const raw = record(value)
+  if (raw?.type !== "response.metadata") return undefined
   const metadata = record(raw.metadata)
   const response = record(raw.response)
   const responseMetadata = record(response?.metadata)
@@ -57,6 +110,148 @@ function rawProviderMetadata(value: unknown): ProviderMetadata | undefined {
   return headers ? { openai: { headers } } : undefined
 }
 
+function cancelTerminal(terminal: ExplicitCompactionTerminal) {
+  if (typeof terminal.cancel === "function") terminal.cancel()
+}
+
+export async function collectExplicitCompaction(
+  result: { readonly fullStream: AsyncIterable<AISDKEvent> },
+  onProviderMetadata?: (metadata: ProviderMetadata) => void,
+): Promise<ExplicitCompactionResult> {
+  try {
+    for await (const event of result.fullStream) {
+      if (event.type === "error") {
+        const headers = APICallError.isInstance(event.error) ? stringRecord(event.error.responseHeaders) : undefined
+        if (headers) onProviderMetadata?.({ openai: { headers } })
+        throw explicitCompactionError(
+          "OpenAI Responses explicit compaction stream failed",
+          event.error,
+          false,
+        )
+      }
+      if (event.type === "abort") {
+        throw explicitCompactionError(
+          "OpenAI Responses explicit compaction stream was aborted",
+          event.reason,
+          false,
+        )
+      }
+      if (event.type !== "raw") continue
+      const terminal = explicitCompactionTerminal(event.rawValue)
+      if (!terminal) continue
+      const headers = stringRecord(terminal.headers)
+      const metadata = turnStateMetadata(headers)
+      if (metadata) onProviderMetadata?.(metadata)
+      try {
+        switch (terminal.outcome.type) {
+          case "completed":
+            return {
+              input: terminal.outcome.input.filter((item) => record(item)?.type !== "compaction_trigger"),
+              output: [terminal.outcome.output],
+              ...(metadata ? { providerMetadata: metadata } : {}),
+            }
+          case "failed":
+            throw explicitCompactionError(
+              "OpenAI Responses explicit compaction ended with response.failed",
+              terminal.outcome.cause,
+              true,
+              headers,
+            )
+          case "incomplete":
+            throw explicitCompactionError(
+              "OpenAI Responses explicit compaction ended with response.incomplete",
+              terminal.outcome.cause,
+              retryableOpenAIIncomplete(terminal.outcome.cause),
+            )
+          case "stream-error":
+            throw explicitCompactionError(
+              "OpenAI Responses explicit compaction stream failed",
+              terminal.outcome.cause,
+              true,
+              headers,
+            )
+          case "protocol-error":
+            throw explicitCompactionError(terminal.outcome.message, terminal.outcome.cause, false)
+          case "stream-closed":
+            throw explicitCompactionError(
+              "OpenAI Responses explicit compaction stream closed before response.completed",
+              undefined,
+              true,
+            )
+        }
+      } finally {
+        cancelTerminal(terminal)
+      }
+    }
+  } catch (cause) {
+    if (cause instanceof ExplicitCompactionError) throw cause
+    throw explicitCompactionError("OpenAI Responses explicit compaction stream failed", cause, true)
+  }
+  throw explicitCompactionError(
+    "OpenAI Responses explicit compaction stream closed before response.completed",
+    undefined,
+    true,
+  )
+}
+
+function explicitCompactionError(
+  message: string,
+  cause?: unknown,
+  fallbackRetryable = false,
+  responseHeaders?: Record<string, string>,
+) {
+  const resolved = resolveExplicitCompactionError(cause, responseHeaders, fallbackRetryable)
+  return new ExplicitCompactionError({
+    message,
+    retryable: resolved.retryable,
+    ...(resolved.retryAfterMs === undefined ? {} : { retryAfterMs: resolved.retryAfterMs }),
+    ...(cause === undefined ? {} : { cause }),
+  })
+}
+
+function resolveExplicitCompactionError(
+  error: unknown,
+  responseHeaders: Record<string, string> | undefined,
+  fallbackRetryable: boolean,
+) {
+  if (APICallError.isInstance(error)) {
+    const parsed = ProviderError.parseAPICallError({ providerID: OPENAI_PROVIDER_ID, error })
+    if (parsed.type === "context_overflow") return { retryable: false }
+    return {
+      retryable: parsed.isRetryable,
+      retryAfterMs: cappedRetryAfter(error.responseHeaders, error.message),
+    }
+  }
+  if (error instanceof ProviderError.ResponseStreamError || error instanceof ProviderError.HeaderTimeoutError)
+    return { retryable: true }
+  const raw = record(error)
+  const response = record(raw?.response)
+  const providerError = record(response?.error) ?? record(raw?.error) ?? raw
+  const providerCode = typeof providerError?.code === "string" ? providerError.code : undefined
+  const message = typeof providerError?.message === "string" ? providerError.message : "OpenAI stream error"
+  const resolved = ProviderError.resolve({
+    providerID: OPENAI_PROVIDER_ID,
+    message,
+    isRetryable: raw?.isRetryable === true || raw?.retryable === true || fallbackRetryable,
+    providerCode,
+    responseHeaders,
+  })
+  return {
+    retryable: resolved.isRetryable,
+    retryAfterMs: cappedRetryAfter(responseHeaders, message),
+  }
+}
+
+function retryableOpenAIIncomplete(value: unknown) {
+  const reason = record(record(record(value)?.response)?.incomplete_details)?.reason
+  return typeof reason !== "string" || !NON_RETRYABLE_OPENAI_INCOMPLETE_REASONS.has(reason)
+}
+
+function cappedRetryAfter(headers: Record<string, string> | undefined, message: string) {
+  const value = ProviderError.retryAfterMs({ headers, message })
+  return value === undefined ? undefined : Math.min(OPENAI_RETRY_MAX_DELAY_MS, value)
+}
+
 function record(value: unknown): Record<string, unknown> | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined
   return value as Record<string, unknown>
@@ -66,6 +261,11 @@ function stringRecord(value: unknown) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined
   const entries = Object.entries(value).filter((entry): entry is [string, string] => typeof entry[1] === "string")
   return entries.length === 0 ? undefined : Object.fromEntries(entries)
+}
+
+function turnStateMetadata(headers: Record<string, string> | undefined): ProviderMetadata | undefined {
+  const turnState = Object.entries(headers ?? {}).find(([key]) => key.toLowerCase() === "x-codex-turn-state")
+  return turnState ? { openai: { headers: { [turnState[0]]: turnState[1] } } } : undefined
 }
 
 function usage(value: unknown) {

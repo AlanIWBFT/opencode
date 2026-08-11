@@ -717,6 +717,12 @@ const layer = Layer.effect(
       }
       const userMessage = parent.info
       const compactionPart = parent.parts.find((part): part is SessionV1.CompactionPart => part.type === "compaction")
+      // Native compaction continues the active logical turn, so it must see that turn.
+      // Summary fallback keeps the legacy behavior of removing and replaying it below.
+      const nativeHistory =
+        compactionPart && input.messages.at(-1)?.info.id === input.parentID
+          ? input.messages.slice(0, -1)
+          : input.messages
 
       let messages = input.messages
       let replay:
@@ -752,6 +758,9 @@ const layer = Layer.effect(
       const history = compactionPart && messages.at(-1)?.info.id === input.parentID ? messages.slice(0, -1) : messages
       const prior = completedCompactions(history)
       const hidden = new Set(prior.flatMap((item) => [item.userIndex, item.assistantIndex]))
+      const nativePrior = nativeHistory === history ? prior : completedCompactions(nativeHistory)
+      const nativeHidden =
+        nativeHistory === history ? hidden : new Set(nativePrior.flatMap((item) => [item.userIndex, item.assistantIndex]))
       const previousSummary = prior.at(-1)?.summary
       const language = promptLanguage(replay ? [...history, { info: replay.info, parts: replay.parts }] : history)
       const compactionAgent = localizeAgent({ agent, language })
@@ -762,7 +771,7 @@ const layer = Layer.effect(
         { context: [], prompt: undefined },
       )
       const ctx = yield* InstanceState.context
-      const priorCheckpoint = OpenAINativeCompaction.findCheckpoint(history)
+      const priorCheckpoint = OpenAINativeCompaction.findCheckpoint(nativeHistory)
       const native = yield* tryNativeCompaction({
         sessionID: input.sessionID,
         userMessage,
@@ -770,8 +779,8 @@ const layer = Layer.effect(
         chatModel,
         nativeCompactionWindow: priorCheckpoint ? OpenAINativeCompaction.replayWindow({ checkpoint: priorCheckpoint }) : undefined,
         turnState: input.turnState,
-        history,
-        hidden,
+        history: nativeHistory,
+        hidden: nativeHidden,
         cfg,
         compacting,
       })
@@ -837,7 +846,7 @@ const layer = Layer.effect(
       }
 
       if (result === "continue" && input.auto) {
-        if (replay) {
+        if (replay && outcome.type !== "native") {
           const original = replay.info
           const replayMsg = yield* session.updateMessage({
             id: MessageID.ascending(),
