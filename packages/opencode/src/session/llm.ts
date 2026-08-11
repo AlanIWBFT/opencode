@@ -7,7 +7,7 @@ import { serviceUse } from "@opencode-ai/core/effect/service-use"
 import { Context, Effect, Layer } from "effect"
 import * as Stream from "effect/Stream"
 import { streamText, wrapLanguageModel, type ModelMessage, type Tool } from "ai"
-import type { LLMEvent } from "@opencode-ai/llm"
+import type { LLMEvent, OpenAIResponsesCompactResult } from "@opencode-ai/llm"
 import { LLMClient } from "@opencode-ai/llm/route"
 import type { LLMClientService } from "@opencode-ai/llm/route"
 import { GitLabWorkflowLanguageModel } from "gitlab-ai-provider"
@@ -27,8 +27,9 @@ import { RuntimeFlags } from "@/effect/runtime-flags"
 import * as Option from "effect/Option"
 import * as OtelTracer from "@effect/opentelemetry/Tracer"
 import { LLMAISDK } from "./llm/ai-sdk"
-import { LLMNativeRuntime } from "./llm/native-runtime"
+import { LLMNativeRuntime, type TurnState } from "./llm/native-runtime"
 import { LLMRequestPrep } from "./llm/request"
+import { OpenAINativeCompaction } from "./openai-native-compaction"
 
 export const OUTPUT_TOKEN_MAX = ProviderTransform.OUTPUT_TOKEN_MAX
 
@@ -45,6 +46,8 @@ export type StreamInput = {
   tools: Record<string, Tool>
   retries?: number
   toolChoice?: "auto" | "required" | "none"
+  nativeCompactionWindow?: OpenAINativeCompaction.Window
+  turnState?: TurnState
 }
 
 export type StreamRequest = StreamInput & {
@@ -53,6 +56,7 @@ export type StreamRequest = StreamInput & {
 
 export interface Interface {
   readonly stream: (input: StreamInput) => Stream.Stream<LLMEvent, unknown>
+  readonly compact: (input: StreamInput) => Effect.Effect<OpenAIResponsesCompactResult, unknown>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/LLM") {}
@@ -223,7 +227,7 @@ const live: Layer.Layer<
 
       // Runtime seam: native is an opt-in adapter over @opencode-ai/llm. It
       // either returns a ready LLMEvent stream or a concrete fallback reason.
-      if (flags.experimentalNativeLlm) {
+      if (flags.experimentalNativeLlm || input.nativeCompactionWindow) {
         const native = LLMNativeRuntime.stream({
           model: input.model,
           provider: item,
@@ -239,6 +243,8 @@ const live: Layer.Layer<
           providerOptions: prepared.params.options,
           headers: prepared.headers,
           abort: input.abort,
+          nativeCompactionWindow: input.nativeCompactionWindow,
+          turnState: input.turnState,
         })
         if (native.type === "supported") {
           yield* Effect.logInfo("llm runtime selected", {
@@ -250,6 +256,11 @@ const live: Layer.Layer<
             type: "native" as const,
             stream: native.stream,
           }
+        }
+        if (input.nativeCompactionWindow) {
+          return yield* Effect.fail(
+            new Error(`Native LLM runtime required for OpenAI native compaction replay: ${native.reason}`),
+          )
         }
         yield* Effect.logInfo("llm runtime selected", {
           "llm.runtime": "ai-sdk",
@@ -273,6 +284,10 @@ const live: Layer.Layer<
         "llm.provider": input.model.providerID,
         "llm.model": input.model.id,
       })
+      const headers = {
+        ...prepared.headers,
+        ...LLMNativeRuntime.withTurnStateHeaders({ model: input.model, turnState: input.turnState }),
+      }
       // Default runtime path: AI SDK owns provider execution and tool dispatch;
       // LLMAISDK.toLLMEvents below normalizes fullStream parts for the processor.
       return {
@@ -292,7 +307,9 @@ const live: Layer.Layer<
             )
           },
           // Copilot returns the authoritative billed amount only in provider-specific response fields.
-          includeRawChunks: input.model.providerID.includes("github-copilot"),
+          includeRawChunks:
+            input.model.providerID.includes("github-copilot") ||
+            LLMNativeRuntime.usesOpenAITurnState({ model: input.model, turnState: input.turnState }),
           async experimental_repairToolCall(failed) {
             const lower = failed.toolCall.toolName.toLowerCase()
             if (lower !== failed.toolCall.toolName && prepared.tools[lower]) {
@@ -319,7 +336,7 @@ const live: Layer.Layer<
           toolChoice: input.toolChoice,
           maxOutputTokens: prepared.params.maxOutputTokens,
           abortSignal: input.abort,
-          headers: prepared.headers,
+          headers,
           maxRetries: input.retries ?? 0,
           messages: prepared.messages,
           model: wrapLanguageModel({
@@ -354,6 +371,40 @@ const live: Layer.Layer<
       }
     })
 
+    const compact: Interface["compact"] = Effect.fn("LLM.compact")(function* (input) {
+      const [item, info] = yield* Effect.all(
+        [provider.getProvider(input.model.providerID), auth.get(input.model.providerID)],
+        { concurrency: "unbounded" },
+      )
+      const prepared = yield* LLMRequestPrep.prepare({
+        ...input,
+        provider: item,
+        auth: info,
+        plugin,
+        flags,
+        isWorkflow: false,
+      })
+      const result = yield* LLMNativeRuntime.compact({
+        model: input.model,
+        provider: item,
+        auth: info,
+        llmClient,
+        messages: prepared.messages,
+        tools: prepared.tools,
+        temperature: prepared.params.temperature,
+        topP: prepared.params.topP,
+        topK: prepared.params.topK,
+        maxOutputTokens: prepared.params.maxOutputTokens,
+        providerOptions: prepared.params.options,
+        headers: prepared.headers,
+        nativeCompactionWindow: input.nativeCompactionWindow,
+        turnState: input.turnState,
+      })
+      if (result.type === "supported")
+        return { output: result.output, input: result.input, providerMetadata: result.providerMetadata }
+      return yield* Effect.fail(new Error(`OpenAI native compaction unavailable: ${result.reason}`))
+    })
+
     const stream: Interface["stream"] = (input) =>
       Stream.scoped(
         Stream.unwrap(
@@ -375,12 +426,13 @@ const live: Layer.Layer<
             ).pipe(
               Stream.mapEffect((event) => LLMAISDK.toLLMEvents(state, event)),
               Stream.flatMap((events) => Stream.fromIterable(events)),
+              Stream.tap((event) => Effect.sync(() => LLMNativeRuntime.captureTurnState(input.turnState, event))),
             )
           }),
         ),
       )
 
-    return Service.of({ stream })
+    return Service.of({ stream, compact })
   }),
 )
 

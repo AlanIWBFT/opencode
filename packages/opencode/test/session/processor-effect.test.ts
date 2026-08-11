@@ -189,6 +189,7 @@ const it = testEffect(env)
 const providerErrorLLM = Layer.succeed(
   LLM.Service,
   LLM.Service.of({
+    compact: () => Effect.fail(new Error("compact not implemented")),
     stream: () =>
       Stream.make(
         LLMEvent.stepStart({ index: 0 }),
@@ -212,6 +213,7 @@ const itProviderError = testEffect(providerErrorEnv)
 const fragmentFailureLLM = Layer.succeed(
   LLM.Service,
   LLM.Service.of({
+    compact: () => Effect.fail(new Error("compact not implemented")),
     stream: () =>
       Stream.make(
         LLMEvent.stepStart({ index: 0 }),

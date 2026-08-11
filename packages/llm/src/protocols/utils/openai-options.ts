@@ -90,4 +90,13 @@ export const instructions = (request: LLMRequest) => {
   return typeof value === "string" ? value : undefined
 }
 
+export const clientMetadata = (request: LLMRequest): Record<string, string> | undefined => {
+  const value = options(request)?.clientMetadata
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined
+  const result = Object.fromEntries(
+    Object.entries(value).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
+  )
+  return Object.keys(result).length === 0 ? undefined : result
+}
+
 export * as OpenAIOptions from "./openai-options"

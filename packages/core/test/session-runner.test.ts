@@ -74,7 +74,9 @@ let maxActiveToolExecutions = 0
 const client = Layer.succeed(
   LLMClient.Service,
   LLMClient.Service.of({
-    prepare: () => Effect.die("unused"),
+    prepare: LLMClient.prepare,
+    compact: () => Effect.die("unused"),
+    compactWithInput: () => Effect.die("unused"),
     stream: ((request: LLMRequest) => {
       requests.push(request)
       if (responseStream) {

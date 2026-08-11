@@ -16,6 +16,7 @@ export interface OpenAIOptionsInput {
   readonly include?: ReadonlyArray<OpenAIResponseIncludable>
   readonly textVerbosity?: TextVerbosity
   readonly serviceTier?: OpenAIServiceTier
+  readonly clientMetadata?: Record<string, string>
 }
 
 export type OpenAIProviderOptionsInput = ProviderOptions & {
@@ -35,6 +36,7 @@ const openAIProviderOptions = (options: OpenAIOptionsInput | undefined): Provide
       include: options?.include,
       textVerbosity: options?.textVerbosity,
       serviceTier: options?.serviceTier,
+      clientMetadata: options?.clientMetadata,
     }),
   )
   if (Object.keys(openai).length === 0) return undefined

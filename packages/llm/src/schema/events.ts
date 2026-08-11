@@ -206,6 +206,12 @@ export const ProviderErrorEvent = Schema.Struct({
 }).annotate({ identifier: "LLM.Event.ProviderError" })
 export type ProviderErrorEvent = Schema.Schema.Type<typeof ProviderErrorEvent>
 
+export const ProviderMetadataEvent = Schema.Struct({
+  type: Schema.tag("provider-metadata"),
+  providerMetadata: ProviderMetadata,
+}).annotate({ identifier: "LLM.Event.ProviderMetadata" })
+export type ProviderMetadataEvent = Schema.Schema.Type<typeof ProviderMetadataEvent>
+
 const llmEventTagged = Schema.Union([
   StepStart,
   TextStart,
@@ -223,6 +229,7 @@ const llmEventTagged = Schema.Union([
   StepFinish,
   Finish,
   ProviderErrorEvent,
+  ProviderMetadataEvent,
 ]).pipe(Schema.toTaggedUnion("type"))
 
 type WithID<Event extends { readonly id: unknown }, ID> = Omit<Event, "type" | "id"> & { readonly id: ID | string }
@@ -273,6 +280,7 @@ export const LLMEvent = Object.assign(llmEventTagged, {
       usage: input.usage === undefined ? undefined : Usage.from(input.usage),
     }),
   providerError: ProviderErrorEvent.make,
+  providerMetadata: ProviderMetadataEvent.make,
   is: {
     stepStart: llmEventTagged.guards["step-start"],
     textStart: llmEventTagged.guards["text-start"],
@@ -290,6 +298,7 @@ export const LLMEvent = Object.assign(llmEventTagged, {
     stepFinish: llmEventTagged.guards["step-finish"],
     finish: llmEventTagged.guards.finish,
     providerError: llmEventTagged.guards["provider-error"],
+    providerMetadata: llmEventTagged.guards["provider-metadata"],
   },
 })
 export type LLMEvent = Schema.Schema.Type<typeof llmEventTagged>

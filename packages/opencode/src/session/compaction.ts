@@ -11,8 +11,8 @@ import { Agent } from "@/agent/agent"
 import { Plugin } from "@/plugin"
 import { Config } from "@/config/config"
 import { NotFoundError } from "@/storage/storage"
-
-import { Effect, Layer, Context } from "effect"
+import { Cause, Effect, Layer, Context } from "effect"
+import * as DateTime from "effect/DateTime"
 import { InstanceState } from "@/effect/instance-state"
 import { isOverflow as overflow, usable } from "./overflow"
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
@@ -22,6 +22,11 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { buildPrompt as buildEnglishPrompt } from "@opencode-ai/core/session/compaction"
 import { SessionCompactionEvent } from "@opencode-ai/schema/session-compaction-event"
+import { SessionEvent } from "@opencode-ai/schema/session-event"
+import { SessionMessage } from "@opencode-ai/schema/session-message"
+import { LLM } from "./llm"
+import type { TurnState } from "./llm/native-runtime"
+import { OpenAINativeCompaction } from "./openai-native-compaction"
 import PROMPT_COMPACTION from "@/agent/prompt/compaction.txt"
 import PROMPT_COMPACTION_ZH from "@/agent/prompt/compaction.zh.txt"
 
@@ -207,6 +212,12 @@ function autoContinueText(input: { overflow: boolean; language: SummaryLanguage 
   )
 }
 
+function nativeErrorMessage(cause: Cause.Cause<unknown>) {
+  const error = Cause.squash(cause)
+  if (error instanceof Error) return error.message
+  return String(error)
+}
+
 function preserveRecentBudget(input: { cfg: ConfigV1.Info; model: Provider.Model }) {
   return (
     input.cfg.compaction?.preserve_recent_tokens ??
@@ -269,6 +280,7 @@ export interface Interface {
     sessionID: SessionID
     auto: boolean
     overflow?: boolean
+    turnState?: TurnState
   }) => Effect.Effect<"continue" | "stop">
   readonly create: (input: {
     sessionID: SessionID
@@ -294,6 +306,7 @@ const layer = Layer.effect(
     const provider = yield* Provider.Service
     const events = yield* EventV2Bridge.Service
     const flags = yield* RuntimeFlags.Service
+    const llm = yield* LLM.Service
 
     const isOverflow = Effect.fn("SessionCompaction.isOverflow")(function* (input: {
       tokens: SessionV1.Assistant["tokens"]
@@ -411,12 +424,292 @@ const layer = Layer.effect(
       }
     })
 
+    const prepareMessages = Effect.fn("SessionCompaction.prepareMessages")(function* (input: {
+      history: SessionV1.WithParts[]
+      hidden: ReadonlySet<number>
+      cfg: ConfigV1.Info
+      model: Provider.Model
+    }) {
+      const selected = yield* select({
+        messages: input.history.filter((_, index) => !input.hidden.has(index)),
+        cfg: input.cfg,
+        model: input.model,
+      })
+      const msgs = structuredClone(selected.head)
+      yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
+      const conversation = msgs.map(serialize).filter(Boolean).join("\n\n")
+      const modelMessages = yield* MessageV2.toModelMessagesEffect(msgs, input.model, {
+        stripMedia: true,
+        toolOutputMaxChars: TOOL_OUTPUT_MAX_CHARS,
+      })
+      const tailIndex = selected.tail_start_id
+        ? input.history.findIndex((message) => message.info.id === selected.tail_start_id)
+        : -1
+      const recent =
+        tailIndex < 0
+          ? ""
+          : JSON.stringify(
+              yield* MessageV2.toModelMessagesEffect(input.history.slice(tailIndex), input.model, {
+                stripMedia: true,
+                toolOutputMaxChars: TOOL_OUTPUT_MAX_CHARS,
+              }),
+            )
+      return { selected, modelMessages, conversation, recent }
+    })
+
+    const assistantMessage = (input: {
+      parentID: MessageID
+      sessionID: SessionID
+      userMessage: SessionV1.User
+      model: Provider.Model
+      ctx: { directory: string; worktree: string }
+      completed: boolean
+    }): SessionV1.Assistant => {
+      const created = Date.now()
+      return {
+        id: MessageID.ascending(),
+        role: "assistant",
+        parentID: input.parentID,
+        sessionID: input.sessionID,
+        mode: "compaction",
+        agent: "compaction",
+        variant: input.userMessage.model.variant,
+        summary: true,
+        path: {
+          cwd: input.ctx.directory,
+          root: input.ctx.worktree,
+        },
+        cost: 0,
+        tokens: {
+          output: 0,
+          input: 0,
+          reasoning: 0,
+          cache: { read: 0, write: 0 },
+        },
+        modelID: input.model.id,
+        providerID: input.model.providerID,
+        time: input.completed ? { created, completed: created } : { created },
+        ...(input.completed ? { finish: "stop" as const } : {}),
+      }
+    }
+
+    const nativeSkipReason = (input: {
+      model: Provider.Model
+      compacting: { readonly context: readonly unknown[]; readonly prompt: string | undefined }
+    }) =>
+      !OpenAINativeCompaction.supportsModel(input.model)
+        ? "model is not official OpenAI Responses"
+        : input.compacting.prompt !== undefined || input.compacting.context.length > 0
+          ? "compaction plugin customized prompt/context"
+          : undefined
+
+    const tryNativeCompaction = Effect.fn("SessionCompaction.tryOpenAINative")(function* (input: {
+      sessionID: SessionID
+      userMessage: SessionV1.User
+      compactionAgent: Agent.Info
+      chatModel: Provider.Model
+      nativeCompactionWindow?: OpenAINativeCompaction.Window
+      turnState?: TurnState
+      history: SessionV1.WithParts[]
+      hidden: ReadonlySet<number>
+      cfg: ConfigV1.Info
+      compacting: { readonly context: readonly unknown[]; readonly prompt: string | undefined }
+    }) {
+      const skipReason = nativeSkipReason({ model: input.chatModel, compacting: input.compacting })
+      if (skipReason) {
+        yield* Effect.logInfo("openai native compaction skipped", {
+          "session.id": input.sessionID,
+          reason: skipReason,
+          providerID: input.chatModel.providerID,
+          modelID: input.chatModel.id,
+          modelApiID: input.chatModel.api.id,
+          modelApiNpm: input.chatModel.api.npm,
+          pluginContextCount: input.compacting.context.length,
+          pluginPrompt: input.compacting.prompt !== undefined,
+        })
+        return undefined
+      }
+      const prepared = yield* prepareMessages({
+        history: input.history,
+        hidden: input.hidden,
+        cfg: input.cfg,
+        model: input.chatModel,
+      })
+      const result = yield* Effect.gen(function* () {
+        yield* Effect.logInfo("openai native compaction starting", {
+          "session.id": input.sessionID,
+          providerID: input.chatModel.providerID,
+          modelID: input.chatModel.id,
+          modelApiID: input.chatModel.api.id,
+        })
+        const compactResult = yield* llm.compact({
+          user: input.userMessage,
+          agent: input.compactionAgent,
+          sessionID: input.sessionID,
+          tools: {},
+          system: [],
+          messages: prepared.modelMessages,
+          model: input.chatModel,
+          nativeCompactionWindow: input.nativeCompactionWindow,
+          turnState: input.turnState,
+        })
+        return { ...compactResult, output: OpenAINativeCompaction.sanitizeOutput(compactResult.output) }
+      }).pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("openai native compaction failed; falling back to summary", {
+            "session.id": input.sessionID,
+            providerID: input.chatModel.providerID,
+            modelID: input.chatModel.id,
+            error: nativeErrorMessage(cause),
+          }).pipe(Effect.as(undefined)),
+        ),
+      )
+      if (result === undefined) return undefined
+      if (OpenAINativeCompaction.hasCompactionItem(result.output))
+        return {
+          output: result.output,
+          window: OpenAINativeCompaction.buildReplacementWindow({
+            compactInput: result.input,
+            compactOutput: result.output,
+          }),
+          prepared,
+        }
+      yield* Effect.logWarning("openai native compaction returned no checkpoint; falling back to summary", {
+        "session.id": input.sessionID,
+        providerID: input.chatModel.providerID,
+        modelID: input.chatModel.id,
+        outputCount: result.output.length,
+        outputTypes: result.output.map((item) => (typeof item.type === "string" ? item.type : "unknown")),
+        outputShapes: result.output.map((item) => ({
+          type: typeof item.type === "string" ? item.type : "unknown",
+          keys: Object.keys(item).filter((key) => key !== "encrypted_content"),
+          hasEncryptedContent: typeof item.encrypted_content === "string",
+        })),
+      })
+      return undefined
+    })
+
+    const storeNativeCheckpoint = Effect.fn("SessionCompaction.storeOpenAINativeCheckpoint")(function* (input: {
+      msg: SessionV1.Assistant
+      userMessage: SessionV1.User
+      chatModel: Provider.Model
+      window: OpenAINativeCompaction.Window
+    }) {
+      yield* Effect.logInfo("openai native compaction checkpoint stored", {
+        "session.id": input.msg.sessionID,
+        providerID: input.chatModel.providerID,
+        modelID: input.chatModel.id,
+      })
+      yield* session.updatePart({
+        id: PartID.ascending(),
+        messageID: input.msg.id,
+        sessionID: input.msg.sessionID,
+        type: "text",
+        text: OpenAINativeCompaction.PLACEHOLDER,
+        metadata: OpenAINativeCompaction.metadata({
+          model: {
+            providerID: ProviderV2.ID.make(input.chatModel.providerID),
+            modelID: ModelV2.ID.make(input.chatModel.id),
+            ...(input.userMessage.model.variant === undefined ? {} : { variant: input.userMessage.model.variant }),
+          },
+          window: input.window,
+        }),
+        time: { start: Date.now(), end: Date.now() },
+      })
+      yield* events.publish(SessionEvent.ModelSwitched, {
+        sessionID: input.msg.sessionID,
+        messageID: SessionMessage.ID.create(),
+        timestamp: DateTime.makeUnsafe(Date.now()),
+        model: {
+          id: ModelV2.ID.make(input.chatModel.id),
+          providerID: ProviderV2.ID.make(input.chatModel.providerID),
+          variant: ModelV2.VariantID.make(input.userMessage.model.variant ?? "default"),
+        },
+      })
+    })
+
+    const runSummaryCompaction = Effect.fn("SessionCompaction.runSummary")(function* (input: {
+      parentID: MessageID
+      sessionID: SessionID
+      userMessage: SessionV1.User
+      compactionAgent: Agent.Info
+      history: SessionV1.WithParts[]
+      hidden: ReadonlySet<number>
+      cfg: ConfigV1.Info
+      model: Provider.Model
+      ctx: { directory: string; worktree: string }
+      previousSummary?: string
+      language: SummaryLanguage
+      compacting: { readonly context: readonly unknown[]; readonly prompt: string | undefined }
+    }) {
+      const prepared = yield* prepareMessages({
+        history: input.history,
+        hidden: input.hidden,
+        cfg: input.cfg,
+        model: input.model,
+      })
+      const prompt =
+        input.compacting.prompt ??
+        [
+          buildPrompt({
+            previousSummary: input.previousSummary,
+            context: [prepared.conversation],
+            language: input.language,
+          }),
+          ...input.compacting.context,
+        ]
+          .filter(Boolean)
+          .join("\n\n")
+      const msg = assistantMessage({
+        parentID: input.parentID,
+        sessionID: input.sessionID,
+        userMessage: input.userMessage,
+        model: input.model,
+        ctx: input.ctx,
+        completed: false,
+      })
+      yield* session.updateMessage(msg)
+      const processor = yield* processors.create({
+        assistantMessage: msg,
+        sessionID: input.sessionID,
+        model: input.model,
+      })
+      const result = yield* processor.process({
+        user: input.userMessage,
+        agent: input.compactionAgent,
+        sessionID: input.sessionID,
+        tools: {},
+        system: [],
+        messages: [
+          {
+            role: "user" as const,
+            content: [
+              {
+                type: "text" as const,
+                text: [
+                  prompt,
+                  ...(input.compacting.prompt
+                    ? ["The following is the conversation history:", prepared.conversation]
+                    : []),
+                ]
+                  .filter(Boolean)
+                  .join("\n\n"),
+              },
+            ],
+          },
+        ],
+        model: input.model,
+      })
+      return { type: "summary" as const, msg, result, selected: prepared.selected, recent: prepared.recent }
+    })
+
     const processCompaction = Effect.fn("SessionCompaction.process")(function* (input: {
       parentID: MessageID
       messages: SessionV1.WithParts[]
       sessionID: SessionID
       auto: boolean
       overflow?: boolean
+      turnState?: TurnState
     }) {
       const parent = input.messages.findLast((m) => m.info.id === input.parentID)
       if (!parent || parent.info.role !== "user") {
@@ -451,9 +744,10 @@ const layer = Layer.effect(
       }
 
       const agent = yield* agents.get("compaction")
+      const chatModel = yield* provider.getModel(userMessage.model.providerID, userMessage.model.modelID).pipe(Effect.orDie)
       const model = agent.model
         ? yield* provider.getModel(agent.model.providerID, agent.model.modelID).pipe(Effect.orDie)
-        : yield* provider.getModel(userMessage.model.providerID, userMessage.model.modelID).pipe(Effect.orDie)
+        : chatModel
       const cfg = yield* config.get()
       const history = compactionPart && messages.at(-1)?.info.id === input.parentID ? messages.slice(0, -1) : messages
       const prior = completedCompactions(history)
@@ -461,105 +755,84 @@ const layer = Layer.effect(
       const previousSummary = prior.at(-1)?.summary
       const language = promptLanguage(replay ? [...history, { info: replay.info, parts: replay.parts }] : history)
       const compactionAgent = localizeAgent({ agent, language })
-      const selected = yield* select({
-        messages: history.filter((_, index) => !hidden.has(index)),
-        cfg,
-        model,
-      })
       // Allow plugins to inject context or replace compaction prompt.
       const compacting = yield* plugin.trigger(
         "experimental.session.compacting",
         { sessionID: input.sessionID },
         { context: [], prompt: undefined },
       )
-      const msgs = structuredClone(selected.head)
-      yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
-      const conversation = msgs.map(serialize).filter(Boolean).join("\n\n")
-      const nextPrompt =
-        compacting.prompt ??
-        [
-          buildPrompt({
-            previousSummary,
-            context: [conversation],
-            language,
-          }),
-          ...compacting.context,
-        ]
-          .filter(Boolean)
-          .join("\n\n")
       const ctx = yield* InstanceState.context
-      const msg: SessionV1.Assistant = {
-        id: MessageID.ascending(),
-        role: "assistant",
-        parentID: input.parentID,
+      const priorCheckpoint = OpenAINativeCompaction.findCheckpoint(history)
+      const native = yield* tryNativeCompaction({
         sessionID: input.sessionID,
-        mode: "compaction",
-        agent: "compaction",
-        variant: userMessage.model.variant,
-        summary: true,
-        path: {
-          cwd: ctx.directory,
-          root: ctx.worktree,
-        },
-        cost: 0,
-        tokens: {
-          output: 0,
-          input: 0,
-          reasoning: 0,
-          cache: { read: 0, write: 0 },
-        },
-        modelID: model.id,
-        providerID: model.providerID,
-        time: {
-          created: Date.now(),
-        },
-      }
-      yield* session.updateMessage(msg)
-      const processor = yield* processors.create({
-        assistantMessage: msg,
-        sessionID: input.sessionID,
-        model,
+        userMessage,
+        compactionAgent,
+        chatModel,
+        nativeCompactionWindow: priorCheckpoint ? OpenAINativeCompaction.replayWindow({ checkpoint: priorCheckpoint }) : undefined,
+        turnState: input.turnState,
+        history,
+        hidden,
+        cfg,
+        compacting,
       })
-      const result = yield* processor.process({
-        user: userMessage,
-        agent: compactionAgent,
-        sessionID: input.sessionID,
-        tools: {},
-        system: [],
-        messages: [
-          {
-            role: "user",
-            content: [
-              {
-                type: "text",
-                text: [
-                  nextPrompt,
-                  ...(compacting.prompt ? ["The following is the conversation history:", conversation] : []),
-                ]
-                  .filter(Boolean)
-                  .join("\n\n"),
-              },
-            ],
-          },
-        ],
-        model,
-      })
+      const outcome = native
+        ? yield* Effect.gen(function* () {
+            const msg = assistantMessage({
+              parentID: input.parentID,
+              sessionID: input.sessionID,
+              userMessage,
+              model: chatModel,
+              ctx,
+              completed: true,
+            })
+            yield* session.updateMessage(msg)
+            yield* storeNativeCheckpoint({ msg, userMessage, chatModel, window: native.window })
+            return {
+              type: "native" as const,
+              msg,
+              result: "continue" as const,
+              selected: native.prepared.selected,
+              recent: native.prepared.recent,
+              output: native.output,
+            }
+          })
+        : yield* runSummaryCompaction({
+            parentID: input.parentID,
+            sessionID: input.sessionID,
+            userMessage,
+            compactionAgent,
+            history,
+            hidden,
+            cfg,
+            model,
+            ctx,
+            previousSummary,
+            language,
+            compacting,
+          })
+
+      const msg = outcome.msg
+      const result = outcome.result
 
       if (result === "compact") {
-        processor.message.error = new SessionV1.ContextOverflowError({
+        msg.error = new SessionV1.ContextOverflowError({
           message: replay
             ? "Conversation history too large to compact - exceeds model context limit"
             : "Session too large to compact - context exceeds model limit even after stripping media",
         }).toObject()
-        processor.message.finish = "error"
-        yield* session.updateMessage(processor.message)
+        msg.finish = "error"
+        yield* session.updateMessage(msg)
         return "stop"
       }
 
-      if (compactionPart && selected.tail_start_id && compactionPart.tail_start_id !== selected.tail_start_id) {
+      if (
+        compactionPart &&
+        outcome.selected.tail_start_id &&
+        compactionPart.tail_start_id !== outcome.selected.tail_start_id
+      ) {
         yield* session.updatePart({
           ...compactionPart,
-          tail_start_id: selected.tail_start_id,
+          tail_start_id: outcome.selected.tail_start_id,
         })
       }
 
@@ -592,7 +865,7 @@ const layer = Layer.effect(
           }
         }
 
-        if (!replay) {
+        if (!replay && outcome.type !== "native") {
           const info = yield* provider.getProvider(userMessage.model.providerID)
           if (
             (yield* plugin.trigger(
@@ -643,8 +916,30 @@ const layer = Layer.effect(
         }
       }
 
-      if (processor.message.error) return "stop"
+      if (msg.error) return "stop"
       if (result === "continue") {
+        const summary =
+          outcome.type === "native"
+            ? OpenAINativeCompaction.PLACEHOLDER
+            : summaryText(
+                (yield* session.messages({ sessionID: input.sessionID }).pipe(Effect.orDie)).find(
+                  (item) => item.info.id === msg.id,
+                ) ?? {
+                  info: msg,
+                  parts: [],
+                },
+              )
+        if (flags.experimentalEventSystem) {
+          if (summary)
+            yield* events.publish(SessionEvent.Compaction.Ended, {
+              sessionID: input.sessionID,
+              messageID: SessionMessage.ID.make(input.parentID),
+              timestamp: DateTime.makeUnsafe(Date.now()),
+              reason: input.auto ? "auto" : "manual",
+              text: summary ?? "",
+              recent: outcome.recent,
+            })
+        }
         yield* events.publish(Event.Compacted, { sessionID: input.sessionID })
       }
       return result
@@ -693,6 +988,7 @@ export const node = LayerNode.make({
     Agent.node,
     Plugin.node,
     SessionProcessor.node,
+    LLM.node,
     Provider.node,
     EventV2Bridge.node,
     RuntimeFlags.node,

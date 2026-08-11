@@ -22,17 +22,20 @@ import { SessionExecution } from "@opencode-ai/core/session/execution"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 
 import { Provider } from "@/provider/provider"
+import { Agent } from "@/agent/agent"
 import * as SessionProcessorModule from "../../src/session/processor"
 import { ProviderTest } from "../fake/provider"
 import { testEffect } from "../lib/effect"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { TestConfig } from "../fixture/config"
+import { Snapshot } from "../../src/snapshot"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { LLMEvent, Usage } from "@opencode-ai/llm"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { OpenAINativeCompaction } from "@/session/openai-native-compaction"
 
 const summary = Layer.succeed(
   SessionSummary.Service,
@@ -88,7 +91,7 @@ function createModel(opts: {
 
 const wide = () => ProviderTest.fake({ model: createModel({ context: 100_000, output: 32_000 }) })
 
-function createUserMessage(sessionID: SessionID, text: string) {
+function createUserMessage(sessionID: SessionID, text: string, model = ref) {
   return Effect.gen(function* () {
     const ssn = yield* SessionNs.Service
     const msg = yield* ssn.updateMessage({
@@ -96,7 +99,7 @@ function createUserMessage(sessionID: SessionID, text: string) {
       role: "user",
       sessionID,
       agent: "build",
-      model: ref,
+      model,
       time: { created: Date.now() },
     })
     yield* ssn.updatePart({
@@ -171,13 +174,13 @@ function createSummaryAssistantMessage(sessionID: SessionID, parentID: MessageID
   )
 }
 
-function createCompactionMarker(sessionID: SessionID) {
+function createCompactionMarker(sessionID: SessionID, model = ref) {
   return SessionNs.Service.use((ssn) =>
     Effect.gen(function* () {
       const msg = yield* ssn.updateMessage({
         id: MessageID.ascending(),
         role: "user",
-        model: ref,
+        model,
         sessionID,
         agent: "build",
         time: { created: Date.now() },
@@ -189,6 +192,7 @@ function createCompactionMarker(sessionID: SessionID) {
         type: "compaction",
         auto: false,
       })
+      return msg
     }),
   )
 }
@@ -222,6 +226,14 @@ function cfg(compaction?: ConfigV1.Info["compaction"]) {
   return Layer.succeed(Config.Service, TestConfig.make({ get: () => Effect.succeed({ ...base, compaction }) }))
 }
 
+const defaultLLM = Layer.succeed(
+  LLM.Service,
+  LLM.Service.of({
+    compact: () => Effect.succeed({ output: [] as readonly Record<string, unknown>[], input: [] as readonly unknown[] }),
+    stream: () => Stream.empty,
+  }),
+)
+
 const defaultProvider = wide()
 const compactionTestNode = LayerNode.group([
   SessionCompaction.node,
@@ -233,9 +245,67 @@ const compactionTestNode = LayerNode.group([
 ])
 const env = AppNodeBuilder.build(compactionTestNode, [
   [Provider.node, defaultProvider.layer],
+  [LLM.node, defaultLLM],
   [SessionProcessorModule.SessionProcessor.node, processorLayer("continue")],
   [RuntimeFlags.node, RuntimeFlags.layer({ experimentalEventSystem: true })],
 ])
+
+function providerLayer(models: readonly Provider.Model[]) {
+  const first = models[0]!
+  const info = ProviderTest.info(
+    {
+      id: first.providerID,
+      models: Object.fromEntries(models.map((model) => [model.id, model])),
+    },
+    first,
+  )
+  return ProviderTest.fake({
+    model: first,
+    info,
+    getModel: Effect.fn("TestProvider.getModel")((providerID, modelID) => {
+      const model = models.find((item) => item.providerID === providerID && item.id === modelID)
+      if (model) return Effect.succeed(model)
+      return Effect.die(new Error(`Unknown test model: ${providerID}/${modelID}`))
+    }),
+    getProvider: Effect.fn("TestProvider.getProvider")((providerID) => {
+      if (providerID === info.id) return Effect.succeed(info)
+      return Effect.die(new Error(`Unknown test provider: ${providerID}`))
+    }),
+  })
+}
+
+function agentLayer(input: { compactionModel: { providerID: ProviderV2.ID; modelID: ModelV2.ID } }) {
+  const build: Agent.Info = {
+    name: "build",
+    mode: "primary",
+    native: true,
+    options: {},
+    permission: [{ permission: "*", pattern: "*", action: "allow" }],
+  }
+  const compaction: Agent.Info = {
+    name: "compaction",
+    mode: "primary",
+    native: true,
+    hidden: true,
+    options: {},
+    permission: [{ permission: "*", pattern: "*", action: "deny" }],
+    model: input.compactionModel,
+  }
+  return Layer.succeed(
+    Agent.Service,
+    Agent.Service.of({
+      get: (name) =>
+        Effect.sync(() => {
+          if (name === "compaction") return compaction
+          return build
+        }),
+      list: () => Effect.succeed([build, compaction]),
+      defaultInfo: () => Effect.succeed(build),
+      defaultAgent: () => Effect.succeed("build"),
+      generate: () => Effect.die("unused"),
+    }),
+  )
+}
 
 const it = testEffect(env)
 
@@ -247,9 +317,11 @@ const itCompaction = testEffect(compactionEnv)
 type CompactionProcessOptions = {
   result?: "continue" | "compact"
   llm?: Layer.Layer<LLM.Service>
+  agent?: Layer.Layer<Agent.Service>
   plugin?: Layer.Layer<Plugin.Service>
   provider?: ReturnType<typeof wide>
   config?: Layer.Layer<Config.Service>
+  snapshot?: Layer.Layer<Snapshot.Service>
 }
 
 function withCompaction(options?: CompactionProcessOptions) {
@@ -259,27 +331,30 @@ function withCompaction(options?: CompactionProcessOptions) {
 function compactionProcessLayer(options?: CompactionProcessOptions) {
   const replacements: LayerNode.Replacements = [
     [Provider.node, (options?.provider ?? wide()).layer],
+    [LLM.node, options?.llm ?? defaultLLM],
     [RuntimeFlags.node, RuntimeFlags.layer({ experimentalEventSystem: true })],
     [SessionSummary.node, summary],
+    ...(options?.snapshot ? ([[Snapshot.node, options.snapshot]] as const) : []),
   ]
   if (!options?.llm) {
     return AppNodeBuilder.build(compactionTestNode, [
       ...replacements,
       [SessionProcessorModule.SessionProcessor.node, processorLayer(options?.result ?? "continue")],
+      ...(options?.agent ? ([[Agent.node, options.agent]] as const) : []),
       ...(options?.plugin ? ([[Plugin.node, options.plugin]] as const) : []),
       ...(options?.config ? ([[Config.node, options.config]] as const) : []),
     ])
   }
   return AppNodeBuilder.build(compactionTestNode, [
     ...replacements,
-    [LLM.node, options.llm],
+    ...(options?.agent ? ([[Agent.node, options.agent]] as const) : []),
     ...(options?.plugin ? ([[Plugin.node, options.plugin]] as const) : []),
     ...(options?.config ? ([[Config.node, options.config]] as const) : []),
   ])
 }
 
-function createSummaryCompaction(sessionID: SessionID) {
-  return SessionCompaction.use.create({ sessionID, agent: "build", model: ref, auto: false })
+function createSummaryCompaction(sessionID: SessionID, model = ref) {
+  return SessionCompaction.use.create({ sessionID, agent: "build", model, auto: false })
 }
 
 function readCompactionPart(sessionID: SessionID) {
@@ -292,18 +367,47 @@ function readCompactionPart(sessionID: SessionID) {
     )
 }
 
+type CompactStubResponse = { readonly output: readonly Record<string, unknown>[]; readonly input?: readonly unknown[] }
+
+function isCompactStubResponse(value: CompactStubResponse | readonly Record<string, unknown>[]): value is CompactStubResponse {
+  return !Array.isArray(value)
+}
+
 function llm() {
   const queue: Array<
     Stream.Stream<LLMEvent, unknown> | ((input: LLM.StreamInput) => Stream.Stream<LLMEvent, unknown>)
+  > = []
+  const compactQueue: Array<
+    | CompactStubResponse
+    | readonly Record<string, unknown>[]
+    | Error
+    | ((input: LLM.StreamInput) => CompactStubResponse | readonly Record<string, unknown>[] | Error)
   > = []
 
   return {
     push(stream: Stream.Stream<LLMEvent, unknown> | ((input: LLM.StreamInput) => Stream.Stream<LLMEvent, unknown>)) {
       queue.push(stream)
     },
-    llmLayer: Layer.succeed(
+    compact(
+      output:
+        | CompactStubResponse
+        | readonly Record<string, unknown>[]
+        | Error
+        | ((input: LLM.StreamInput) => CompactStubResponse | readonly Record<string, unknown>[] | Error),
+    ) {
+      compactQueue.push(output)
+    },
+    layer: Layer.succeed(
       LLM.Service,
       LLM.Service.of({
+        compact: (input) => {
+          const item = compactQueue.shift()
+          if (!item) return Effect.fail(new Error("No compact response queued"))
+          const output = typeof item === "function" ? item(input) : item
+          if (output instanceof Error) return Effect.fail(output)
+          if (isCompactStubResponse(output)) return Effect.succeed({ output: output.output, input: output.input ?? [] })
+          return Effect.succeed({ output, input: [] as readonly unknown[] })
+        },
         stream: (input) => {
           const item = queue.shift() ?? Stream.empty
           const stream = typeof item === "function" ? item(input) : item
@@ -812,6 +916,40 @@ describe("session.compaction.prune", () => {
 })
 
 describe("session.compaction.process", () => {
+  test("OpenAI native replacement window keeps only retained user input and one compaction item", () => {
+    const window = OpenAINativeCompaction.buildReplacementWindow({
+      compactInput: [
+        { role: "system", content: "system" },
+        { role: "developer", content: "developer" },
+        { role: "assistant", content: [{ type: "output_text", text: "assistant" }] },
+        { role: "user", content: [{ type: "input_text", text: "<system-update>\nstale\n</system-update>" }] },
+        {
+          role: "user",
+          content: [
+            { type: "input_text", text: "<environment_context>stale</environment_context>" },
+            { type: "input_text", text: "mixed real user" },
+          ],
+        },
+        { role: "user", content: [{ type: "output_text", text: "not user input" }] },
+        { role: "user", content: [{ type: "input_text", text: "real user" }] },
+        { role: "user", content: [{ type: "input_image", image_url: "data:image/png;base64,AAAA" }] },
+        { type: "compaction_trigger" },
+      ],
+      compactOutput: [
+        { type: "message", role: "assistant", content: [] },
+        { type: "compaction", encrypted_content: "opaque" },
+        { type: "compaction", encrypted_content: "ignored" },
+      ],
+    })
+
+    expect(window.output).toEqual([
+      { role: "user", content: [{ type: "input_text", text: "real user" }] },
+      { role: "user", content: [{ type: "input_image", image_url: "data:image/png;base64,AAAA" }] },
+      { type: "compaction", encrypted_content: "opaque" },
+    ])
+    expect(window).toMatchObject({ compactOutput: [{ type: "compaction", encrypted_content: "opaque" }] })
+  })
+
   it.instance(
     "throws when parent is not a user message",
     Effect.gen(function* () {
@@ -962,6 +1100,349 @@ describe("session.compaction.process", () => {
   )
 
   itCompaction.instance(
+    "uses OpenAI native compact for GPT responses and stores the opaque checkpoint",
+    () => {
+      const stub = llm()
+      stub.compact({
+        input: [
+          { role: "system", content: "discard me" },
+          { role: "user", content: [{ type: "input_text", text: "older native context" }] },
+        ],
+        output: [{ type: "compaction", encrypted_content: "sealed-window" }],
+      })
+      const nativeRef = {
+        providerID: ProviderV2.ID.make("openai"),
+        modelID: ModelV2.ID.make("gpt-5-mini"),
+      }
+      const nativeModel = ProviderTest.model({
+        id: nativeRef.modelID,
+        providerID: nativeRef.providerID,
+        api: { id: nativeRef.modelID, url: "https://api.openai.com/v1", npm: "@ai-sdk/openai" },
+      })
+
+      return Effect.gen(function* () {
+        const ssn = yield* SessionNs.Service
+        const session = yield* ssn.create({})
+        yield* createUserMessage(session.id, "older native context", nativeRef)
+        const keep = yield* createUserMessage(session.id, "recent native tail", nativeRef)
+        const marker = yield* createCompactionMarker(session.id, nativeRef)
+        const msgs = yield* ssn.messages({ sessionID: session.id })
+
+        const result = yield* SessionCompaction.use.process({
+          parentID: marker.id,
+          messages: msgs,
+          sessionID: session.id,
+          auto: false,
+        })
+
+        const all = yield* ssn.messages({ sessionID: session.id })
+        const part = yield* readCompactionPart(session.id)
+        const summary = all.find((message) => message.info.role === "assistant" && message.info.summary)
+        const text = summary?.parts.find((part): part is SessionV1.TextPart => part.type === "text")
+
+        expect(result).toBe("continue")
+        expect(part?.tail_start_id).toBe(keep.id)
+        expect(summary?.info.role).toBe("assistant")
+        if (summary?.info.role === "assistant") {
+          expect(summary.info.providerID).toBe(nativeRef.providerID)
+          expect(summary.info.modelID).toBe(nativeRef.modelID)
+          expect(summary.info.finish).toBe("stop")
+        }
+        expect(text?.text).toBe(OpenAINativeCompaction.PLACEHOLDER)
+        expect(text?.metadata).toMatchObject({
+          openaiNativeCompactionLock: {
+            version: 1,
+            strategy: OpenAINativeCompaction.STRATEGY,
+            model: nativeRef,
+          },
+          openaiNativeCompactionWindow: {
+            version: 2,
+            output: [
+              { role: "user", content: [{ type: "input_text", text: "older native context" }] },
+              { type: "compaction", encrypted_content: "sealed-window" },
+            ],
+            compactOutput: [{ type: "compaction", encrypted_content: "sealed-window" }],
+          },
+        })
+        expect(JSON.stringify(text?.metadata)).not.toContain("discard me")
+      }).pipe(
+        withCompaction({
+          llm: stub.layer,
+          provider: ProviderTest.fake({ model: nativeModel, info: ProviderTest.info({}, nativeModel) }),
+          config: cfg({ tail_turns: 1, preserve_recent_tokens: 10_000 }),
+        }),
+      )
+    },
+    { git: true },
+    { timeout: 10_000 },
+  )
+
+  itCompaction.instance(
+    "does not add synthetic continue prompt after OpenAI native auto compaction",
+    () => {
+      const stub = llm()
+      stub.compact({
+        input: [{ role: "user", content: [{ type: "input_text", text: "research the plan" }] }],
+        output: [{ type: "compaction", encrypted_content: "sealed-window" }],
+      })
+      const nativeRef = {
+        providerID: ProviderV2.ID.make("openai"),
+        modelID: ModelV2.ID.make("gpt-5-mini"),
+      }
+      const nativeModel = ProviderTest.model({
+        id: nativeRef.modelID,
+        providerID: nativeRef.providerID,
+        api: { id: nativeRef.modelID, url: "https://api.openai.com/v1", npm: "@ai-sdk/openai" },
+      })
+
+      return Effect.gen(function* () {
+        const ssn = yield* SessionNs.Service
+        const session = yield* ssn.create({})
+        yield* createUserMessage(session.id, "research the plan", nativeRef)
+        const marker = yield* createCompactionMarker(session.id, nativeRef)
+        const msgs = yield* ssn.messages({ sessionID: session.id })
+
+        const result = yield* SessionCompaction.use.process({
+          parentID: marker.id,
+          messages: msgs,
+          sessionID: session.id,
+          auto: true,
+        })
+
+        const all = yield* ssn.messages({ sessionID: session.id })
+        expect(result).toBe("continue")
+        expect(
+          all.some(
+            (message) =>
+              message.info.role === "user" &&
+              message.parts.some((part) => part.type === "text" && part.metadata?.compaction_continue),
+          ),
+        ).toBe(false)
+        expect(
+          all.some(
+            (message) =>
+              message.info.role === "user" &&
+              message.parts.some((part) => part.type === "text" && part.synthetic && part.text.includes("Continue if")),
+          ),
+        ).toBe(false)
+      }).pipe(
+        withCompaction({
+          llm: stub.layer,
+          provider: ProviderTest.fake({ model: nativeModel, info: ProviderTest.info({}, nativeModel) }),
+        }),
+      )
+    },
+    { git: true },
+  )
+
+  itCompaction.instance(
+    "falls back to summary compaction when OpenAI native compact returns no compaction item",
+    () => {
+      const stub = llm()
+      stub.compact([{ type: "message", role: "assistant", content: [] }])
+      stub.push(reply("summary fallback"))
+      const nativeRef = {
+        providerID: ProviderV2.ID.make("openai"),
+        modelID: ModelV2.ID.make("gpt-5-mini"),
+      }
+      const nativeModel = ProviderTest.model({
+        id: nativeRef.modelID,
+        providerID: nativeRef.providerID,
+        api: { id: nativeRef.modelID, url: "https://api.openai.com/v1", npm: "@ai-sdk/openai" },
+      })
+
+      return Effect.gen(function* () {
+        const ssn = yield* SessionNs.Service
+        const session = yield* ssn.create({})
+        const msg = yield* createUserMessage(session.id, "hello", nativeRef)
+        const msgs = yield* ssn.messages({ sessionID: session.id })
+
+        const result = yield* SessionCompaction.use.process({
+          parentID: msg.id,
+          messages: msgs,
+          sessionID: session.id,
+          auto: false,
+        })
+
+        const summary = (yield* ssn.messages({ sessionID: session.id })).find(
+          (message) => message.info.role === "assistant" && message.info.summary,
+        )
+        const text = summary?.parts.find((part): part is SessionV1.TextPart => part.type === "text")
+
+        expect(result).toBe("continue")
+        expect(text?.text).toBe("summary fallback")
+        expect(text?.metadata?.openaiNativeCompactionLock).toBeUndefined()
+      }).pipe(
+        withCompaction({
+          llm: stub.layer,
+          provider: ProviderTest.fake({ model: nativeModel, info: ProviderTest.info({}, nativeModel) }),
+        }),
+      )
+    },
+    { git: true },
+  )
+
+  itCompaction.instance(
+    "passes prior OpenAI native compaction window into the next native compact request",
+    () => {
+      const stub = llm()
+      let capturedWindow: LLM.StreamInput["nativeCompactionWindow"]
+      stub.compact((input) => {
+        capturedWindow = input.nativeCompactionWindow
+        return [{ type: "compaction", encrypted_content: "next-window" }]
+      })
+      const nativeRef = {
+        providerID: ProviderV2.ID.make("openai"),
+        modelID: ModelV2.ID.make("gpt-5-mini"),
+      }
+      const nativeModel = ProviderTest.model({
+        id: nativeRef.modelID,
+        providerID: nativeRef.providerID,
+        api: { id: nativeRef.modelID, url: "https://api.openai.com/v1", npm: "@ai-sdk/openai" },
+      })
+
+      return Effect.gen(function* () {
+        const ssn = yield* SessionNs.Service
+        const session = yield* ssn.create({})
+        yield* createUserMessage(session.id, "before compact", nativeRef)
+        const firstMarker = yield* createCompactionMarker(session.id, nativeRef)
+        const firstSummary = yield* createSummaryAssistantMessage(
+          session.id,
+          firstMarker.id,
+          (yield* TestInstance).directory,
+          OpenAINativeCompaction.PLACEHOLDER,
+        )
+        yield* ssn.updatePart({
+          id: PartID.ascending(),
+          messageID: firstSummary.id,
+          sessionID: session.id,
+          type: "text",
+          text: OpenAINativeCompaction.PLACEHOLDER,
+          metadata: OpenAINativeCompaction.metadata({
+            model: nativeRef,
+            output: [
+              { role: "user", content: [{ type: "input_text", text: "before compact" }] },
+              { type: "compaction", encrypted_content: "previous-window" },
+            ],
+            compactOutput: [{ type: "compaction", encrypted_content: "previous-window" }],
+          }),
+        })
+        yield* createUserMessage(session.id, "after first compact", nativeRef)
+        const secondMarker = yield* createCompactionMarker(session.id, nativeRef)
+        const msgs = yield* ssn.messages({ sessionID: session.id })
+
+        const result = yield* SessionCompaction.use.process({
+          parentID: secondMarker.id,
+          messages: msgs,
+          sessionID: session.id,
+          auto: false,
+        })
+
+        expect(result).toBe("continue")
+        expect(capturedWindow).toMatchObject({
+          version: 2,
+          output: [
+            { role: "user", content: [{ type: "input_text", text: "before compact" }] },
+            { type: "compaction", encrypted_content: "previous-window" },
+          ],
+        })
+      }).pipe(
+        withCompaction({
+          llm: stub.layer,
+          provider: ProviderTest.fake({ model: nativeModel, info: ProviderTest.info({}, nativeModel) }),
+          config: cfg({ tail_turns: 1, preserve_recent_tokens: 10_000 }),
+        }),
+      )
+    },
+    { git: true },
+  )
+
+  itCompaction.instance(
+    "rebuilds fallback summary messages for the compaction agent model after native compact misses",
+    () => {
+      const stub = llm()
+      let nativeMessages = ""
+      let summaryMessages = ""
+      stub.compact((input) => {
+        nativeMessages = JSON.stringify(input.messages)
+        return [{ type: "message", role: "assistant", content: [] }]
+      })
+      stub.push(reply("summary fallback", (input) => {
+        summaryMessages = JSON.stringify(input.messages)
+      }))
+      const nativeRef = {
+        providerID: ProviderV2.ID.make("openai"),
+        modelID: ModelV2.ID.make("gpt-5-mini"),
+      }
+      const summaryRef = {
+        providerID: ProviderV2.ID.make("openai"),
+        modelID: ModelV2.ID.make("summary-model"),
+      }
+      const nativeModel = ProviderTest.model({
+        id: nativeRef.modelID,
+        providerID: nativeRef.providerID,
+        api: { id: nativeRef.modelID, url: "https://api.openai.com/v1", npm: "@ai-sdk/openai" },
+      })
+      const summaryModel = ProviderTest.model({
+        id: summaryRef.modelID,
+        providerID: summaryRef.providerID,
+        api: { id: summaryRef.modelID, url: "https://api.openai.com/v1", npm: "@ai-sdk/openai" },
+      })
+
+      return Effect.gen(function* () {
+        const ssn = yield* SessionNs.Service
+        const test = yield* TestInstance
+        const session = yield* ssn.create({})
+        const user = yield* createUserMessage(session.id, "hello", nativeRef)
+        const assistant = yield* ssn.updateMessage({
+          id: MessageID.ascending(),
+          role: "assistant",
+          sessionID: session.id,
+          mode: "build",
+          agent: "build",
+          providerID: nativeRef.providerID,
+          modelID: nativeRef.modelID,
+          path: { cwd: test.directory, root: test.directory },
+          cost: 0,
+          tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+          parentID: user.id,
+          time: { created: Date.now(), completed: Date.now() },
+          finish: "stop",
+        } satisfies SessionV1.Assistant)
+        yield* ssn.updatePart({
+          id: PartID.ascending(),
+          messageID: assistant.id,
+          sessionID: session.id,
+          type: "text",
+          text: "assistant response",
+          metadata: { openai: { item_id: "opaque-metadata" } },
+        })
+        const marker = yield* createCompactionMarker(session.id, nativeRef)
+        const msgs = yield* ssn.messages({ sessionID: session.id })
+
+        const result = yield* SessionCompaction.use.process({
+          parentID: marker.id,
+          messages: msgs,
+          sessionID: session.id,
+          auto: false,
+        })
+
+        expect(result).toBe("continue")
+        expect(nativeMessages).toContain("opaque-metadata")
+        expect(summaryMessages).not.toContain("opaque-metadata")
+      }).pipe(
+        withCompaction({
+          llm: stub.layer,
+          agent: agentLayer({ compactionModel: summaryRef }),
+          provider: providerLayer([nativeModel, summaryModel]),
+          config: cfg({ tail_turns: 0 }),
+        }),
+      )
+    },
+    { git: true },
+  )
+
+  itCompaction.instance(
     "shrinks retained tail to fit preserve token budget",
     Effect.gen(function* () {
       const ssn = yield* SessionNs.Service
@@ -1009,7 +1490,7 @@ describe("session.compaction.process", () => {
         expect(part?.type).toBe("compaction")
         expect(part?.tail_start_id).toBeUndefined()
         expect(captured).toContain("yyyy")
-      }).pipe(withCompaction({ llm: stub.llmLayer, config: cfg({ tail_turns: 1, preserve_recent_tokens: 20 }) }))
+      }).pipe(withCompaction({ llm: stub.layer, config: cfg({ tail_turns: 1, preserve_recent_tokens: 20 }) }))
     },
     { git: true },
   )
@@ -1046,7 +1527,7 @@ describe("session.compaction.process", () => {
         expect(part?.tail_start_id).toBeUndefined()
         expect(captured).toContain("recent image turn")
         expect(captured).toContain("Attached image/png: big.png")
-      }).pipe(withCompaction({ llm: stub.llmLayer, config: cfg({ tail_turns: 1, preserve_recent_tokens: 100 }) }))
+      }).pipe(withCompaction({ llm: stub.layer, config: cfg({ tail_turns: 1, preserve_recent_tokens: 100 }) }))
     },
     { git: true },
   )
@@ -1097,7 +1578,7 @@ describe("session.compaction.process", () => {
         expect(filtered[1]?.info.role).toBe("assistant")
         expect(filtered[1]?.info.role === "assistant" ? filtered[1].info.summary : false).toBe(true)
         expect(filtered.map((msg) => msg.info.id)).not.toContain(large.id)
-      }).pipe(withCompaction({ llm: stub.llmLayer, config: cfg({ tail_turns: 1, preserve_recent_tokens: 100 }) }))
+      }).pipe(withCompaction({ llm: stub.layer, config: cfg({ tail_turns: 1, preserve_recent_tokens: 100 }) }))
     },
     { git: true },
   )
@@ -1258,7 +1739,14 @@ describe("session.compaction.process", () => {
           expect(Cause.hasInterrupts(exit.cause)).toBe(true)
           expect(Date.now() - start).toBeLessThan(250)
         }
-      }).pipe(withCompaction({ llm: stub.llmLayer }))
+      }).pipe(
+        withCompaction({
+          llm: stub.layer,
+          snapshot: Layer.mock(Snapshot.Service)({
+            track: () => Effect.succeed(undefined),
+          }),
+        }),
+      )
     },
     { git: true },
     { timeout: 10_000 },
@@ -1331,7 +1819,7 @@ describe("session.compaction.process", () => {
         expect(summary?.parts.some((part) => part.type === "reasoning")).toBe(false)
         // Sanity: the text part still got through.
         expect(summary?.parts.some((part) => part.type === "text" && part.text === "summary")).toBe(true)
-      }).pipe(withCompaction({ llm: stub.llmLayer }))
+      }).pipe(withCompaction({ llm: stub.layer }))
     },
     { git: true },
   )
@@ -1367,7 +1855,7 @@ describe("session.compaction.process", () => {
 
         expect(summary?.info.role).toBe("assistant")
         expect(summary?.parts.some((part) => part.type === "tool")).toBe(false)
-      }).pipe(withCompaction({ llm: stub.llmLayer }))
+      }).pipe(withCompaction({ llm: stub.layer }))
     },
     { git: true },
   )
@@ -1414,7 +1902,7 @@ describe("session.compaction.process", () => {
         expect(captured).not.toContain("What did we do so far?")
       }).pipe(
         withCompaction({
-          llm: stub.llmLayer,
+          llm: stub.layer,
           config: cfg({ tail_turns: 2, preserve_recent_tokens: 10_000 }),
         }),
       )
@@ -1458,7 +1946,7 @@ describe("session.compaction.process", () => {
         expect(capturedPrompt).not.toContain("近期未压缩尾部")
         expect(capturedPrompt).not.toContain("继续用中文总结这件事")
         expect(capturedPrompt).not.toContain("## Goal")
-        expect(capturedAgentPrompt).toContain("锚定上下文摘要助手")
+        expect(capturedAgentPrompt).toContain("上下文摘要代理")
         expect(capturedAgentPrompt).not.toContain("anchored context")
         expect(
           all.some(
@@ -1467,7 +1955,7 @@ describe("session.compaction.process", () => {
               msg.parts.some((part) => part.type === "text" && part.synthetic && part.text.includes("如果你有下一步")),
           ),
         ).toBe(true)
-      }).pipe(withCompaction({ llm: stub.layer }))
+      }).pipe(withCompaction({ llm: stub.layer, config: cfg({ tail_turns: 2 }) }))
     },
     { git: true },
   )
@@ -1511,7 +1999,7 @@ describe("session.compaction.process", () => {
         expect(captured).toContain("summary of the conversation before the <conversation> above")
         expect(captured).toContain("## Important Details")
         expect(captured).toContain("## Work State")
-      }).pipe(withCompaction({ llm: stub.llmLayer }))
+      }).pipe(withCompaction({ llm: stub.layer }))
     },
     { git: true },
   )
@@ -1551,7 +2039,7 @@ describe("session.compaction.process", () => {
         )
       }).pipe(
         withCompaction({
-          llm: stub.llmLayer,
+          llm: stub.layer,
           plugin: compactionContext("Prioritize unresolved migration details"),
         }),
       )
@@ -1622,7 +2110,7 @@ describe("session.compaction.process", () => {
         expect(JSON.stringify(captured)).toContain('[Assistant tool call]: read({\\"filePath\\":\\"src/index.ts\\"})')
         expect(JSON.stringify(captured)).toContain("[Tool result]: file contents")
         expect(JSON.stringify(captured)).not.toContain('\\"role\\":\\"assistant\\"')
-      }).pipe(withCompaction({ llm: stub.llmLayer, config: cfg({ tail_turns: 0 }) }))
+      }).pipe(withCompaction({ llm: stub.layer, config: cfg({ tail_turns: 0 }) }))
     },
     { git: true },
   )
@@ -1664,7 +2152,7 @@ describe("session.compaction.process", () => {
       expect(
         filtered.some((msg) => msg.info.role === "user" && msg.parts.some((part) => part.type === "compaction")),
       ).toBe(true)
-    }).pipe(withCompaction({ llm: stub.llmLayer, config: cfg({ tail_turns: 2, preserve_recent_tokens: 10_000 }) }))
+    }).pipe(withCompaction({ llm: stub.layer, config: cfg({ tail_turns: 2, preserve_recent_tokens: 10_000 }) }))
   })
 
   itCompaction.instance(

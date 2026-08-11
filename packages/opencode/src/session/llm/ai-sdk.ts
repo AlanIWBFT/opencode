@@ -42,6 +42,32 @@ function copilotTotalNanoAiu(value: unknown) {
   return total
 }
 
+function rawProviderMetadata(value: unknown): ProviderMetadata | undefined {
+  if (!value || typeof value !== "object") return undefined
+  const raw = value as Record<string, unknown>
+  if (raw.type !== "response.metadata") return undefined
+  const metadata = record(raw.metadata)
+  const response = record(raw.response)
+  const responseMetadata = record(response?.metadata)
+  const headers =
+    stringRecord(raw.headers) ??
+    stringRecord(metadata?.headers) ??
+    stringRecord(response?.headers) ??
+    stringRecord(responseMetadata?.headers)
+  return headers ? { openai: { headers } } : undefined
+}
+
+function record(value: unknown): Record<string, unknown> | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined
+  return value as Record<string, unknown>
+}
+
+function stringRecord(value: unknown) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined
+  const entries = Object.entries(value).filter((entry): entry is [string, string] => typeof entry[1] === "string")
+  return entries.length === 0 ? undefined : Object.fromEntries(entries)
+}
+
 function usage(value: unknown) {
   if (!value || typeof value !== "object") return undefined
   const item = value as {
@@ -277,7 +303,8 @@ export function toLLMEvents(
     case "raw":
       return Effect.sync(() => {
         state.copilotTotalNanoAiu = copilotTotalNanoAiu(event.rawValue) ?? state.copilotTotalNanoAiu
-        return []
+        const metadata = rawProviderMetadata(event.rawValue)
+        return metadata ? [LLMEvent.providerMetadata({ providerMetadata: metadata })] : []
       })
 
     default: {

@@ -59,6 +59,7 @@ import { LLMEvent } from "@opencode-ai/llm"
 import { Todo } from "./todo"
 import { ExecSession } from "@/tool/exec-session"
 import { BackgroundJob } from "@/background/job"
+import { OpenAINativeCompaction } from "./openai-native-compaction"
 
 // @ts-ignore
 globalThis.AI_SDK_LOG_WARNINGS = false
@@ -474,6 +475,26 @@ const layer = Layer.effect(
       })
     })
 
+    const nativeContinuationUser = Effect.fn("SessionPrompt.nativeContinuationUser")(function* (input: {
+      sessionID: SessionID
+      markerID: MessageID
+    }) {
+      // The native checkpoint is the provider-visible context; this user only supplies
+      // session metadata when the active history has no user after removing the checkpoint.
+      const match = yield* sessions
+        .findMessage(
+          input.sessionID,
+          (message) =>
+            message.info.role === "user" &&
+            message.info.id < input.markerID &&
+            !message.parts.some((part) => part.type === "compaction") &&
+            !message.parts.some((part) => part.type === "text" && part.metadata?.compaction_continue),
+        )
+        .pipe(Effect.orDie)
+      if (Option.isSome(match) && match.value.info.role === "user") return match.value.info
+      return undefined
+    })
+
     const handleSubtask = Effect.fn("SessionPrompt.handleSubtask")(function* (input: {
       task: SessionV1.SubtaskPart
       model: Provider.Model
@@ -853,6 +874,42 @@ const layer = Layer.effect(
         .pipe(Effect.orDie)
       if (Option.isSome(match) && match.value.info.role === "user") return match.value.info.model
       return yield* provider.defaultModel().pipe(Effect.orDie)
+    })
+
+    const rejectIncompatibleNativeCheckpoint = Effect.fn("SessionPrompt.rejectIncompatibleNativeCheckpoint")(function* (input: {
+      sessionID: SessionID
+      model: { providerID: ProviderV2.ID; modelID: ModelV2.ID }
+      variant: string | undefined
+      explicitModel: boolean
+    }) {
+      const checkpoint = yield* MessageV2.filterCompactedEffect(input.sessionID).pipe(
+        Effect.provideService(Database.Service, database),
+        Effect.map(OpenAINativeCompaction.findCheckpoint),
+      )
+      if (!checkpoint) return
+      if (
+        OpenAINativeCompaction.canReplayWithModel(checkpoint.lock.model, {
+          providerID: input.model.providerID,
+          modelID: input.model.modelID,
+          variant: input.variant,
+        })
+      )
+        return
+      yield* Effect.logWarning("rejecting prompt due to native compaction model lock", {
+        "session.id": input.sessionID,
+        requestedProviderID: input.model.providerID,
+        requestedModelID: input.model.modelID,
+        requestedVariant: input.variant ?? "default",
+        lockedProviderID: checkpoint.lock.model.providerID,
+        lockedModelID: checkpoint.lock.model.modelID,
+        lockedVariant: checkpoint.lock.model.variant ?? "default",
+        explicitModel: input.explicitModel,
+      })
+      const error = new NamedError.Unknown({
+        message: `Session is locked to OpenAI Responses by OpenAI native compaction. Revert before the compaction checkpoint to switch providers.`,
+      })
+      yield* events.publish(Session.Event.Error, { sessionID: input.sessionID, error: error.toObject() })
+      throw error
     })
 
     const prepareUserMessage = Effect.fn("SessionPrompt.prepareUserMessage")(function* (input: PromptInput) {
@@ -1255,6 +1312,12 @@ const layer = Layer.effect(
     ) {
       if (message.info.role !== "user") throw new Error("Expected prepared user message")
       const info = message.info
+      yield* rejectIncompatibleNativeCheckpoint({
+        sessionID: input.sessionID,
+        model: info.model,
+        variant: info.model.variant,
+        explicitModel: input.model !== undefined,
+      })
       const current = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
       if (
         current.agent !== info.agent ||
@@ -1322,18 +1385,44 @@ const layer = Layer.effect(
         let structured: unknown
         let step = 0
         const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
+        const openAITurnState = {}
 
         while (true) {
           yield* status.set(sessionID, { type: "busy" })
           yield* Effect.logInfo("loop", { "session.id": sessionID, step })
 
-          let msgs = yield* MessageV2.filterCompactedEffect(sessionID).pipe(
+          const compacted = yield* MessageV2.filterCompactedEffect(sessionID).pipe(
             Effect.provideService(Database.Service, database),
           )
+          const nativeReplay = OpenAINativeCompaction.replayMessages(compacted)
+          let msgs = nativeReplay.checkpoint ? nativeReplay.messages : compacted
+          const nativeCompactionWindow = nativeReplay.checkpoint
+            ? OpenAINativeCompaction.replayWindow({ checkpoint: nativeReplay.checkpoint })
+            : undefined
 
-          const { user: lastUser, assistant: lastAssistant, finished: lastFinished, tasks } = MessageV2.latest(msgs)
+          const durableLatest = MessageV2.latest(compacted)
+          const { tasks } = durableLatest
+          const activeLatest = MessageV2.latest(msgs)
+          const continuationUser =
+            !activeLatest.user && nativeReplay.checkpoint?.auto
+              ? yield* nativeContinuationUser({ sessionID, markerID: nativeReplay.checkpoint.markerID })
+              : undefined
+          const lastUser = activeLatest.user ?? continuationUser
+          const lastAssistant = activeLatest.assistant
+          const lastFinished = activeLatest.finished
 
-          if (!lastUser) throw new Error("No user message found in stream. This should never happen.")
+          if (!lastUser) {
+            if (nativeReplay.checkpoint) {
+              yield* Effect.logInfo("exiting loop after native compaction checkpoint", {
+                "session.id": sessionID,
+                checkpointMarkerID: nativeReplay.checkpoint.markerID,
+                checkpointSummaryID: nativeReplay.checkpoint.summaryID,
+                reason: "missing replay user",
+              })
+              break
+            }
+            throw new Error("No user message found in stream. This should never happen.")
+          }
 
           const lastAssistantMsg = msgs.findLast(
             (msg) => msg.info.role === "assistant" && msg.info.id === lastAssistant?.id,
@@ -1367,6 +1456,19 @@ const layer = Layer.effect(
             break
           }
 
+          if (continuationUser && nativeReplay.checkpoint) {
+            yield* Effect.logInfo("continuing loop after native compaction checkpoint", {
+              "session.id": sessionID,
+              checkpointMarkerID: nativeReplay.checkpoint.markerID,
+              checkpointSummaryID: nativeReplay.checkpoint.summaryID,
+              userID: continuationUser.id,
+            })
+          }
+          const assistantParentID =
+            nativeReplay.checkpoint && lastUser.id < nativeReplay.checkpoint.markerID
+              ? nativeReplay.checkpoint.markerID
+              : lastUser.id
+
           step++
           if (step === 1)
             yield* title({
@@ -1395,12 +1497,15 @@ const layer = Layer.effect(
           }
 
           if (task?.type === "compaction") {
+            const parentID = durableLatest.user?.id
+            if (!parentID) throw new Error("No compaction parent found in stream. This should never happen.")
             const result = yield* compaction.process({
-              messages: msgs,
-              parentID: lastUser.id,
+              messages: compacted,
+              parentID,
               sessionID,
               auto: task.auto,
               overflow: task.overflow,
+              turnState: openAITurnState,
             })
             if (result === "stop") break
             continue
@@ -1408,6 +1513,7 @@ const layer = Layer.effect(
 
           if (
             lastFinished &&
+            !(nativeReplay.checkpoint && lastFinished.id < nativeReplay.checkpoint.markerID) &&
             lastFinished.summary !== true &&
             (yield* compaction.isOverflow({ tokens: lastFinished.tokens, model }))
           ) {
@@ -1433,7 +1539,7 @@ const layer = Layer.effect(
 
           const msg: SessionV1.Assistant = {
             id: MessageID.ascending(),
-            parentID: lastUser.id,
+            parentID: assistantParentID,
             role: "assistant",
             mode: agent.name,
             agent: agent.name,
@@ -1528,6 +1634,8 @@ const layer = Layer.effect(
                 ...modelMsgs,
                 ...(isLastStep ? [{ role: "assistant" as const, content: MAX_STEPS_PROMPT }] : []),
               ],
+              nativeCompactionWindow,
+              turnState: openAITurnState,
               tools,
               model,
               toolChoice: format.type === "json_schema" ? "required" : undefined,

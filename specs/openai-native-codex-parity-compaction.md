@@ -1,0 +1,406 @@
+# OpenAI Native Codex-Parity Compaction Implementation Plan
+
+## Goal
+
+Implement OpenAI native compaction with the same history semantics as Codex RemoteCompactionV2, not just a compatible request shape.
+
+The target behavior is:
+
+- Compact through ordinary OpenAI Responses requests with a final `{ "type": "compaction_trigger" }` input item.
+- Persist a replacement replay window that contains retained pre-compaction user history plus the returned encrypted compaction item.
+- Resume provider execution with `retained user history + compaction item + retained post-checkpoint tail`, without creating a synthetic "Continue if..." user prompt.
+- Keep UI-visible compaction markers separate from the provider replay window.
+- Keep durable prompt admission and model execution behavior unchanged outside native OpenAI compaction.
+
+## Current State
+
+opencode already has the transport pieces for Codex-style native compaction:
+
+- `packages/llm/src/protocols/openai-responses-compact.ts` sends compact requests to `/responses`, forces `store: false`, enables streaming, and appends a unique `{ type: "compaction_trigger" }` item.
+- `packages/llm/src/protocols/openai-responses.ts` accepts replay input through `providerOptions.openai.responsesReplayInput` and prepends that replay input before lowered session messages.
+- `packages/opencode/src/session/openai-native-compaction.ts` stores encrypted compaction output in checkpoint metadata.
+- `packages/opencode/src/session/compaction.ts` skips synthetic auto-continue prompts for native compaction.
+- `packages/opencode/src/session/prompt.ts` can resume after an auto native checkpoint with no retained tail by using an old user only as execution metadata.
+
+The main mismatch is history semantics. Current no-tail native replay sends provider input as checkpoint-only: the old user message is used for agent/model/tool metadata but is not included in `request.messages`, so the provider sees the encrypted compaction item without the original task text.
+
+## Codex Reference Behavior
+
+Codex RemoteCompactionV2 does three distinct things.
+
+First, it compacts with ordinary `/v1/responses` input plus a final compaction trigger:
+
+```text
+codex-rs/core/src/compact_remote_v2.rs
+  prompt_input = history.for_prompt(...)
+  input = prompt_input.clone()
+  input.push(ResponseItem::CompactionTrigger {})
+```
+
+Second, after the compact stream returns one `ResponseItem::Compaction`, Codex builds replacement history from the compact request input rather than from the raw compact response alone:
+
+```text
+build_v2_compacted_history(prompt_input, compaction_output):
+  retained = prompt_input
+    .filter(is_retained_for_remote_compaction_v2)
+    .filter(should_keep_compacted_history_item)
+  retained = truncate_retained_messages_for_remote_compaction(retained, 64_000)
+  retained.push(compaction_output)
+```
+
+Third, Codex installs that replacement history into the session. The next sampling request is built from session history, so the model sees retained user context before the compaction item.
+
+Important details from Codex:
+
+- RemoteCompactionV2 retains only `user`, `developer`, and `system` messages from compact request input before filtering.
+- `should_keep_compacted_history_item` drops developer messages and non-real user wrapper messages, keeps real user messages, assistant messages if the compact output ever emits them, agent messages, and compaction items.
+- RemoteCompactionV2 appends exactly the new compaction item after retained messages.
+- Retained message text is capped at a 64k approximate-token budget, scanning from newest to oldest and truncating an over-budget retained text item if needed.
+- Mid-turn compaction reinjects initial context above the last real user or, if no real user remains, above the compaction item so the compaction item stays last.
+- Manual and pre-turn compaction clear the reference context baseline; the following ordinary user turn reinjects canonical context after the compaction item.
+- Codex can have an old remote compaction item in the compact request input, but after installing a new RemoteCompactionV2 checkpoint, replacement history converges to retained messages plus the latest compaction item.
+
+## Desired opencode Semantics
+
+opencode should persist native compaction metadata as a provider replay window, not as raw compact output only.
+
+For an auto native compaction with no retained tail:
+
+```text
+durable user:        "before compact"
+durable marker:      user compaction part
+durable summary:     assistant summary with native checkpoint metadata
+
+provider replay:     [user "before compact", compaction encrypted_content]
+provider messages:   []
+final provider input [system/context, user "before compact", compaction encrypted_content]
+```
+
+For an auto native compaction with retained tail:
+
+```text
+durable user:        "Research the plan"
+durable assistant:   unfinished/tool-call tail
+durable marker:      user compaction part with tail_start_id = durable user id
+durable summary:     assistant summary with native checkpoint metadata
+
+provider replay:     [retained pre-compaction user messages, compaction encrypted_content]
+provider messages:   [tail user "Research the plan", unfinished assistant/tool items]
+final provider input [system/context, retained user history, compaction, tail]
+```
+
+Manual native compaction remains admit-only from the user's perspective. It should install a checkpoint but should not auto-run the model without a new user input unless there is an explicit retained unfinished tail that requires continuation.
+
+## Data Model Changes
+
+Extend native checkpoint metadata to distinguish raw compact output from the installed replay window.
+
+Recommended schema shape:
+
+```ts
+const Window = Schema.Struct({
+  version: Schema.Literal(2),
+  output: Schema.Array(Schema.Record(Schema.String, Schema.Unknown)),
+  compactOutput: Schema.optional(Schema.Array(Schema.Record(Schema.String, Schema.Unknown))),
+})
+```
+
+Field semantics:
+
+- `output` is the provider replay window to pass as `responsesReplayInput`.
+- `compactOutput` is the raw compact response output for diagnostics. It is optional because `output` is enough to replay.
+- Version `1` means legacy metadata where `output` is raw compact output, usually just `[compaction]`.
+- Version `2` means `output` is already Codex-style replacement replay history.
+
+Compatibility rules:
+
+- Decode v1 checkpoints and synthesize a v2 replay window at read time when possible.
+- Do not migrate persisted data eagerly.
+- If a v1 checkpoint has retained tail, synthesize using the durable messages before the marker and the legacy compaction item.
+- If synthesis cannot find a real user for an auto no-tail checkpoint, keep existing safe behavior: log and stop instead of creating a synthetic user prompt.
+
+## LLM Package Work
+
+### 1. Expose compact request input
+
+The session layer needs to build Codex replacement history from the actual compact request input after protocol lowering and provider transforms. Avoid duplicating provider wire lowering in session code.
+
+Add an LLM compact result shape that includes the normalized compact request input:
+
+```ts
+type OpenAIResponsesCompactResult = {
+  readonly output: readonly OutputItem[]
+  readonly input: readonly unknown[]
+}
+```
+
+Implementation notes:
+
+- In `packages/llm/src/protocols/openai-responses-compact.ts`, `compactRequestBody(...)` already constructs the compact body with the final trigger.
+- Return the compact response output and the body input before sending, or return the input with the trailing `compaction_trigger` removed.
+- Prefer returning `inputWithoutTrigger`, because Codex replacement history is based on `prompt_input`, not `prompt_input + compaction_trigger`.
+- Keep existing `LLMClient.compact(request)` API stable if public callers expect only output. Add a narrow internal API only if changing the return type would ripple too far.
+
+Possible approaches:
+
+- Add `LLMClient.compactWithInput(request)` for opencode native compaction.
+- Or change `LLMClient.compact` return type and adapt all callsites in one commit if it is only used internally.
+- Or add `metadata` to the existing compact output result if the route client already has a generic response envelope.
+
+### 2. Preserve replay item decoding
+
+Ensure `packages/llm/src/protocols/openai-responses.ts` continues to accept these replay input item types:
+
+- `{ role: "user", content: [...] }`
+- `{ role: "system", content: string }`
+- `{ role: "assistant", content: [...] }`
+- `{ type: "compaction", encrypted_content: string, id?: string, ... }`
+- `{ type: "function_call" | "function_call_output" }` only if we intentionally retain them later.
+
+Do not include `compaction_trigger` in normal replay windows. It belongs only to compact requests.
+
+### 3. Turn-state parity
+
+Codex reuses turn-state headers for ChatGPT/OAuth Responses flows:
+
+- Initial sampling mints turn state.
+- RemoteCompactionV2 compact request replays that same state.
+- Post-compact continuation also replays that same state.
+
+If exact Codex parity includes ChatGPT/OAuth transport behavior, add a scoped turn-state holder to the native OpenAI runtime:
+
+- Capture response metadata/header state from `LLMClient.stream`.
+- Pass it into `LLMClient.compactWithInput`.
+- Preserve the first state value across compact and continuation requests.
+
+This should be a separate phase if the current `@opencode-ai/llm` route stack does not expose provider response metadata yet.
+
+## Session Work
+
+### 1. Build Codex replacement replay windows
+
+Add a function in `packages/opencode/src/session/openai-native-compaction.ts` or a sibling module:
+
+```ts
+buildReplacementWindow(input: {
+  readonly compactInput: readonly Record<string, unknown>[]
+  readonly compactOutput: readonly Record<string, unknown>[]
+  readonly mode: "pre-turn" | "mid-turn" | "manual"
+}): Window
+```
+
+Responsibilities:
+
+- Drop any `compaction_trigger` items.
+- Keep only supported retained messages from the compact input.
+- Filter retained messages to real user messages for the first implementation unless developer/system retention is deliberately needed.
+- Append exactly one returned compaction item.
+- Enforce one compaction output item with `encrypted_content`.
+- Apply a retained-message token budget compatible with Codex.
+
+Start minimal and safe:
+
+- Retain real user messages only.
+- Preserve input images in retained user messages.
+- Drop developer/system because opencode already injects current system/context separately through `LLMRequestPrep.prepare`.
+- Drop assistant/tool artifacts from replacement window; retained tail still carries unfinished assistant/tool state through normal `msgs`.
+
+Then add Codex-complete retention if tests prove a gap:
+
+- Preserve developer/system only when they represent chronological session context that is not otherwise injected.
+- Preserve assistant messages emitted by compact output if OpenAI starts returning them.
+- Preserve agent messages if opencode gains an equivalent wire item.
+
+### 2. Store replacement window in checkpoint metadata
+
+In `packages/opencode/src/session/compaction.ts`:
+
+- Change `tryNativeCompaction` to receive `{ output, compactInput }` from `llm.compact`.
+- Build `OpenAINativeCompaction.Window` from `compactInput` and `output`.
+- Pass the replacement window into `storeNativeCheckpoint`.
+- Store raw compact output only as optional diagnostics.
+
+The native checkpoint text part should still render as `OpenAINativeCompaction.PLACEHOLDER`.
+
+### 3. Use replacement window for continuation
+
+In `packages/opencode/src/session/prompt.ts`:
+
+- Keep `nativeContinuationUser` or equivalent for execution metadata: agent, selected model, tools, format, system additions.
+- Do not inject a synthetic durable user message for native no-tail auto continuation.
+- Pass `nativeReplay.checkpoint.window` to the LLM request.
+- Ensure `msgs` only contains retained post-checkpoint tail messages, not marker/summary.
+- Ensure `title(...)` and task handling use durable or replay-safe history without moving the UI compaction divider.
+
+Expected no-tail behavior after this change:
+
+- `activeLatest.user` is absent.
+- `continuationUser` is the previous durable user and provides metadata.
+- Provider messages are empty, but `nativeCompactionWindow.output` contains the retained original user and compaction item.
+- Assistant parent remains the marker id, preserving UI grouping.
+
+### 4. Legacy v1 checkpoint synthesis
+
+For checkpoints whose stored window is just `[compaction]`, synthesize a Codex-style replay window before sending to the provider:
+
+```text
+retained = durable messages before marker, filtered to real user messages and capped
+window.output = retained + legacyWindow.output
+```
+
+This synthesis can live in `OpenAINativeCompaction.replayMessages(...)` if it gets the full durable message list, or in `prompt.ts` where durable `compacted` messages are already available.
+
+Rules:
+
+- Only synthesize for auto checkpoints or explicit continuation after a retained unfinished tail.
+- Manual no-tail checkpoint with no new prompt should still stop.
+- Do not persist the synthesized v2 window unless there is a specific migration reason.
+
+### 5. Retained tail behavior
+
+Preserve opencode's existing `tail_start_id` semantics:
+
+- The replacement window represents compacted head.
+- Messages at or after `tail_start_id` remain as normal session messages.
+- Native replay input is `replacement window + lowered tail messages` because `openai-responses.ts` prepends replay input before normal lowered messages.
+- Do not include tail messages in `replacement window`, or they will be duplicated.
+
+### 6. Manual compaction behavior
+
+Manual native compaction should match Codex standalone compaction semantics:
+
+- Compact existing history and install a checkpoint.
+- Stop the loop after the checkpoint if there is no retained unfinished tail.
+- The next user prompt should produce provider input `compaction replay window + new user message`.
+- The new user prompt, not the old compacted user, should control agent/model metadata unless opencode intentionally adopts Codex's reconstructed previous-turn settings behavior.
+
+### 7. Initial context placement
+
+Codex treats initial context placement differently by phase:
+
+- Pre-turn/manual compaction: context is reinjected after compaction on the next normal turn.
+- Mid-turn compaction: context is inserted before the last real user or before the compaction item so the compaction item stays last.
+
+opencode does not store canonical context as raw `ResponseItem`s in the same way. For parity at the provider input level:
+
+- Rely on `LLMRequestPrep.prepare` to inject current system/context before replay input.
+- Do not store opencode system/context in the native replay window initially.
+- If OpenAI behavior requires the compaction item to be physically last for mid-turn continuation, add a phase-aware option in `openai-responses.ts` to place `responsesReplayInput` after system but before or after specific context messages. Do this only with a failing test or live provider evidence.
+
+## Tests
+
+### LLM package tests
+
+Update `packages/llm/test/provider/openai-responses.test.ts`:
+
+- Compact request still goes to `/responses`.
+- Compact request input ends with exactly one `compaction_trigger`.
+- `compactWithInput` returns compact input without the trigger.
+- Prior `responsesReplayInput` appears before current compact messages and before the final trigger.
+- Normal stream requests never include `compaction_trigger` unless explicitly passed as replay input for a compact request.
+- Stream compact response must include `response.completed` and exactly one compaction item.
+
+### Native runtime tests
+
+Update `packages/opencode/test/session/llm-native.test.ts`:
+
+- Native compact returns both raw output and compact input.
+- Native compact with prior compaction window includes prior replay input, current compact messages, then trigger.
+- Native compact exposes compact input in the exact order sent to OpenAI, excluding the final trigger if that is the chosen API.
+
+### Session compaction tests
+
+Update `packages/opencode/test/session/compaction.test.ts`:
+
+- Native auto compaction stores a v2 replay window containing retained real user messages and the returned compaction item.
+- Native auto compaction does not store `compaction_trigger` in metadata.
+- A second native compaction replaces the previous replay window with retained messages plus the latest compaction item.
+- Retained-message budget drops old retained users first and truncates an over-budget newest user message.
+- Plugin-customized compaction still falls back to summary compaction.
+- Summary compaction behavior and synthetic auto-continue remain unchanged for non-native compaction.
+
+### Session prompt tests
+
+Update `packages/opencode/test/session/prompt.test.ts`:
+
+- No-tail auto native checkpoint resumes with provider body containing both encrypted compaction item and original user text.
+- No-tail auto native checkpoint still does not create a synthetic `compaction_continue` user part.
+- The assistant created after checkpoint has parent id equal to the compaction marker id.
+- Manual no-tail native checkpoint exits cleanly and does not auto-run.
+- Manual checkpoint followed by a new user prompt sends `replacement window + new user`.
+- Retained unfinished tail sends `replacement window + tail user/assistant/tool state`, with no duplicate tail user inside replacement window.
+- Legacy v1 checkpoint with only `[compaction]` synthesizes retained user replay for auto continuation.
+- Legacy v1 checkpoint with no recoverable user stops safely.
+
+### Snapshot or request-shape tests
+
+Add compact request shape snapshots mirroring Codex scenarios:
+
+- Pre-turn native compaction excludes incoming user from compact request, then follow-up includes `retained users + compaction + incoming user`.
+- Mid-turn continuation compaction after tool output includes tool artifacts in the compact request, then continuation includes `retained user + compaction` and retained tail if needed.
+- Manual compaction with prior history installs checkpoint, then follow-up includes `compaction + new user` or `retained user + compaction + new user` depending on the retention phase decision.
+
+## Migration And Compatibility
+
+Persisted native checkpoints may already exist with metadata version 1.
+
+Compatibility requirements:
+
+- Version 1 checkpoints remain readable.
+- Version 1 replay should be upgraded in memory to Codex-style input when possible.
+- Version 2 checkpoints should be written for all new native compactions.
+- Do not alter non-native summary compaction metadata.
+- Do not regenerate SDKs unless the public protocol changes. Native checkpoint metadata is internal message-part metadata and should not require protocol generation unless exposed through public schemas.
+
+Potential compatibility risk:
+
+- Existing tests or user sessions may rely on checkpoint-only replay. The new behavior sends retained original user text to OpenAI again. This matches Codex but changes provider input shape.
+- If retained original user contains large images or text, token use increases. The retained budget and truncation are mandatory before enabling broadly.
+
+## Rollout Phases
+
+### Phase 1: Build and store replacement windows
+
+- Add compact input exposure in the LLM compact route.
+- Build v2 replacement windows in native compaction.
+- Store v2 checkpoint metadata for new native compactions.
+- Keep legacy v1 replay unchanged for the first commit if needed.
+- Update focused LLM/native compact tests.
+
+### Phase 2: Replay replacement windows in prompt loop
+
+- Change no-tail auto native continuation to rely on v2 replay window containing retained user messages.
+- Update prompt tests to assert original user text is in provider input.
+- Preserve no synthetic prompt behavior.
+- Preserve marker-parent UI grouping.
+
+### Phase 3: Legacy synthesis and retained budget
+
+- Add v1 checkpoint in-memory synthesis.
+- Implement Codex-style retained-message token budget and truncation.
+- Add tests for over-budget retained history.
+
+### Phase 4: Codex edge parity
+
+- Add phase-aware initial-context placement if needed.
+- Add turn-state replay for OpenAI OAuth/ChatGPT if route metadata exposes it.
+- Add snapshots for pre-turn, mid-turn, manual, and resume scenarios.
+
+## Acceptance Criteria
+
+- New native OpenAI compactions persist a replay window, not raw compact output only.
+- Auto no-tail checkpoint continuation provider input includes retained original user text and encrypted compaction item.
+- Retained tail continuation provider input includes the replay window and tail exactly once.
+- Manual no-tail native compaction does not auto-continue.
+- No native compaction path creates synthetic "Continue if..." prompts.
+- Provider input never includes stale compaction triggers outside compact requests.
+- Replacement windows contain at most one latest compaction item.
+- Existing summary compaction tests still pass.
+- `bun test test/session/prompt.test.ts`, `bun test test/session/compaction.test.ts`, relevant `packages/llm` provider tests, and `bun typecheck` pass from their package directories.
+
+## Open Questions
+
+- Should opencode retain developer/system messages in the v2 window, or should it rely entirely on current `LLMRequestPrep.prepare` system/context injection? Start with real user retention only unless provider evidence requires exact wire parity.
+- Should manual compact replacement windows include retained old user messages before the compaction item? Codex V2 does, but existing opencode UX may prefer the next user prompt to be the only visible task context outside the encrypted item.
+- Does OpenAI require the compaction item to be the last replay item for mid-turn continuation, or is `replay input + tail` accepted? Current tests can validate shape, but live provider validation is needed for confidence.
+- Is turn-state replay required for API-key OpenAI, or only ChatGPT/OAuth/websocket transports? Implement only when the transport exposes the relevant headers/metadata.

@@ -26,6 +26,7 @@ import { ToolSchemaProjection } from "./utils/tool-schema"
 import { ToolStream } from "./utils/tool-stream"
 
 const ADAPTER = "openai-responses"
+const WEBSOCKET_ADAPTER = `${ADAPTER}-websocket`
 export const DEFAULT_BASE_URL = "https://api.openai.com/v1"
 export const PATH = "/responses"
 
@@ -65,6 +66,17 @@ const OpenAIResponsesItemReference = Schema.Struct({
   id: Schema.String,
 })
 
+const OpenAIResponsesCompactionItem = Schema.Struct({
+  type: Schema.tag("compaction"),
+  id: Schema.optionalKey(Schema.String),
+  encrypted_content: Schema.String,
+  internal_chat_message_metadata_passthrough: Schema.optional(Schema.Unknown),
+})
+
+const OpenAIResponsesCompactionTrigger = Schema.Struct({
+  type: Schema.tag("compaction_trigger"),
+})
+
 // `function_call_output.output` accepts either a plain string or an ordered
 // array of content items so tools can return images in addition to text.
 // https://platform.openai.com/docs/api-reference/responses/object
@@ -81,6 +93,8 @@ const OpenAIResponsesInputItem = Schema.Union([
   Schema.Struct({ role: Schema.tag("assistant"), content: Schema.Array(OpenAIResponsesOutputText) }),
   OpenAIResponsesReasoningItem,
   OpenAIResponsesItemReference,
+  OpenAIResponsesCompactionItem,
+  OpenAIResponsesCompactionTrigger,
   Schema.Struct({
     type: Schema.tag("function_call"),
     call_id: Schema.String,
@@ -94,6 +108,16 @@ const OpenAIResponsesInputItem = Schema.Union([
   }),
 ])
 type OpenAIResponsesInputItem = Schema.Schema.Type<typeof OpenAIResponsesInputItem>
+
+const replayInputItems = (request: LLMRequest): OpenAIResponsesInputItem[] => {
+  const value = request.providerOptions?.openai?.responsesReplayInput
+  if (!Array.isArray(value)) return []
+  const decode = Schema.decodeUnknownOption(OpenAIResponsesInputItem)
+  return value.flatMap((item) => {
+    const parsed = decode(item)
+    return parsed._tag === "Some" ? [parsed.value] : []
+  })
+}
 
 // Mutable counterpart of the schema reasoning item so `lowerMessages` can fold
 // multiple streamed summary parts into the same item before flushing.
@@ -132,6 +156,7 @@ const OpenAIResponsesCoreFields = {
   store: Schema.optional(Schema.Boolean),
   service_tier: Schema.optional(OpenAIOptions.OpenAIServiceTier),
   prompt_cache_key: Schema.optional(Schema.String),
+  client_metadata: Schema.optional(Schema.Record(Schema.String, Schema.String)),
   include: optionalArray(OpenAIOptions.OpenAIResponseIncludable),
   reasoning: Schema.optional(
     Schema.Struct({
@@ -214,10 +239,13 @@ const OpenAIResponsesEvent = Schema.Struct({
   item_id: Schema.optional(Schema.String),
   summary_index: Schema.optional(Schema.Number),
   item: Schema.optional(OpenAIResponsesStreamItem),
+  headers: Schema.optional(Schema.Record(Schema.String, Schema.Unknown)),
+  metadata: Schema.optional(Schema.Record(Schema.String, Schema.Unknown)),
   response: Schema.optional(
     Schema.StructWithRest(
       Schema.Struct({
         id: Schema.optional(Schema.String),
+        headers: Schema.optional(Schema.Record(Schema.String, Schema.Unknown)),
         service_tier: optionalNull(Schema.String),
         incomplete_details: optionalNull(Schema.Struct({ reason: Schema.String })),
         usage: optionalNull(OpenAIResponsesUsage),
@@ -347,7 +375,7 @@ const lowerToolResultOutput = Effect.fn("OpenAIResponses.lowerToolResultOutput")
 const lowerMessages = Effect.fn("OpenAIResponses.lowerMessages")(function* (request: LLMRequest) {
   const system: OpenAIResponsesInputItem[] =
     request.system.length === 0 ? [] : [{ role: "system", content: ProviderShared.joinText(request.system) }]
-  const input: OpenAIResponsesInputItem[] = [...system]
+  const input: OpenAIResponsesInputItem[] = [...system, ...replayInputItems(request)]
   const store = OpenAIOptions.store(request)
 
   for (const message of request.messages) {
@@ -465,10 +493,12 @@ const lowerOptions = Effect.fn("OpenAIResponses.lowerOptions")(function* (reques
   const verbosity = OpenAIOptions.textVerbosity(request)
   const instructions = OpenAIOptions.instructions(request)
   const serviceTier = OpenAIOptions.serviceTier(request)
+  const clientMetadata = request.model.route.id === WEBSOCKET_ADAPTER ? OpenAIOptions.clientMetadata(request) : undefined
   return {
     ...(instructions ? { instructions } : {}),
     ...(store !== undefined ? { store } : {}),
     ...(promptCacheKey ? { prompt_cache_key: promptCacheKey } : {}),
+    ...(clientMetadata ? { client_metadata: clientMetadata } : {}),
     ...(include ? { include } : {}),
     ...(effort || summary ? { reasoning: { effort, summary } } : {}),
     ...(verbosity ? { text: { verbosity } } : {}),
@@ -530,6 +560,17 @@ const mapFinishReason = (event: OpenAIResponsesEvent, hasFunctionCall: boolean):
 }
 
 const openaiMetadata = (metadata: Record<string, unknown>): ProviderMetadata => ({ openai: metadata })
+
+const metadataHeaders = (event: OpenAIResponsesEvent) => event.response?.headers ?? event.headers
+
+const metadataFromResponseMetadata = (event: OpenAIResponsesEvent) => {
+  if (event.type !== "response.metadata") return undefined
+  const metadata: Record<string, unknown> = {}
+  if (event.metadata) metadata.metadata = event.metadata
+  const headers = metadataHeaders(event)
+  if (headers) metadata.headers = headers
+  return Object.keys(metadata).length === 0 ? undefined : openaiMetadata(metadata)
+}
 
 // Hosted tool items (provider-executed) ship their typed input + status +
 // result fields all in one item. We expose them as a `tool-call` +
@@ -931,6 +972,11 @@ const onResponseFailed = (state: ParserState, event: OpenAIResponsesEvent): Step
   [providerError(event, "OpenAI Responses response failed")],
 ]
 
+const onResponseMetadata = (state: ParserState, event: OpenAIResponsesEvent): StepResult => {
+  const providerMetadata = metadataFromResponseMetadata(event)
+  return providerMetadata ? [state, [LLMEvent.providerMetadata({ providerMetadata })]] : [state, NO_EVENTS]
+}
+
 const onError = (state: ParserState, event: OpenAIResponsesEvent): StepResult => [
   state,
   [providerError(event, "OpenAI Responses stream error")],
@@ -965,6 +1011,7 @@ const step = (state: ParserState, event: OpenAIResponsesEvent) => {
   }
   if (event.type === "response.completed" || event.type === "response.incomplete")
     return Effect.succeed(onResponseFinish(state, event))
+  if (event.type === "response.metadata") return Effect.succeed(onResponseMetadata(state, event))
   if (event.type === "response.failed") return Effect.succeed(onResponseFailed(state, event))
   if (event.type === "error") return Effect.succeed(onError(state, event))
   return Effect.succeed<StepResult>([state, NO_EVENTS])
@@ -1033,7 +1080,7 @@ export const webSocketTransport = WebSocketTransport.jsonTransport.with<
 })
 
 export const webSocketRoute = Route.make({
-  id: `${ADAPTER}-websocket`,
+  id: WEBSOCKET_ADAPTER,
   provider: "openai",
   protocol,
   endpoint,

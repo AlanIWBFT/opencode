@@ -554,6 +554,25 @@ describe("session.llm.ai-sdk adapter", () => {
     if (events[1].type !== "step-finish") throw new Error("expected step-finish")
     expect(events[1].providerMetadata?.copilot).toBeUndefined()
   })
+
+  test("emits OpenAI turn-state metadata from raw response metadata chunks", async () => {
+    const events = await adapt([
+      uncheckedAdapterEvent({
+        type: "raw",
+        rawValue: {
+          type: "response.metadata",
+          headers: { "x-codex-turn-state": "turn-1", ignored: 1 },
+        },
+      }),
+    ])
+
+    expect(events).toEqual([
+      {
+        type: "provider-metadata",
+        providerMetadata: { openai: { headers: { "x-codex-turn-state": "turn-1" } } },
+      },
+    ])
+  })
 })
 
 type Capture = {
@@ -1433,6 +1452,8 @@ describe("session.llm.stream", () => {
           LLMClient.Service,
           LLMClient.Service.of({
             prepare: () => Effect.die(new Error("native LLM client should not be used when the flag is off")),
+            compact: () => Effect.die(new Error("native LLM client should not be used when the flag is off")),
+            compactWithInput: () => Effect.die(new Error("native LLM client should not be used when the flag is off")),
             stream: () => Stream.die(new Error("native LLM client should not be used when the flag is off")),
             generate: () => Effect.die(new Error("native LLM client should not be used when the flag is off")),
           }),
@@ -1467,12 +1488,82 @@ describe("session.llm.stream", () => {
             system: ["You are a helpful assistant."],
             messages: [{ role: "user", content: "Hello" }],
             tools: {},
+            turnState: { value: "turn-1" },
           },
         )
 
         const capture = yield* Effect.promise(() => request)
         expect(capture.url.pathname.endsWith("/responses")).toBe(true)
+        expect(capture.headers.get("x-codex-turn-state")).toBe("turn-1")
         expect(capture.body.model).toBe(resolved.api.id)
+      }),
+    { config: () => openAIConfig(loadFixture("openai", "gpt-5.2").model, `${state.server!.url.origin}/v1`) },
+  )
+
+  it.instance(
+    "forces native OpenAI replay when a native compaction window is present",
+    () =>
+      Effect.gen(function* () {
+        const model = loadFixture("openai", "gpt-5.2").model
+        const request = waitRequest(
+          "/responses",
+          createEventResponse(
+            [
+              {
+                type: "response.completed",
+                response: {
+                  incomplete_details: null,
+                  usage: {
+                    input_tokens: 1,
+                    input_tokens_details: null,
+                    output_tokens: 1,
+                    output_tokens_details: null,
+                  },
+                  service_tier: null,
+                },
+              },
+            ],
+            true,
+          ),
+        )
+        const resolved = yield* Provider.use.getModel(ProviderV2.ID.openai, ModelV2.ID.make(model.id))
+        const sessionID = SessionID.make("session-test-native-replay")
+        const agent = {
+          name: "test",
+          mode: "primary",
+          options: {},
+          permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        } satisfies Agent.Info
+
+        yield* drainWith(
+          llmLayerWithExecutor({ executor: RequestExecutor.fetchLayer, flags: { experimentalNativeLlm: false } }),
+          {
+            user: {
+              id: MessageID.make("msg_user-native-replay"),
+              sessionID,
+              role: "user",
+              time: { created: Date.now() },
+              agent: agent.name,
+              model: { providerID: ProviderV2.ID.make("openai"), modelID: resolved.id },
+            } satisfies SessionV1.User,
+            sessionID,
+            model: resolved,
+            agent,
+            system: ["System baseline"],
+            messages: [{ role: "user", content: "After compaction" }],
+            tools: {},
+            nativeCompactionWindow: {
+              version: 1,
+              output: [{ type: "compaction", encrypted_content: "opaque-window" }],
+            },
+          },
+        )
+
+        const capture = yield* Effect.promise(() => request)
+        const input = capture.body.input as Array<Record<string, unknown>>
+        expect(input[0]).toMatchObject({ role: "system" })
+        expect(input[1]).toEqual({ type: "compaction", encrypted_content: "opaque-window" })
+        expect(input[2]).toMatchObject({ role: "user" })
       }),
     { config: () => openAIConfig(loadFixture("openai", "gpt-5.2").model, `${state.server!.url.origin}/v1`) },
   )
