@@ -23,6 +23,7 @@ import { InstructionStateTable, SessionTable } from "@opencode/core/session/sql"
 import { SessionStore } from "@opencode/core/session/store"
 import { LayerNode } from "@opencode/util/effect/layer-node"
 import { Model } from "@opencode/schema/model"
+import { Provider } from "@opencode/schema/provider"
 import { asc, eq } from "drizzle-orm"
 import { Effect, Schema } from "effect"
 import { testEffect } from "./lib/effect"
@@ -193,7 +194,7 @@ test("canonical provider context round-trips tools, opaque checkpoints and binar
   ).toThrow()
 })
 
-test("compatibility uses the actual deployment and endpoint rather than a catalog alias or variant", () => {
+test("OpenAI compatibility spans models but still checks provider, route and endpoint", () => {
   expect(
     SessionProviderContext.compatible(
       providerContext.provenance,
@@ -203,8 +204,21 @@ test("compatibility uses the actual deployment and endpoint rather than a catalo
       }),
     ),
   ).toBe(true)
+  expect(
+    SessionProviderContext.compatible(providerContext.provenance, {
+      ...providerContext.provenance,
+      modelID: "other-model",
+    }),
+  ).toBe(true)
+  const otherProvider = { ...providerContext.provenance, provider: "anthropic", protocol: "anthropic-messages" }
+  expect(SessionProviderContext.compatible(otherProvider, { ...otherProvider, modelID: "other-model" })).toBe(false)
+  expect(
+    SessionProviderContext.compatible(providerContext.provenance, {
+      ...providerContext.provenance,
+      providerID: Provider.ID.make("other-provider"),
+    }),
+  ).toBe(false)
   for (const changed of [
-    { ...model, model: LanguageModel.update(model.model, { id: "other-deployment" }) },
     {
       ...model,
       model: LanguageModel.update(model.model, {
@@ -271,7 +285,7 @@ it.effect(
         ])
         for (const incompatible of [
           "local" as const,
-          { ...providerContext.provenance, modelID: "other" },
+          { ...providerContext.provenance, endpoint: "other" },
           { ...providerContext.provenance, provider: "other" },
         ]) {
           const expanded = yield* s.load(incompatible)
@@ -288,6 +302,7 @@ it.effect(
           ])
         }
         const preview = yield* SessionHistory.preview(s.db, sessionID, s.instructions, target)
+        expect(yield* s.load({ ...providerContext.provenance, modelID: "other-model" })).toEqual(native)
         expect(preview.initial).toBe("changed instructions")
         expect(preview.messages).toEqual(native.entries.map((entry) => entry.message))
         const store = yield* SessionStore.Service
@@ -335,7 +350,7 @@ it.effect("falls back to an earlier compatible native or local checkpoint", () =
     yield* s.prompt("after native")
     s.state.value = "new native baseline"
     yield* s.prepare
-    yield* s.compact({ ...providerContext, provenance: { ...providerContext.provenance, modelID: "other" } })
+    yield* s.compact({ ...providerContext, provenance: { ...providerContext.provenance, endpoint: "other" } })
     s.state.value = "post-epoch update"
     yield* s.prepare
     const native = yield* s.load(target)
@@ -364,5 +379,38 @@ it.effect("rejects malformed persisted native windows instead of silently droppi
     })
     const store = yield* SessionStore.Service
     expect(yield* store.context(sessionID).pipe(Effect.flip)).toMatchObject({ _tag: "Session.MessageDecodeError" })
+  }),
+)
+
+it.effect("binds a legacy checkpoint once to the selected OpenAI configuration and never to other providers", () =>
+  Effect.gen(function* () {
+    const s = yield* setup
+    yield* s.prepare
+    yield* s.prompt("original request")
+    yield* s.compact({
+      ...providerContext,
+      provenance: { ...providerContext.provenance, endpoint: SessionProviderContext.legacyEndpoint },
+    })
+    const latest = yield* s.load("latest")
+    expect(latest.entries[0].message).toMatchObject({
+      providerContext: { provenance: { endpoint: SessionProviderContext.legacyEndpoint } },
+    })
+    expect(
+      (yield* s.load({
+        ...providerContext.provenance,
+        provider: "anthropic",
+        protocol: "anthropic-messages",
+      })).entries.map((entry) => entry.message.type),
+    ).toEqual(["user"])
+    const selected = { ...providerContext.provenance, modelID: "new-selected-model", endpoint: "selected-deployment" }
+    const bound = yield* s.load(selected)
+    expect(bound.entries[0].message).toMatchObject({ providerContext: { provenance: selected } })
+    expect((yield* s.load({ ...selected, modelID: "another-openai-model" })).entries).toEqual(bound.entries)
+    expect(
+      (yield* s.load({ ...selected, endpoint: "later-different-deployment" })).entries.map(
+        (entry) => entry.message.type,
+      ),
+    ).toEqual(["user"])
+    expect((yield* s.load("latest")).entries[0].message).toMatchObject({ providerContext: { provenance: selected } })
   }),
 )

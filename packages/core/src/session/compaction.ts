@@ -347,7 +347,8 @@ export const layer = Layer.effect(
         if (LLMClient.canCompact(request, { mechanism: "trigger" })) {
           return Effect.gen(function* () {
             const history = yield* SessionHistory.load(db, context.session.id, "local").pipe(Effect.orDie)
-            const retained = recentUserMessages(history, context.model, keep)
+            const openai = request.model.provider === "openai" && request.model.route.protocol === "openai-responses"
+            const retained = recentUserMessages(history, context.model, openai ? 64_000 : keep, openai)
             const response = yield* llm.compact(request, { ...prepared.options, mechanism: "trigger" })
             return yield* toResult([...retained, Message.assistant(response.checkpoint)], response.usage)
           })
@@ -845,11 +846,12 @@ const serializeToolContent = (content: ReadonlyArray<SessionMessage.ToolStateCom
     })
     .join("\n")
 
-/** The newest whole, real user messages within `keep` tokens: no synthetic guidance, no half of an attachment. */
+/** Real user messages; OpenAI may retain boundary text within its fixed allowance. */
 export const recentUserMessages = (
   messages: ReadonlyArray<SessionMessage.Info>,
   model: Pick<SessionContext.Loaded["model"], "ref" | "capabilities">,
   keep: number,
+  truncateText = false,
 ) => {
   const users = messages
     .filter((message) => message.type === "user")
@@ -857,7 +859,19 @@ export const recentUserMessages = (
   const sendable = SessionModelRequest.boundImages(
     SessionModelRequest.unsupportedParts(toLLMMessages(users, model.ref), model.capabilities),
   )
-  return sendable.slice(oldestToDrop(sendable, estimateMessage, keep))
+  const start = oldestToDrop(sendable, estimateMessage, keep)
+  if (!truncateText || start === 0) return sendable.slice(start)
+  const remaining = keep - sendable.slice(start).reduce((sum, message) => sum + estimateMessage(message), 0)
+  if (remaining <= 0) return sendable.slice(start)
+  let chars = remaining * 4
+  const boundary = sendable[start - 1]
+  const content = boundary.content.flatMap<ContentPart>((part) => {
+    if (part.type !== "text") return [part]
+    const text = part.text.slice(0, chars)
+    chars -= text.length
+    return text ? [{ ...part, text }] : []
+  })
+  return content.length ? [Message.make({ ...boundary, content }), ...sendable.slice(start)] : sendable.slice(start)
 }
 
 export const estimateContext = (context: SessionContext.Loaded) => {

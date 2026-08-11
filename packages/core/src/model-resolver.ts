@@ -283,7 +283,10 @@ function prepareProviderSettings(
   )
 }
 
-function prepareProviderURL(model: RuntimeInfo, baseURL: string): Effect.Effect<string, UnresolvedProviderVariablesError> {
+function prepareProviderURL(
+  model: RuntimeInfo,
+  baseURL: string,
+): Effect.Effect<string, UnresolvedProviderVariablesError> {
   if (!baseURL.includes("${")) return Effect.succeed(baseURL)
   const prepared = baseURL.replace(/\$\{([^}]+)\}/g, (placeholder, name: string) => process.env[name] ?? placeholder)
   const failure = unresolvedProviderVariables(model, prepared)
@@ -388,7 +391,14 @@ export const layer = Layer.effect(
         capabilities: selected.capabilities,
         cost: selected.cost,
         limit: selected.limit,
-        compaction: runtimeInfo.settings?.compaction,
+        compaction:
+          runtimeInfo.settings?.compaction ??
+          (selected.providerID === Provider.ID.openai &&
+          runtime.provider === "openai" &&
+          runtime.route.protocol === "openai-responses" &&
+          (runtime.route.compact?.trigger || runtime.route.compact?.endpoint)
+            ? { type: "native" as const }
+            : undefined),
         transport: provider?.settings?.transport,
         chunkTimeout: provider?.settings?.chunkTimeout,
       }

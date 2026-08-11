@@ -442,4 +442,23 @@ test("retained user budget counts attachments and drops whole oldest messages", 
   expect(
     SessionCompaction.recentUserMessages([user("x".repeat(63_000 * 4)), { ...newest, text: "new" }], model, 64_000),
   ).toHaveLength(1)
+  const truncated = SessionCompaction.recentUserMessages([user("old"), user("x".repeat(65_000 * 4))], model, 64_000, true)
+  expect(truncated).toHaveLength(1)
+  expect(truncated[0].content).toEqual([Message.text("x".repeat(64_000 * 4))])
+  expect(
+    SessionCompaction.recentUserMessages([user("abcdefgh"), user("last")], model, 2, true).map((message) => message.content),
+  ).toEqual([[Message.text("abcd")], [Message.text("last")]])
 })
+
+it.live("OpenAI trigger retains 64k user text despite the ordinary summary budget", () =>
+  Effect.gen(function* () {
+    const fixture = yield* setup()
+    yield* fixture.compaction.transform((editor) => editor.configure({ keep: 1 }))
+    yield* fixture.prompt("oldest")
+    yield* fixture.prompt("x".repeat(65_000 * 4))
+    expect(yield* fixture.compact).toEqual({ status: "completed" })
+    const messages = SessionProviderContext.decode(yield* fixture.checkpoint)
+    expect(messages.map((message) => message.role)).toEqual(["user", "assistant"])
+    expect(messages[0].content).toEqual([Message.text("x".repeat(64_000 * 4))])
+  }),
+)

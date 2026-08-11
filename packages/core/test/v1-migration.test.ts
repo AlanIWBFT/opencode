@@ -5,6 +5,7 @@ import { Database } from "@opencode/core/database/database"
 import { DatabaseMigration } from "@opencode/core/database/migration"
 import { V1Migration } from "@opencode/core/database/v1-migration"
 import { SessionMessage } from "@opencode/core/session/message"
+import { SessionProviderContext } from "@opencode/core/session/provider-context"
 import { SessionSchema } from "@opencode/core/session/schema"
 import { SessionTable } from "@opencode/core/session/sql"
 import { Project } from "@opencode/core/project"
@@ -127,6 +128,98 @@ const transform = (messages: V1Migration.SourceMessage[], parts: V1Migration.Sou
 }
 
 describe("V1Migration.transformSession", () => {
+  test.each(
+    [1, 2].flatMap((version) =>
+      ["read", "bash", "grep"].flatMap((tool) => [false, true].map((after) => ({ version, tool, after }))),
+    ),
+  )(
+    "migrates native checkpoint v$version with $tool in its retained tail (also after checkpoint: $after)",
+    ({ version, tool, after }) => {
+      const call = (id: string, messageID: string, name: string) => part(id, messageID, {
+        type: "tool",
+        tool: name,
+        callID: `call_${id}`,
+        state: {
+          status: "completed",
+          input: name === "bash" ? { command: "echo tail" } : { filePath: "example.txt" },
+          title: name,
+          output: "tail tool result",
+          metadata: {},
+          time: { start: 30, end: 31 },
+        },
+      })
+      const result = transform(
+        [
+          user("msg_head", {}, 10),
+          assistant("msg_discarded", "msg_head", {}, 15),
+          user("msg_tail", {}, 20),
+          assistant("msg_tool", "msg_tail", { providerID: "openai", modelID: "gpt-old" }, 30),
+          user("msg_compact", {}, 40),
+          assistant("msg_summary", "msg_compact", { summary: true, finish: "stop" }, 50),
+          ...(after ? [assistant("msg_after", "msg_tail", {}, 60)] : []),
+        ],
+        [
+          part("prt_head", "msg_head", { type: "text", text: "original head" }),
+          call("prt_discarded", "msg_discarded", "todowrite"),
+          part("prt_tail", "msg_tail", { type: "text", text: "tail question" }),
+          call("prt_tool", "msg_tool", tool),
+          ...(after ? [call("prt_after", "msg_after", tool)] : []),
+          part("prt_compact", "msg_compact", { type: "compaction", auto: true, tail_start_id: "msg_tail" }),
+          part("prt_summary", "msg_summary", {
+            type: "text",
+            text: "[OpenAI native compaction checkpoint]",
+            metadata: {
+              openaiNativeCompactionLock: {
+                version: 1,
+                strategy: "openai-responses-compact",
+                model: { providerID: "openai", modelID: "gpt-old" },
+              },
+              openaiNativeCompactionWindow: {
+                version,
+                output: [
+                  ...(version === 2
+                    ? [{ role: "user", content: [{ type: "input_text", text: "retained head" }] }]
+                    : []),
+                  { type: "compaction", encrypted_content: "opaque-checkpoint", id: "cmp_saved" },
+                ],
+              },
+            },
+          }),
+        ],
+      )
+      const checkpoint = result.messages.find((message) => message.type === "compaction")!
+      expect(checkpoint.data).toMatchObject({ summary: "", recent: "" })
+      const context = Schema.decodeUnknownSync(SessionProviderContext.Info)(checkpoint.data.providerContext)
+      expect(context.provenance.endpoint).toBe(SessionProviderContext.legacyEndpoint)
+      const messages = SessionProviderContext.decode(context)
+      const content = JSON.stringify(messages)
+      expect(content).toContain("opaque-checkpoint")
+      expect(content).toContain("tail tool result")
+      expect(content.match(/tail question/g)).toHaveLength(1)
+      expect(content).not.toContain("[OpenAI native compaction checkpoint]")
+      expect(messages[0].role).toBe(version === 2 ? "user" : "assistant")
+      const notices = result.messages.filter((message) => message.type === "system")
+      expect(notices).toHaveLength(tool === "grep" ? 0 : 1)
+      if (tool === "read") {
+        expect(notices[0].data.text).toBe(
+          "The available tools have changed.\n\nThe `read` tool now takes `path` instead of `filePath`.",
+        )
+      }
+      if (tool === "bash") {
+        expect(notices[0].data.text).toBe([
+          "The available tools have changed.",
+          "The `bash` tool is now `exec_command` and must be called by that name.",
+          "The `exec_command` tool takes `cmd` instead of `command`. Use the returned `exec_id` with `poll_exec`, `write_stdin`, or `terminate_exec` to control a running command.",
+        ].join("\n\n"))
+      }
+      expect(content).not.toContain("todowrite")
+      expect(result.messages.map((message) => message.seq)).toEqual(
+        Array.from({ length: 5 + Number(after) + notices.length }, (_, seq) => seq),
+      )
+      expect(result.watermark).toBe(result.messages.length - 1)
+    },
+  )
+
   test.each([false, true])(
     "folds projected Script children into parent details without adding model calls (processRunning=%s)",
     (processRunning) => {
