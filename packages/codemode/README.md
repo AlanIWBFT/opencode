@@ -94,6 +94,10 @@ receive `{ extension, name, args }`. An `after` hook also receives how the call 
 `failure` with its error, or `interrupted`). A failing `before` hook denies the call, and the program catches the
 failure as a thrown error.
 
+The optional second argument to a tool's `execute(input, call)` is the same invocation object passed to its hooks.
+Hosts can use its identity to associate concurrent calls with their own progress and result records, including repeated
+calls with identical inputs. Session identity and persistence remain the host's responsibility.
+
 ### `Extension.make`
 
 Extensions are host functions a program calls directly as globals, such as `fetch`. Unlike tools they are not in the

@@ -77,7 +77,10 @@ import { OpenCodeTools } from "../tool/plugin/opencode.js"
 import { QuestionTool } from "../tool/plugin/question.js"
 import { ReadToolFileSystem } from "../tool/read-filesystem.js"
 import { ReadTool } from "../tool/plugin/read.js"
-import { ShellTool } from "../tool/plugin/shell.js"
+import { UnifiedExecTool } from "../tool/plugin/unified-exec.js"
+import { ExecSession } from "../tool/exec-session.js"
+import { SessionEnvironment } from "../session/environment.js"
+import { PluginHooks } from "./hooks.js"
 import { SkillTool } from "../tool/plugin/skill.js"
 import { SubagentTool } from "../tool/plugin/subagent.js"
 import { TodoTool } from "../tool/plugin/todo.js"
@@ -145,6 +148,9 @@ const services = [
   SessionCompaction.Service,
   SessionInstructions.Service,
   SubagentJob.Service,
+  SessionEnvironment.Service,
+  ExecSession.Service,
+  PluginHooks.Service,
   Shell.Service,
   ShellSelect.Service,
   Snapshot.Service,
@@ -199,6 +205,9 @@ export const requirements = LayerNode.group([
   SessionCompaction.node,
   SessionInstructions.node,
   SubagentJob.node,
+  SessionEnvironment.node,
+  ExecSession.node,
+  PluginHooks.node,
   Shell.node,
   ShellSelect.node,
   Snapshot.node,
@@ -241,7 +250,7 @@ const pre = [
   McpResourceTools.Plugin,
   QuestionTool.Plugin,
   ReadTool.Plugin,
-  ShellTool.Plugin,
+  UnifiedExecTool.Plugin,
   SkillTool.Plugin,
   SubagentTool.Plugin,
   TodoTool.Plugin,

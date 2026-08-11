@@ -1,5 +1,7 @@
 export * as SessionProjector from "./projector.js"
 
+import { detachExecMetadata } from "./exec-metadata.js"
+
 import { and, asc, desc, eq, gt, gte, inArray, isNull, lt, lte, or, sql } from "drizzle-orm"
 import { DateTime, Effect, Layer, Schema, Stream } from "effect"
 import path from "path"
@@ -211,6 +213,9 @@ const projectFork = Effect.fn("SessionProjector.projectFork")(function* (
 
     const values = yield* Effect.forEach(rows, (row) =>
       Effect.gen(function* () {
+        const { id, type, ...data } = row.type === "assistant"
+          ? encodeMessage(detachExecMetadata(SessionHistory.decodeMessageRowSync(row)))
+          : { ...row.data, id: row.id, type: row.type }
         const copy = {
           id: forkedID(row.seq),
           session_id: event.data.sessionID,
@@ -218,7 +223,7 @@ const projectFork = Effect.fn("SessionProjector.projectFork")(function* (
           seq: row.seq,
           time_created: row.time_created,
           time_updated: row.time_updated,
-          data: row.data,
+          data,
         }
         // A summary references the first message it kept, which the fork copied under a new ID.
         const keepID = row.type === "compaction" ? row.data.metadata?.keepID : undefined
@@ -633,6 +638,14 @@ const layer = Layer.effectDiscard(
         .run()
         .pipe(Effect.orDie),
     )
+    yield* bus.project(SessionEvent.ArchiveUpdated, (event) =>
+      db
+        .update(SessionTable)
+        .set({ time_archived: event.data.archivedAt, time_updated: event.created })
+        .where(eq(SessionTable.id, event.data.sessionID))
+        .run()
+        .pipe(Effect.orDie),
+    )
     yield* bus.project(SessionEvent.Viewed, (event) => {
       const idle = event.data.idle
       return db
@@ -771,6 +784,8 @@ const layer = Layer.effectDiscard(
     yield* bus.project(SessionEvent.Tool.Called, (event) => run(db, event))
     yield* bus.project(SessionEvent.Tool.Success, (event) => run(db, event))
     yield* bus.project(SessionEvent.Tool.Failed, (event) => run(db, event))
+    yield* bus.project(SessionEvent.Exec.Captured, (event) => run(db, event))
+    yield* bus.project(SessionEvent.Exec.ScriptCaptured, (event) => run(db, event))
     yield* bus.project(SessionEvent.Reasoning.Started, (event) => run(db, event))
     yield* bus.project(SessionEvent.Reasoning.Ended, (event) => run(db, event))
     yield* bus.project(SessionEvent.RetryScheduled, (event) => run(db, event))
