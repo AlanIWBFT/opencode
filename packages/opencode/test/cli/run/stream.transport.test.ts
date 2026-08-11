@@ -87,6 +87,7 @@ function retry(sessionID: string, attempt: number, message: string) {
 function assistant(id: string) {
   return {
     id: `evt-${id}`,
+    seq: 1,
     type: "message.updated",
     properties: {
       sessionID: "session-1",
@@ -190,6 +191,7 @@ function assistantMessage(input: { sessionID: string; id: string; parts: Session
   return {
     info: {
       id: input.id,
+      seq: 1,
       sessionID: input.sessionID,
       role: "assistant",
       time: {
@@ -230,6 +232,7 @@ function runningTool(input: {
 }): SessionToolPart {
   return {
     id: input.id,
+    seq: 1,
     sessionID: input.sessionID,
     messageID: input.messageID,
     type: "tool",
@@ -258,6 +261,7 @@ function completedTool(input: {
 }): SessionToolPart {
   return {
     id: input.id,
+    seq: 1,
     sessionID: input.sessionID,
     messageID: input.messageID,
     type: "tool",
@@ -280,6 +284,7 @@ function completedTool(input: {
 function textPart(id: string, messageID: string, text: string, sessionID = "session-1"): TextPart {
   return {
     id,
+    seq: 1,
     sessionID,
     messageID,
     type: "text",
@@ -290,6 +295,7 @@ function textPart(id: string, messageID: string, text: string, sessionID = "sess
 function textUpdated(part: TextPart): SdkEvent {
   return {
     id: `evt-${part.id}-updated`,
+    seq: 1,
     type: "message.part.updated",
     properties: {
       sessionID: part.sessionID,
@@ -302,6 +308,7 @@ function textUpdated(part: TextPart): SdkEvent {
 function reasoningPart(id: string, messageID: string, text: string): ReasoningPart {
   return {
     id,
+    seq: 1,
     sessionID: "session-1",
     messageID,
     type: "reasoning",
@@ -313,6 +320,7 @@ function reasoningPart(id: string, messageID: string, text: string): ReasoningPa
 function reasoningUpdated(part: ReasoningPart): SdkEvent {
   return {
     id: `evt-${part.id}-updated`,
+    seq: 1,
     type: "message.part.updated",
     properties: {
       sessionID: part.sessionID,
@@ -325,6 +333,7 @@ function reasoningUpdated(part: ReasoningPart): SdkEvent {
 function toolUpdated(part: SessionToolPart): SdkEvent {
   return {
     id: `evt-${part.id}-updated`,
+    seq: 1,
     type: "message.part.updated",
     properties: {
       sessionID: part.sessionID,
@@ -1582,6 +1591,7 @@ describe("run stream transport", () => {
       global.push(
         globalEvent({
           id: "evt-child-message",
+          seq: 1,
           type: "message.updated",
           properties: {
             sessionID: "child-1",
@@ -1703,6 +1713,7 @@ describe("run stream transport", () => {
       global.push(
         globalEvent({
           id: "evt-child-message",
+          seq: 1,
           type: "message.updated",
           properties: {
             sessionID: "child-1",

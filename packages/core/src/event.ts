@@ -11,12 +11,20 @@ import { makeGlobalNode } from "./effect/app-node"
 import { isDeepStrictEqual } from "node:util"
 import { Durable } from "@opencode-ai/schema/durable-event-manifest"
 
+// SQLite may scan the complete event table for larger parameterized IN lists despite the primary key.
+const eventIDLookupChunkSize = 100
+
 export const ID = Event.ID
 export type ID = import("@opencode-ai/schema/event").ID
 export type { Data, Definition, Payload } from "@opencode-ai/schema/event"
 
 export type Subscriber<D extends Definition = Definition> = (event: Payload<D>) => Effect.Effect<void>
+export type BatchSubscriber = (events: readonly Payload[]) => Effect.Effect<void>
 export type Unsubscribe = Effect.Effect<void>
+export type BatchProjector = {
+  readonly accepts: (events: readonly Payload[]) => boolean
+  readonly project: BatchSubscriber
+}
 
 export const latestSequence = Effect.fn("EventV2.latestSequence")(function* (
   db: Database.Interface["db"],
@@ -123,18 +131,41 @@ export interface PublishOptions {
   readonly commit?: (seq: number) => Effect.Effect<void>
 }
 
+export type PublishItem = {
+  readonly definition: Definition
+  readonly data: unknown
+  readonly options?: PublishOptions
+}
+
+export type PublishBatchOptions = {
+  readonly projector?: string
+}
+
+export function publishItem<D extends Definition>(definition: D, data: Data<D>, options?: PublishOptions): PublishItem {
+  return { definition, data, options }
+}
+
 export interface Interface {
   readonly publish: <D extends Definition>(
     definition: D,
     data: Data<D>,
     options?: PublishOptions,
   ) => Effect.Effect<Payload<D>>
+  readonly publishBatch: (
+    items: readonly PublishItem[],
+    options?: PublishBatchOptions,
+  ) => Effect.Effect<readonly Payload[]>
   readonly subscribe: <D extends Definition>(definition: D) => Stream.Stream<Payload<D>>
   readonly all: () => Stream.Stream<Payload>
   readonly durable: (input: { readonly aggregateID: string; readonly after?: number }) => Stream.Stream<Payload>
   /** @deprecated Use `all()` and consume the returned stream. */
   readonly listen: (listener: Subscriber) => Effect.Effect<Unsubscribe>
   readonly project: <D extends Definition>(definition: D, projector: Subscriber<D>) => Effect.Effect<void>
+  readonly projectBatch: (
+    id: string,
+    definitions: readonly Definition[],
+    projector: BatchProjector,
+  ) => Effect.Effect<void>
   readonly replay: (
     event: SerializedEvent,
     options?: { readonly publish?: boolean; readonly ownerID?: string; readonly strictOwner?: boolean },
@@ -177,9 +208,23 @@ export const layerWith = (options?: LayerOptions) =>
         typed: new Map<string, PubSub.PubSub<Payload>>(),
       }
       const projectors = new Map<string, Subscriber[]>()
+      const batchProjectors = new Array<{
+        readonly id: string
+        readonly projections: ReadonlyMap<string, Subscriber>
+        readonly projector: BatchProjector
+      }>()
       // TODO: Bind durable projectors to exact type+version before supporting incompatible historical payloads.
       const listeners = new Array<Subscriber>()
       const { db } = yield* Database.Service
+
+      type PreparedPublish = {
+        readonly definition: Definition
+        readonly version: number
+        readonly event: Payload
+        readonly encoded: Record<string, unknown>
+        readonly aggregateID: string
+        readonly commit?: PublishOptions["commit"]
+      }
 
       const getOrCreate = (definition: Definition) =>
         Effect.gen(function* () {
@@ -366,33 +411,147 @@ export const layerWith = (options?: LayerOptions) =>
         })
       }
 
-      function publishEvent<D extends Definition>(definition: D, event: Payload<D>, commit?: PublishOptions["commit"]) {
+      function publishLiveEvent<D extends Definition>(definition: D, event: Payload<D>, commit?: PublishOptions["commit"]) {
         return Effect.gen(function* () {
-          if (!definition?.durable && commit)
+          if (commit)
             return yield* Effect.die(
               new InvalidDurableEventError({
                 type: event.type,
                 message: "Local commit hooks require a durable event",
               }),
             )
-          if (definition?.durable) {
-            const committed = yield* commitDurableEvent(definition, event as Payload, undefined, commit)
-            if (committed) {
-              event = {
-                ...event,
-                durable: {
-                  aggregateID: committed.aggregateID,
-                  seq: committed.seq,
-                  version: definition.durable.version,
-                },
-              }
-              yield* notify(event as Payload, true)
-              return event
-            }
-          }
           yield* notify(event as Payload, false)
           return event
         })
+      }
+
+      function commitDurableBatch(items: readonly PreparedPublish[], batchProjectorID?: string) {
+        return Effect.uninterruptible(
+          Effect.gen(function* () {
+            const first = items[0]
+            if (!first)
+              return {
+                events: [],
+                transactionMs: 0,
+                projector: undefined,
+              }
+            const aggregateID = first.aggregateID
+            const transactionStarted = performance.now()
+            const committed = yield* db
+              .transaction(
+                () =>
+                  Effect.gen(function* () {
+                    const row = yield* db
+                      .select({ seq: EventSequenceTable.seq })
+                      .from(EventSequenceTable)
+                      .where(eq(EventSequenceTable.aggregate_id, aggregateID))
+                      .get()
+                      .pipe(Effect.orDie)
+                    const start = (row?.seq ?? -1) + 1
+                    const stored = (
+                      yield* Effect.forEach(
+                        Array.from({ length: Math.ceil(items.length / eventIDLookupChunkSize) }, (_, index) =>
+                          items
+                            .slice(index * eventIDLookupChunkSize, (index + 1) * eventIDLookupChunkSize)
+                            .map((item) => item.event.id),
+                        ),
+                        (ids) =>
+                          db
+                            .select({ id: EventTable.id, aggregateID: EventTable.aggregate_id, seq: EventTable.seq })
+                            .from(EventTable)
+                            .where(inArray(EventTable.id, ids))
+                            .all()
+                            .pipe(Effect.orDie),
+                      )
+                    ).flat()
+                    if (stored[0]) {
+                      yield* Effect.die(
+                        new InvalidDurableEventError({
+                          type: items.find((item) => item.event.id === stored[0]?.id)?.event.type ?? "unknown",
+                          message: `Event ${stored[0].id} already exists at aggregate ${stored[0].aggregateID} sequence ${stored[0].seq}`,
+                        }),
+                      )
+                    }
+                    const result = new Array<Payload>()
+                    const rows = new Array<typeof EventTable.$inferInsert>()
+                    for (const [index, item] of items.entries()) {
+                      const seq = start + index
+                      const event = {
+                        ...item.event,
+                        durable: {
+                          aggregateID,
+                          seq,
+                          version: item.version,
+                        },
+                      } as Payload
+                      rows.push({
+                        id: event.id,
+                        aggregate_id: aggregateID,
+                        seq,
+                        type: versionedType(item.definition.type, item.version),
+                        data: item.encoded,
+                      })
+                      result.push(event)
+                    }
+                    const batchProjector = items.some((item) => item.commit)
+                      ? undefined
+                      : batchProjectors.find(
+                          (candidate) =>
+                            candidate.id === batchProjectorID &&
+                            result.every((event) => candidate.projections.has(event.type)) &&
+                            candidate.projector.accepts(result) &&
+                            Array.from(candidate.projections).every(([type, projector]) => {
+                              const registered = projectors.get(type) ?? []
+                              return registered.length === 1 && registered[0] === projector
+                            }),
+                        )
+                    yield* Effect.gen(function* () {
+                      if (batchProjector) return yield* batchProjector.projector.project(result)
+                      for (const [index, event] of result.entries()) {
+                        for (const projector of projectors.get(event.type) ?? []) {
+                          yield* projector(event)
+                        }
+                        const commit = items[index]?.commit
+                        if (commit) yield* commit(event.durable?.seq ?? start + index)
+                      }
+                    })
+                    yield* db
+                      .insert(EventSequenceTable)
+                      .values([{ aggregate_id: aggregateID, seq: start + items.length - 1 }])
+                      .onConflictDoUpdate({
+                        target: EventSequenceTable.aggregate_id,
+                        set: { seq: start + items.length - 1 },
+                      })
+                      .run()
+                      .pipe(Effect.orDie)
+                    yield* Effect.forEach(
+                      Array.from({ length: Math.ceil(rows.length / 100) }, (_, index) =>
+                        rows.slice(index * 100, (index + 1) * 100),
+                      ),
+                      (chunk) => db.insert(EventTable).values(chunk).run().pipe(Effect.orDie),
+                      { discard: true },
+                    )
+                    return {
+                      events: result,
+                      projector: batchProjector?.id,
+                    }
+                  }),
+                { behavior: "immediate" },
+              )
+              .pipe(Effect.orDie)
+            const transactionCompleted = performance.now()
+            yield* Effect.forEach(
+              pubsub.durable.get(aggregateID) ?? [],
+              (wake) => PubSub.publish(wake, undefined),
+              { discard: true },
+            )
+            return {
+              events: committed.events,
+              transactionMs: transactionCompleted - transactionStarted,
+              projector: committed.projector,
+            }
+          }),
+        )
       }
 
       const observe = (event: Payload, observer: (event: Payload) => Effect.Effect<void>) =>
@@ -424,17 +583,127 @@ export const layerWith = (options?: LayerOptions) =>
             (serviceLocation
               ? { directory: serviceLocation.directory, workspaceID: serviceLocation.workspaceID }
               : undefined)
-          return yield* publishEvent(
-            definition,
+          const event = {
+            id: options?.id ?? ID.create(),
+            ...(options?.metadata ? { metadata: options.metadata } : {}),
+            type: definition.type,
+            ...(location ? { location } : {}),
+            data,
+          } as Payload<D>
+          if (!definition.durable) return yield* publishLiveEvent(definition, event, options?.commit)
+          return (yield* publishPreparedBatch([
             {
-              id: options?.id ?? ID.create(),
-              ...(options?.metadata ? { metadata: options.metadata } : {}),
-              type: definition.type,
-              ...(location ? { location } : {}),
-              data,
-            } as Payload<D>,
-            options?.commit,
+              definition,
+              version: definition.durable.version,
+              event,
+              encoded: Schema.encodeUnknownSync(definition.data)(data) as Record<string, unknown>,
+              aggregateID: requireAggregate(definition, event),
+              commit: options?.commit,
+            },
+          ]))[0] as Payload<D>
+        })
+      }
+
+      function requireAggregate(definition: Definition, event: Payload) {
+        const durable = definition.durable
+        if (!durable) {
+          throw new InvalidDurableEventError({
+            type: event.type,
+            message: "Batch publish requires durable events",
+          })
+        }
+        const aggregateID = (event.data as Record<string, unknown>)[durable.aggregate]
+        if (typeof aggregateID !== "string") {
+          throw new InvalidDurableEventError({
+            type: event.type,
+            message: `Expected string aggregate field ${durable.aggregate}`,
+          })
+        }
+        return aggregateID
+      }
+
+      function publishPreparedBatch(
+        items: readonly PreparedPublish[],
+        batchProjectorID?: string,
+        started?: number,
+      ) {
+        return Effect.gen(function* () {
+          if (items.length === 0) return []
+          const first = items[0]
+          if (!first) return []
+          const aggregateID = first.aggregateID
+          if (items.some((item) => item.aggregateID !== aggregateID)) {
+            return yield* Effect.die(
+              new InvalidDurableEventError({
+                type: first.event.type,
+                message: "Batch events must belong to the same aggregate",
+              }),
+            )
+          }
+          const ids = new Set<ID>()
+          for (const item of items) {
+            if (ids.has(item.event.id)) {
+              return yield* Effect.die(
+                new InvalidDurableEventError({
+                  type: item.event.type,
+                  message: `Duplicate event ID ${item.event.id} in batch`,
+                }),
+              )
+            }
+            ids.add(item.event.id)
+          }
+          return yield* Effect.uninterruptible(
+            Effect.gen(function* () {
+              const committed = yield* commitDurableBatch(items, batchProjectorID)
+              const notifyStarted = performance.now()
+              for (const event of committed.events) {
+                yield* notify(event, true)
+              }
+              const completed = performance.now()
+              if (started !== undefined) {
+                yield* Effect.logInfo("event batch published", {
+                  aggregateID,
+                  events: items.length,
+                  transactionMs: Math.round(committed.transactionMs),
+                  notifyMs: Math.round(completed - notifyStarted),
+                  totalMs: Math.round(completed - started),
+                  ...(committed.projector ? { projector: committed.projector } : {}),
+                })
+              }
+              return committed.events
+            }),
           )
+        })
+      }
+
+      function publishBatch(items: readonly PublishItem[], options?: PublishBatchOptions) {
+        return Effect.gen(function* () {
+          if (items.length === 0) return []
+          const started = performance.now()
+          const serviceLocation = Option.getOrUndefined(yield* Effect.serviceOption(Location.Service))
+          const prepared = items.map((item) => {
+            const location =
+              item.options?.location ??
+              (serviceLocation
+                ? { directory: serviceLocation.directory, workspaceID: serviceLocation.workspaceID }
+                : undefined)
+            const event = {
+              id: item.options?.id ?? ID.create(),
+              ...(item.options?.metadata ? { metadata: item.options.metadata } : {}),
+              type: item.definition.type,
+              ...(location ? { location } : {}),
+              data: item.data,
+            } as Payload
+            return {
+              definition: item.definition,
+              version: item.definition.durable?.version ?? 0,
+              event,
+              encoded: Schema.encodeUnknownSync(item.definition.data)(item.data) as Record<string, unknown>,
+              aggregateID: requireAggregate(item.definition, event),
+              commit: item.options?.commit,
+            }
+          })
+          return yield* publishPreparedBatch(prepared, options?.projector, started)
         })
       }
 
@@ -615,17 +884,38 @@ export const layerWith = (options?: LayerOptions) =>
       const project = <D extends Definition>(definition: D, projector: Subscriber<D>): Effect.Effect<void> =>
         Effect.sync(() => {
           const list = projectors.get(definition.type) ?? []
-          list.push((event) => projector(event as Payload<D>))
+          const registered = (event: Payload) => projector(event as Payload<D>)
+          list.push(registered)
           projectors.set(definition.type, list)
+        })
+
+      const projectBatch = (
+        id: string,
+        definitions: readonly Definition[],
+        projector: BatchProjector,
+      ): Effect.Effect<void> =>
+        Effect.sync(() => {
+          const entries = new Map<string, Subscriber>()
+          for (const definition of definitions) {
+            if (entries.has(definition.type)) throw new Error(`Duplicate batch projector type ${definition.type}`)
+            const registered = projectors.get(definition.type) ?? []
+            if (registered.length !== 1) throw new Error(`Batch projector ${id} requires one projector for ${definition.type}`)
+            entries.set(definition.type, registered[0]!)
+          }
+          if (entries.size === 0) throw new Error("Batch projector requires at least one projection")
+          if (batchProjectors.some((candidate) => candidate.id === id)) throw new Error(`Duplicate batch projector ${id}`)
+          batchProjectors.push({ id, projections: entries, projector })
         })
 
       return Service.of({
         publish,
+        publishBatch,
         subscribe,
         all: streamAll,
         durable,
         listen,
         project,
+        projectBatch,
         replay,
         replayAll,
         remove,

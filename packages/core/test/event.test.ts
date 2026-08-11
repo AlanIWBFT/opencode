@@ -419,6 +419,407 @@ describe("EventV2", () => {
     }),
   )
 
+  it.effect("publishes a durable batch atomically in input order", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const { db } = yield* Database.Service
+      const aggregateID = EventV2.ID.create()
+      const observed = new Array<{ text: string; rows: number }>()
+      const typed = yield* events.subscribe(SyncMessage).pipe(Stream.take(3), Stream.runCollect, Effect.forkScoped)
+      const all = yield* events.all().pipe(Stream.take(3), Stream.runCollect, Effect.forkScoped)
+      yield* Effect.yieldNow
+      yield* events.listen((event) =>
+        event.type !== SyncMessage.type
+          ? Effect.void
+          : db
+              .select({ id: EventTable.id })
+              .from(EventTable)
+              .where(eq(EventTable.aggregate_id, aggregateID))
+              .all()
+              .pipe(
+                Effect.orDie,
+                Effect.tap((rows) =>
+                  Effect.sync(() =>
+                    observed.push({ text: (event.data as typeof SyncMessage.data.Type).text, rows: rows.length }),
+                  ),
+                ),
+                Effect.asVoid,
+              ),
+      )
+
+      const committed = yield* events.publishBatch([
+        EventV2.publishItem(SyncMessage, { id: aggregateID, text: "one" }),
+        EventV2.publishItem(SyncMessage, { id: aggregateID, text: "two" }),
+        EventV2.publishItem(SyncMessage, { id: aggregateID, text: "three" }),
+      ])
+
+      expect(committed.map((event) => [event.durable?.seq, (event.data as typeof SyncMessage.data.Type).text])).toEqual([
+        [0, "one"],
+        [1, "two"],
+        [2, "three"],
+      ])
+      expect(observed).toEqual([
+        { text: "one", rows: 3 },
+        { text: "two", rows: 3 },
+        { text: "three", rows: 3 },
+      ])
+      expect(Array.from(yield* Fiber.join(typed)).map((event) => event.data.text)).toEqual(["one", "two", "three"])
+      expect(
+        Array.from(yield* Fiber.join(all)).map((event) => (event.data as typeof SyncMessage.data.Type).text),
+      ).toEqual(["one", "two", "three"])
+    }),
+  )
+
+  it.effect("uses an explicitly selected batch projector and otherwise preserves ordinary projectors", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const aggregateID = EventV2.ID.create()
+      const projected = new Array<string>()
+      yield* events.project(SyncMessage, (event) =>
+        Effect.sync(() => projected.push(`single:${event.data.text}`)),
+      )
+      yield* events.projectBatch("test.batch", [SyncMessage], {
+        accepts: () => true,
+        project: (batch) =>
+          Effect.sync(() => {
+            projected.push(...batch.map((event) => `batch:${(event.data as typeof SyncMessage.data.Type).text}`))
+          }),
+      })
+
+      yield* events.publishBatch(
+        [
+          EventV2.publishItem(SyncMessage, { id: aggregateID, text: "one" }),
+          EventV2.publishItem(SyncMessage, { id: aggregateID, text: "two" }),
+        ],
+        { projector: "test.batch" },
+      )
+      yield* events.publishBatch([
+        EventV2.publishItem(SyncMessage, { id: aggregateID, text: "three" }),
+        EventV2.publishItem(SyncMessage, { id: aggregateID, text: "four" }),
+      ])
+
+      expect(projected).toEqual(["batch:one", "batch:two", "single:three", "single:four"])
+    }),
+  )
+
+  it.effect("falls back from a selected batch projector when another projector is registered", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const aggregateID = EventV2.ID.create()
+      const projected = new Array<string>()
+      yield* events.project(SyncMessage, (event) =>
+        Effect.sync(() => projected.push(`original:${event.data.text}`)),
+      )
+      yield* events.projectBatch("test.batch", [SyncMessage], {
+        accepts: () => true,
+        project: () => Effect.sync(() => void projected.push("batch")),
+      })
+      yield* events.project(SyncMessage, (event) =>
+        Effect.sync(() => projected.push(`additional:${event.data.text}`)),
+      )
+
+      yield* events.publishBatch(
+        [EventV2.publishItem(SyncMessage, { id: aggregateID, text: "one" })],
+        { projector: "test.batch" },
+      )
+
+      expect(projected).toEqual(["original:one", "additional:one"])
+    }),
+  )
+
+  it.effect("finishes batch notifications after external interruption", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const { db } = yield* Database.Service
+      const aggregateID = EventV2.ID.create()
+      const entered = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      const notified = new Array<string>()
+      yield* events.project(SyncMessage, (event) =>
+        event.data.id === aggregateID && event.data.text === "one"
+          ? Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release)))
+          : Effect.void,
+      )
+      yield* events.listen((event) => {
+        if (event.type !== SyncMessage.type) return Effect.void
+        const data = event.data as typeof SyncMessage.data.Type
+        if (data.id === aggregateID) notified.push(data.text)
+        return Effect.void
+      })
+      const fiber = yield* events
+        .publishBatch([
+          EventV2.publishItem(SyncMessage, { id: aggregateID, text: "one" }),
+          EventV2.publishItem(SyncMessage, { id: aggregateID, text: "two" }),
+        ])
+        .pipe(Effect.forkChild({ startImmediately: true }))
+
+      yield* Deferred.await(entered)
+      fiber.interruptUnsafe()
+      yield* Deferred.succeed(release, undefined)
+      const exit = yield* Fiber.await(fiber)
+      const rows = yield* db
+        .select({ seq: EventTable.seq })
+        .from(EventTable)
+        .where(eq(EventTable.aggregate_id, aggregateID))
+        .orderBy(EventTable.seq)
+        .all()
+        .pipe(Effect.orDie)
+
+      expect(Exit.isFailure(exit) && Cause.hasInterrupts(exit.cause)).toBeTrue()
+      expect(rows.map((row) => row.seq)).toEqual([0, 1])
+      expect(notified).toEqual(["one", "two"])
+    }),
+  )
+
+  it.effect("preserves batch options and runs projectors before commit hooks", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const aggregateID = EventV2.ID.create()
+      const order = new Array<string>()
+      const id = EventV2.ID.create()
+      const explicit = Location.Ref.make({ directory: AbsolutePath.make("explicit") })
+      yield* events.project(SyncMessage, (event) =>
+        Effect.sync(() => order.push(`project:${event.data.text}`)),
+      )
+
+      const [event] = yield* events.publishBatch([
+        EventV2.publishItem(
+          SyncMessage,
+          { id: aggregateID, text: "one" },
+          {
+            id,
+            metadata: { source: "batch" },
+            location: explicit,
+            commit: (seq) => Effect.sync(() => order.push(`commit:${seq}`)),
+          },
+        ),
+      ])
+
+      expect(event).toMatchObject({ id, metadata: { source: "batch" }, location: explicit })
+      expect(order).toEqual(["project:one", "commit:0"])
+    }),
+  )
+
+  it.effect("rolls back a complete batch when a projector fails", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const { db } = yield* Database.Service
+      const aggregateID = EventV2.ID.create()
+      const notified = new Array<EventV2.Payload>()
+      yield* db.run("CREATE TABLE IF NOT EXISTS event_batch_probe (value text NOT NULL)")
+      yield* db.run("DELETE FROM event_batch_probe")
+      yield* events.project(SyncMessage, (event) =>
+        event.data.text === "fail"
+          ? Effect.die("projector failed")
+          : db
+              .run(`INSERT INTO event_batch_probe (value) VALUES ('${event.data.text}')`)
+              .pipe(Effect.orDie, Effect.asVoid),
+      )
+      yield* events.listen((event) => Effect.sync(() => notified.push(event)))
+
+      const exit = yield* events
+        .publishBatch([
+          EventV2.publishItem(SyncMessage, { id: aggregateID, text: "one" }),
+          EventV2.publishItem(SyncMessage, { id: aggregateID, text: "fail" }),
+        ])
+        .pipe(Effect.exit)
+
+      expect(String(exit)).toContain("projector failed")
+      expect(yield* db.all("SELECT value FROM event_batch_probe")).toEqual([])
+      expect(yield* db.select().from(EventTable).where(eq(EventTable.aggregate_id, aggregateID)).all()).toEqual([])
+      expect(
+        yield* db.select().from(EventSequenceTable).where(eq(EventSequenceTable.aggregate_id, aggregateID)).all(),
+      ).toEqual([])
+      expect(notified).toEqual([])
+    }),
+  )
+
+  it.effect("rolls back a complete batch when a commit hook fails", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const { db } = yield* Database.Service
+      const aggregateID = EventV2.ID.create()
+      const exit = yield* events
+        .publishBatch([
+          EventV2.publishItem(SyncMessage, { id: aggregateID, text: "one" }),
+          EventV2.publishItem(SyncMessage, { id: aggregateID, text: "two" }, { commit: () => Effect.die("failed") }),
+        ])
+        .pipe(Effect.exit)
+
+      expect(String(exit)).toContain("failed")
+      expect(yield* db.select().from(EventTable).where(eq(EventTable.aggregate_id, aggregateID)).all()).toEqual([])
+    }),
+  )
+
+  it.effect("rejects invalid batches before writes", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const { db } = yield* Database.Service
+      const one = EventV2.ID.create()
+      const two = EventV2.ID.create()
+      const duplicate = EventV2.ID.create()
+      const live = yield* events.publishBatch([EventV2.publishItem(Message, { text: "live" })]).pipe(Effect.exit)
+      const mixed = yield* events
+        .publishBatch([
+          EventV2.publishItem(SyncMessage, { id: one, text: "one" }),
+          EventV2.publishItem(SyncMessage, { id: two, text: "two" }),
+        ])
+        .pipe(Effect.exit)
+      const repeated = yield* events
+        .publishBatch([
+          EventV2.publishItem(SyncMessage, { id: one, text: "one" }, { id: duplicate }),
+          EventV2.publishItem(SyncMessage, { id: one, text: "two" }, { id: duplicate }),
+        ])
+        .pipe(Effect.exit)
+      const empty = yield* events.publishBatch([])
+
+      expect(String(live)).toContain("Batch publish requires durable events")
+      expect(String(mixed)).toContain("same aggregate")
+      expect(String(repeated)).toContain("Duplicate event ID")
+      expect(empty).toEqual([])
+      expect(yield* db.select().from(EventTable).all()).toEqual([])
+    }),
+  )
+
+  it.effect("serializes concurrent single and batch publishes", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const { db } = yield* Database.Service
+      const aggregateID = EventV2.ID.create()
+
+      yield* Effect.all(
+        [
+          events.publish(SyncMessage, { id: aggregateID, text: "single" }),
+          events.publishBatch([
+            EventV2.publishItem(SyncMessage, { id: aggregateID, text: "batch-one" }),
+            EventV2.publishItem(SyncMessage, { id: aggregateID, text: "batch-two" }),
+          ]),
+        ],
+        { concurrency: "unbounded" },
+      )
+      const rows = yield* db
+        .select({ seq: EventTable.seq })
+        .from(EventTable)
+        .where(eq(EventTable.aggregate_id, aggregateID))
+        .orderBy(EventTable.seq)
+        .all()
+        .pipe(Effect.orDie)
+
+      expect(rows.map((row) => row.seq)).toEqual([0, 1, 2])
+    }),
+  )
+
+  it.effect("advances the aggregate sequence once for a complete batch", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const { db } = yield* Database.Service
+      const aggregateID = EventV2.ID.create()
+      yield* db.run("CREATE TABLE event_sequence_write_probe (aggregate_id text NOT NULL)")
+      yield* db.run(`
+        CREATE TRIGGER event_sequence_insert_probe
+        AFTER INSERT ON event_sequence
+        BEGIN
+          INSERT INTO event_sequence_write_probe (aggregate_id) VALUES (NEW.aggregate_id);
+        END
+      `)
+      yield* db.run(`
+        CREATE TRIGGER event_sequence_update_probe
+        AFTER UPDATE OF seq ON event_sequence
+        BEGIN
+          INSERT INTO event_sequence_write_probe (aggregate_id) VALUES (NEW.aggregate_id);
+        END
+      `)
+
+      yield* events.publishBatch([
+        EventV2.publishItem(SyncMessage, { id: aggregateID, text: "one" }),
+        EventV2.publishItem(SyncMessage, { id: aggregateID, text: "two" }),
+        EventV2.publishItem(SyncMessage, { id: aggregateID, text: "three" }),
+      ])
+      const writes = yield* db.all<{ aggregate_id: string }>(
+        `SELECT aggregate_id FROM event_sequence_write_probe WHERE aggregate_id = '${aggregateID}'`,
+      )
+      const sequence = yield* db
+        .select({ seq: EventSequenceTable.seq })
+        .from(EventSequenceTable)
+        .where(eq(EventSequenceTable.aggregate_id, aggregateID))
+        .get()
+        .pipe(Effect.orDie)
+
+      expect(writes).toEqual([{ aggregate_id: aggregateID }])
+      expect(sequence).toEqual({ seq: 2 })
+    }),
+  )
+
+  it.effect("wakes a durable subscriber once for a complete batch", () =>
+    Effect.gen(function* () {
+      let reads = 0
+      const eventLayer = EventV2.layerWith({
+        beforeAggregateRead: () =>
+          Effect.sync(() => {
+            reads++
+          }),
+      }).pipe(Layer.provide(LayerNode.compile(Database.node)))
+
+      yield* Effect.gen(function* () {
+        const events = yield* EventV2.Service
+        const aggregateID = Session.ID.create()
+        const fiber = yield* events.durable({ aggregateID }).pipe(Stream.take(3), Stream.runCollect, Effect.forkScoped)
+        yield* Effect.yieldNow
+
+        yield* events.publishBatch([
+          EventV2.publishItem(DurableMessage, durableData(aggregateID, "one")),
+          EventV2.publishItem(DurableMessage, durableData(aggregateID, "two")),
+          EventV2.publishItem(DurableMessage, durableData(aggregateID, "three")),
+        ])
+
+        expect(Array.from(yield* Fiber.join(fiber)).map((event) => event.durable?.seq)).toEqual([0, 1, 2])
+        expect(reads).toBe(2)
+      }).pipe(Effect.provide(Layer.merge(LayerNode.compile(Database.node), eventLayer)))
+    }),
+  )
+
+  it.effect("publishes batches larger than one event ID lookup chunk", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const aggregateID = Session.ID.create()
+      const count = 501
+
+      const committed = yield* events.publishBatch(
+        Array.from({ length: count }, (_, index) =>
+          EventV2.publishItem(DurableMessage, durableData(aggregateID, `large_${index}`)),
+        ),
+      )
+
+      expect(committed).toHaveLength(count)
+      expect(committed[0]?.durable?.seq).toBe(0)
+      expect(committed.at(-1)?.durable?.seq).toBe(count - 1)
+    }),
+  )
+
+  it.effect("rejects an existing event ID in a later lookup chunk", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const { db } = yield* Database.Service
+      const existingAggregateID = Session.ID.create()
+      const aggregateID = Session.ID.create()
+      const existingID = EventV2.ID.create()
+      yield* events.publish(DurableMessage, durableData(existingAggregateID, "existing"), { id: existingID })
+
+      const exit = yield* events
+        .publishBatch(
+          Array.from({ length: 201 }, (_, index) =>
+            EventV2.publishItem(DurableMessage, durableData(aggregateID, `large_${index}`), {
+              ...(index === 150 ? { id: existingID } : {}),
+            }),
+          ),
+        )
+        .pipe(Effect.exit)
+
+      expect(String(exit)).toContain(`Event ${existingID} already exists`)
+      expect(yield* db.select().from(EventTable).where(eq(EventTable.aggregate_id, aggregateID)).all()).toEqual([])
+    }),
+  )
+
   it.effect("replays durable aggregate events after a sequence and tails new events", () =>
     Effect.gen(function* () {
       const events = yield* EventV2.Service

@@ -7,6 +7,7 @@ function userMessage(id: string, text: string): SessionMessages[number] {
   return {
     info: {
       id,
+      seq: 1,
       sessionID: "session-1",
       role: "user",
       time: {
@@ -21,6 +22,7 @@ function userMessage(id: string, text: string): SessionMessages[number] {
     parts: [
       {
         id: `${id}-text`,
+        seq: 1,
         sessionID: "session-1",
         messageID: id,
         type: "text",
@@ -41,6 +43,7 @@ function assistantInfo(
 ) {
   return {
     id,
+    seq: 1,
     sessionID: "session-1",
     role: "assistant" as const,
     time: input.time ?? { created: 2 },
@@ -89,6 +92,7 @@ function assistantMessage(
     parts: [
       {
         id: `${id}-text`,
+        seq: 1,
         sessionID: "session-1",
         messageID: id,
         type: "text",
@@ -165,6 +169,7 @@ function runningToolMessage(id: string): SessionMessages[number] {
     parts: [
       {
         id: `${id}-tool`,
+        seq: 1,
         sessionID: "session-1",
         messageID: id,
         type: "tool",
@@ -188,6 +193,7 @@ function shellUserMessage(id: string): SessionMessages[number] {
   return {
     info: {
       id,
+      seq: 1,
       sessionID: "session-1",
       role: "user",
       time: {
@@ -202,6 +208,7 @@ function shellUserMessage(id: string): SessionMessages[number] {
     parts: [
       {
         id: `${id}-text`,
+        seq: 1,
         sessionID: "session-1",
         messageID: id,
         type: "text",
@@ -224,6 +231,7 @@ function shellAssistantMessage(id: string, parentID: string): SessionMessages[nu
     parts: [
       {
         id: `${id}-tool`,
+        seq: 1,
         sessionID: "session-1",
         messageID: id,
         type: "tool",

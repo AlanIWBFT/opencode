@@ -13,6 +13,7 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { Database } from "@opencode-ai/core/database/database"
 import { MessageTable } from "@opencode-ai/core/session/sql"
+import { LocalMessageOrder } from "@opencode-ai/core/database/local-message-order"
 import { eq } from "drizzle-orm"
 
 const it = testEffect(LayerNode.compile(LayerNode.group([SessionNs.node, MessageV2.node, SessionProjector.node])))
@@ -139,6 +140,24 @@ describe("MessageV2.page", () => {
         const result = yield* MessageV2.page({ sessionID, limit: 10 })
         expect(result).toBeDefined()
         expect(result.items).toBeArray()
+      }),
+    ),
+  )
+
+  it.instance("fails instead of falling back when a message sidecar is missing", () =>
+    withSession(({ sessionID }) =>
+      Effect.gen(function* () {
+        const [id] = yield* fill(sessionID, 1)
+        const { db } = yield* Database.Service
+        yield* db
+          .delete(LocalMessageOrder.MessageOrderTable)
+          .where(eq(LocalMessageOrder.MessageOrderTable.message_id, id))
+          .run()
+          .pipe(Effect.orDie)
+
+        const exit = yield* MessageV2.page({ sessionID, limit: 10 }).pipe(Effect.exit)
+
+        expect(exit._tag).toBe("Failure")
       }),
     ),
   )
@@ -391,6 +410,31 @@ describe("MessageV2.parts", () => {
         expect(result).toHaveLength(1)
         expect(result[0].type).toBe("text")
         expect((result[0] as SessionV1.TextPart).text).toBe("m0")
+      }),
+    ),
+  )
+
+  it.instance("fails instead of falling back when a part sidecar is missing", () =>
+    withSession(({ sessionID }) =>
+      Effect.gen(function* () {
+        const [messageID] = yield* fill(sessionID, 1)
+        const { db } = yield* Database.Service
+        const part = yield* db
+          .select({ id: LocalMessageOrder.PartOrderTable.part_id })
+          .from(LocalMessageOrder.PartOrderTable)
+          .where(eq(LocalMessageOrder.PartOrderTable.message_id, messageID))
+          .get()
+          .pipe(Effect.orDie)
+        if (!part) return yield* Effect.die("Part sidecar missing before test")
+        yield* db
+          .delete(LocalMessageOrder.PartOrderTable)
+          .where(eq(LocalMessageOrder.PartOrderTable.part_id, part.id))
+          .run()
+          .pipe(Effect.orDie)
+
+        const exit = yield* MessageV2.parts(messageID).pipe(Effect.exit)
+
+        expect(exit._tag).toBe("Failure")
       }),
     ),
   )
@@ -993,7 +1037,7 @@ describe("MessageV2.filterCompacted", () => {
   test("works with array input", () => {
     // filterCompacted accepts any Iterable, not just generators
     const id = MessageID.ascending()
-    const items: SessionV1.WithParts[] = [
+    const items: MessageV2.StoredWithParts[] = [
       {
         info: {
           id,
@@ -1002,8 +1046,9 @@ describe("MessageV2.filterCompacted", () => {
           time: { created: 1 },
           agent: "test",
           model: { providerID: "test", modelID: "test" },
-        } as unknown as SessionV1.Info,
-        parts: [{ type: "text", text: "hello" }] as unknown as SessionV1.Part[],
+          seq: -1,
+        } as unknown as MessageV2.StoredInfo,
+        parts: [{ type: "text", text: "hello", seq: -1 }] as unknown as MessageV2.StoredPart[],
       },
     ]
     const result = MessageV2.filterCompacted(items)
@@ -1014,22 +1059,14 @@ describe("MessageV2.filterCompacted", () => {
 
 describe("MessageV2.cursor", () => {
   test("encode/decode roundtrip", () => {
-    const input = { id: MessageID.ascending(), time: 1234567890 }
+    const input = { seq: 1234567890 }
     const encoded = MessageV2.cursor.encode(input)
     const decoded = MessageV2.cursor.decode(encoded)
-    expect(decoded.id).toBe(input.id)
-    expect(decoded.time).toBe(input.time)
-  })
-
-  test("encode/decode with fractional time", () => {
-    const input = { id: MessageID.ascending(), time: 1234567890.5 }
-    const encoded = MessageV2.cursor.encode(input)
-    const decoded = MessageV2.cursor.decode(encoded)
-    expect(decoded.time).toBe(1234567890.5)
+    expect(decoded.seq).toBe(input.seq)
   })
 
   test("encoded cursor is base64url", () => {
-    const encoded = MessageV2.cursor.encode({ id: MessageID.ascending(), time: 0 })
+    const encoded = MessageV2.cursor.encode({ seq: 0 })
     expect(encoded).toMatch(/^[A-Za-z0-9_-]+$/)
   })
 })

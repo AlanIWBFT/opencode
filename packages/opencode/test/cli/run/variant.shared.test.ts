@@ -87,6 +87,7 @@ function userMessage(
   return {
     info: {
       id,
+      seq: 1,
       sessionID: "session-1",
       role: "user",
       time: {

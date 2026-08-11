@@ -24,6 +24,117 @@ describe("Runner", () => {
   )
 
   it.live(
+    "ensureRunning reports the claim before awaiting work",
+    Effect.gen(function* () {
+      const s = yield* Scope.Scope
+      const runner = Runner.make<string>(s)
+      const release = yield* Deferred.make<void>()
+      const claimed = yield* Deferred.make<void>()
+
+      const fiber = yield* runner
+        .ensureRunning(
+          Deferred.await(release).pipe(Effect.as("done")),
+          () => Deferred.doneUnsafe(claimed, Effect.void),
+        )
+        .pipe(Effect.forkChild)
+      yield* Deferred.await(claimed)
+      expect(runner.busy).toBe(true)
+      expect(runner.state._tag).toBe("Running")
+
+      yield* Deferred.succeed(release, undefined)
+      expect(yield* Fiber.join(fiber)).toBe("done")
+      expect(runner.busy).toBe(false)
+    }),
+  )
+
+  it.live(
+    "enqueueRunning starts a follow-up run instead of joining the active run",
+    Effect.gen(function* () {
+      const s = yield* Scope.Scope
+      const runner = Runner.make<string>(s)
+      const release = yield* Deferred.make<void>()
+      const first = yield* runner
+        .ensureRunning(Deferred.await(release).pipe(Effect.as("first")))
+        .pipe(Effect.forkChild)
+      yield* waitForState(runner, "Running")
+
+      const second = yield* runner.enqueueRunning(Effect.succeed("second")).pipe(Effect.forkChild)
+      yield* waitForState(runner, "RunningThenRun")
+      yield* Deferred.succeed(release, undefined)
+
+      expect(yield* Fiber.join(first)).toBe("first")
+      expect(yield* Fiber.join(second)).toBe("second")
+      expect(runner.busy).toBe(false)
+    }),
+  )
+
+  it.live(
+    "multiple enqueueRunning callers share the first queued follow-up",
+    Effect.gen(function* () {
+      const s = yield* Scope.Scope
+      const runner = Runner.make<string>(s)
+      const release = yield* Deferred.make<void>()
+      const firstClaimed = yield* Deferred.make<void>()
+      const secondClaimed = yield* Deferred.make<void>()
+      const calls = yield* Ref.make<string[]>([])
+      const active = yield* runner
+        .ensureRunning(Deferred.await(release).pipe(Effect.as("active")))
+        .pipe(Effect.forkChild)
+      yield* waitForState(runner, "Running")
+
+      const first = yield* runner
+        .enqueueRunning(
+          Ref.update(calls, (items) => [...items, "first"]).pipe(Effect.as("first")),
+          () => Deferred.doneUnsafe(firstClaimed, Effect.void),
+        )
+        .pipe(Effect.forkChild)
+      yield* Deferred.await(firstClaimed)
+      const second = yield* runner
+        .enqueueRunning(
+          Ref.update(calls, (items) => [...items, "second"]).pipe(Effect.as("second")),
+          () => Deferred.doneUnsafe(secondClaimed, Effect.void),
+        )
+        .pipe(Effect.forkChild)
+      yield* Deferred.await(secondClaimed)
+      yield* Deferred.succeed(release, undefined)
+
+      expect(yield* Fiber.join(active)).toBe("active")
+      expect(yield* Fiber.join(first)).toBe("first")
+      expect(yield* Fiber.join(second)).toBe("first")
+      expect(yield* Ref.get(calls)).toEqual(["first"])
+    }),
+  )
+
+  it.live(
+    "onIdle defects do not block a completed run result",
+    Effect.gen(function* () {
+      const s = yield* Scope.Scope
+      const runner = Runner.make<string>(s, { onIdle: Effect.die("idle failed") })
+
+      expect(yield* runner.ensureRunning(Effect.succeed("done")).pipe(Effect.timeout("250 millis"))).toBe("done")
+      expect(runner.state._tag).toBe("Idle")
+    }),
+  )
+
+  it.live(
+    "cancel interrupts the active run and its queued follow-up",
+    Effect.gen(function* () {
+      const s = yield* Scope.Scope
+      const runner = Runner.make<string>(s, { onInterrupt: Effect.succeed("interrupted") })
+      const first = yield* runner.ensureRunning(Effect.never.pipe(Effect.as("first"))).pipe(Effect.forkChild)
+      yield* waitForState(runner, "Running")
+      const second = yield* runner.enqueueRunning(Effect.succeed("second")).pipe(Effect.forkChild)
+      yield* waitForState(runner, "RunningThenRun")
+
+      yield* runner.cancel
+
+      expect(yield* Fiber.join(first)).toBe("interrupted")
+      expect(yield* Fiber.join(second)).toBe("interrupted")
+      expect(runner.busy).toBe(false)
+    }),
+  )
+
+  it.live(
     "ensureRunning propagates work failures",
     Effect.gen(function* () {
       const s = yield* Scope.Scope

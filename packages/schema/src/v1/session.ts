@@ -398,6 +398,23 @@ export type Part =
   | RetryPart
   | CompactionPart
 
+export const StoredPart = Schema.Union([
+  Schema.Struct({ ...TextPart.fields, seq: Schema.Int }).annotate({ identifier: "StoredTextPart" }),
+  Schema.Struct({ ...SubtaskPart.fields, seq: Schema.Int }).annotate({ identifier: "StoredSubtaskPart" }),
+  Schema.Struct({ ...ReasoningPart.fields, seq: Schema.Int }).annotate({ identifier: "StoredReasoningPart" }),
+  Schema.Struct({ ...FilePart.fields, seq: Schema.Int }).annotate({ identifier: "StoredFilePart" }),
+  Schema.Struct({ ...ToolPart.fields, seq: Schema.Int }).annotate({ identifier: "StoredToolPart" }),
+  Schema.Struct({ ...StepStartPart.fields, seq: Schema.Int }).annotate({ identifier: "StoredStepStartPart" }),
+  Schema.Struct({ ...StepFinishPart.fields, seq: Schema.Int }).annotate({ identifier: "StoredStepFinishPart" }),
+  Schema.Struct({ ...SnapshotPart.fields, seq: Schema.Int }).annotate({ identifier: "StoredSnapshotPart" }),
+  Schema.Struct({ ...PatchPart.fields, seq: Schema.Int }).annotate({ identifier: "StoredPatchPart" }),
+  Schema.Struct({ ...AgentPart.fields, seq: Schema.Int }).annotate({ identifier: "StoredAgentPart" }),
+  Schema.Struct({ ...RetryPart.fields, seq: Schema.Int }).annotate({ identifier: "StoredRetryPart" }),
+  Schema.Struct({ ...CompactionPart.fields, seq: Schema.Int }).annotate({ identifier: "StoredCompactionPart" }),
+]).annotate({ discriminator: "type", identifier: "StoredPart" })
+type Stored<T> = T extends unknown ? T & { seq: number } : never
+export type StoredPart = Stored<Part>
+
 const AssistantErrorSchema = Schema.Union([
   AuthError.EffectSchema,
   namedError("UnknownError", { message: Schema.String, ref: Schema.optional(Schema.String) }).EffectSchema,
@@ -506,6 +523,12 @@ export type Assistant = Omit<Types.DeepMutable<Schema.Schema.Type<typeof Assista
 export const Info = Schema.Union([User, Assistant]).annotate({ discriminator: "role", identifier: "Message" })
 export type Info = User | Assistant
 
+export const StoredInfo = Schema.Union([
+  Schema.Struct({ ...User.fields, seq: Schema.Int }).annotate({ identifier: "StoredUserMessage" }),
+  Schema.Struct({ ...Assistant.fields, seq: Schema.Int }).annotate({ identifier: "StoredAssistantMessage" }),
+]).annotate({ discriminator: "role", identifier: "StoredMessage" })
+export type StoredInfo = Stored<Info>
+
 export const WithParts = Schema.Struct({
   info: Info,
   parts: Schema.Array(Part),
@@ -514,6 +537,12 @@ export type WithParts = {
   info: Info
   parts: Part[]
 }
+
+export const StoredWithParts = Schema.Struct({
+  info: StoredInfo,
+  parts: Schema.Array(StoredPart),
+}).annotate({ identifier: "StoredMessageWithParts" })
+export type StoredWithParts = { info: StoredInfo; parts: StoredPart[] }
 
 const options = {
   durable: {

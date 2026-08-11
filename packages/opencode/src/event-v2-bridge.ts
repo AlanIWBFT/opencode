@@ -6,6 +6,7 @@ import { GlobalBus } from "@/bus/global"
 import { EventV2 } from "@opencode-ai/core/event"
 import { Location } from "@opencode-ai/core/location"
 import { Project } from "@opencode-ai/core/project"
+import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { AbsolutePath } from "@opencode-ai/core/schema"
 import { Context, Effect, Layer } from "effect"
 
@@ -32,6 +33,27 @@ const layer = Layer.effect(
         })
       })
 
+    const publishBatch: EventV2.Interface["publishBatch"] = (items, options) =>
+      Effect.gen(function* () {
+        if (items.every((item) => item.options?.location)) return yield* events.publishBatch(items, options)
+        const ctx = yield* InstanceRef
+        if (!ctx) return yield* events.publishBatch(items, options)
+        const workspaceID = yield* WorkspaceRef
+        const location = new Location.Info({
+          directory: AbsolutePath.make(ctx.directory),
+          ...(workspaceID ? { workspaceID } : {}),
+          project: { id: Project.ID.make(ctx.project.id), directory: AbsolutePath.make(ctx.worktree) },
+        })
+        return yield* events.publishBatch(
+          items.map((item) =>
+            item.options?.location
+              ? item
+              : EventV2.publishItem(item.definition, item.data, { ...item.options, location }),
+          ),
+          options,
+        )
+      })
+
     const unsubscribe = yield* events.listen((event) =>
       Effect.gen(function* () {
         const ctx = yield* InstanceRef
@@ -40,7 +62,14 @@ const layer = Layer.effect(
           directory: event.location?.directory ?? ctx?.directory,
           project: ctx?.project.id,
           workspace: workspaceID,
-          payload: { id: event.id, type: event.type, properties: event.data },
+          payload: {
+            id: event.id,
+            type: event.type,
+            properties: event.data,
+            ...(event.type === "message.updated" || event.type === "message.part.updated"
+              ? { seq: SessionProjector.projectedSequence(event) }
+              : {}),
+          },
         })
         if (event.durable === undefined) return
         GlobalBus.emit("event", {
@@ -62,7 +91,7 @@ const layer = Layer.effect(
     )
     yield* Effect.addFinalizer(() => unsubscribe)
 
-    return Service.of({ ...events, publish })
+    return Service.of({ ...events, publish, publishBatch })
   }),
 )
 

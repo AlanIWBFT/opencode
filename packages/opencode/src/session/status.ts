@@ -1,7 +1,7 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { InstanceState } from "@/effect/instance-state"
 import { SessionID } from "./schema"
-import { Effect, Layer, Context } from "effect"
+import { Cause, Effect, Layer, Context } from "effect"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { SessionStatusEvent } from "@opencode-ai/schema/session-status-event"
 
@@ -38,13 +38,21 @@ const layer = Layer.effect(
 
     const set = Effect.fn("SessionStatus.set")(function* (sessionID: SessionID, status: Info) {
       const data = yield* InstanceState.get(state)
-      yield* events.publish(Event.Status, { sessionID, status })
       if (status.type === "idle") {
-        yield* events.publish(Event.Idle, { sessionID })
         data.delete(sessionID)
-        return
+      } else {
+        data.set(sessionID, status)
       }
-      data.set(sessionID, status)
+      const publish = (event: Effect.Effect<unknown>) =>
+        event.pipe(
+          Effect.catchCauseIf(
+            (cause) => !Cause.hasInterrupts(cause),
+            (cause) => Effect.logError("session status notification failed", { sessionID, status, cause }),
+          ),
+          Effect.asVoid,
+        )
+      yield* publish(events.publish(Event.Status, { sessionID, status }))
+      if (status.type === "idle") yield* publish(events.publish(Event.Idle, { sessionID }))
     })
 
     return Service.of({ get, list, set })

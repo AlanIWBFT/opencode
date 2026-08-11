@@ -78,17 +78,21 @@ async function check() {
 
     await fs.mkdir(full)
     await drizzle(temporary, full, "schema")
-    if ((await Bun.file(schema).text()) !== (await formatTypescript(renderSchema(await generatedSql(full))))) {
+    if (normalize(await Bun.file(schema).text()) !== normalize(await formatTypescript(renderSchema(await generatedSql(full))))) {
       throw new Error("Current database schema is stale. Run `bun script/migration.ts` from packages/core.")
     }
 
     const migrations = await typescriptMigrations()
-    if ((await Bun.file(registry).text()) !== (await formatTypescript(renderRegistry(migrations)))) {
+    if (normalize(await Bun.file(registry).text()) !== normalize(await formatTypescript(renderRegistry(migrations)))) {
       throw new Error("Database migration registry is stale. Run `bun script/migration.ts` from packages/core.")
     }
   } finally {
     await fs.rm(temporary, { recursive: true, force: true })
   }
+}
+
+function normalize(input: string) {
+  return input.replaceAll("\r\n", "\n")
 }
 
 async function drizzle(temporary: string, output: string, name?: string) {
@@ -107,7 +111,7 @@ export default { ...config, out: ${JSON.stringify(output)} }
 
 async function generatedMigrations(directory: string) {
   return (await Array.fromAsync(new Bun.Glob("*/migration.sql").scan({ cwd: directory })))
-    .map((file) => file.split("/")[0])
+    .map((file) => file.split(/[\\/]/)[0])
     .filter((name): name is string => name !== undefined)
     .sort()
 }

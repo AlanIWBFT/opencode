@@ -37,6 +37,7 @@ const EventSchema = Schema.Union([
     .map((definition) =>
       Schema.Struct({
         id: EventV2.ID,
+        ...(["message.updated", "message.part.updated"].includes(definition.type) ? { seq: Schema.Int } : {}),
         type: Schema.Literal(definition.type),
         properties: definition.data,
       }).annotate({ identifier: `Event.${definition.type}` }),

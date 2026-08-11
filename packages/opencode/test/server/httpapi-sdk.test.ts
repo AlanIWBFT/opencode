@@ -670,6 +670,46 @@ describe("HttpApi SDK", () => {
     ),
   )
 
+  serverPathParity("rejects generated SDK part mutations while the session is busy", (serverPath) =>
+    withFakeLlm(serverPath, ({ sdk, llm, directory }) =>
+      Effect.gen(function* () {
+        const session = yield* capture(() => sdk.session.create({ title: "busy parts" }))
+        const sessionID = String(record(session.data).id)
+        const seeded = yield* seedMessage(directory, sessionID)
+        yield* llm.hang
+        yield* capture(() =>
+          sdk.session.promptAsync({
+            sessionID,
+            agent: "build",
+            model: { providerID: "test", modelID: "test-model" },
+            parts: [{ type: "text", text: "stay busy" }],
+          }),
+        )
+        yield* llm.wait(1)
+
+        const update = yield* capture(() =>
+          sdk.part.update({
+            sessionID,
+            messageID: seeded.message.id,
+            partID: seeded.part.id,
+            part: { ...seeded.part, text: "should not persist" } as NonNullable<
+              Parameters<Sdk["part"]["update"]>[0]["part"]
+            >,
+          }),
+        )
+        const remove = yield* capture(() =>
+          sdk.part.delete({ sessionID, messageID: seeded.message.id, partID: seeded.part.id }),
+        )
+        const persisted = yield* capture(() => sdk.session.message({ sessionID, messageID: seeded.message.id }))
+
+        expect(update.status).toBe(409)
+        expect(remove.status).toBe(409)
+        expect(firstPartText(persisted.data)).toBe("seeded message")
+        yield* capture(() => sdk.session.abort({ sessionID }))
+      }),
+    ),
+  )
+
   // Regression: EventV2 must publish on the same ProjectBus the /event handler
   // subscribes to, AND the /event stream must forward handler ALS/context into the
   // body-pump fiber. Drives the full SDK → /event → Session.updatePart → sync.run →

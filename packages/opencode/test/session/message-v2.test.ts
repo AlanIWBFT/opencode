@@ -1418,7 +1418,6 @@ describe("session.message-v2.toModelMessage", () => {
     expect(texts.map((t) => t.text)).toStrictEqual(["", "hello"])
   })
 })
-
 describe("session.message-v2.fromError", () => {
   test("preserves classified ContextOverflowError instances", () => {
     const input = new SessionV1.ContextOverflowError({ message: "prompt too long" }).toObject()
@@ -1707,7 +1706,6 @@ describe("session.message-v2.fromError", () => {
     expect(result.name).toBe("MessageAbortedError")
   })
 })
-
 describe("session.message-v2.latest", () => {
   const TAIL_USER = MessageID.make("msg_001")
   const OVERFLOW_ASSISTANT = MessageID.make("msg_002")
@@ -1717,13 +1715,14 @@ describe("session.message-v2.latest", () => {
   const NEW_COMPACTION_USER = MessageID.make("msg_006")
 
   const tailUser: SessionV1.WithParts = {
-    info: userInfo(TAIL_USER),
+    info: { ...userInfo(TAIL_USER), seq: 1 } as SessionV1.User,
     parts: [{ ...basePart(TAIL_USER, "p1"), type: "text", text: "original prompt" }] as SessionV1.Part[],
   }
 
   const overflowAssistant: SessionV1.WithParts = {
     info: {
       ...assistantInfo(OVERFLOW_ASSISTANT, TAIL_USER),
+      seq: 2,
       finish: "tool-calls",
       tokens: { input: 280_000, output: 200, reasoning: 0, cache: { read: 0, write: 0 }, total: 280_200 },
     } as SessionV1.Assistant,
@@ -1731,7 +1730,7 @@ describe("session.message-v2.latest", () => {
   }
 
   const compactionUser: SessionV1.WithParts = {
-    info: userInfo(COMPACTION_USER),
+    info: { ...userInfo(COMPACTION_USER), seq: 3 } as SessionV1.User,
     parts: [
       {
         ...basePart(COMPACTION_USER, "p1"),
@@ -1745,6 +1744,7 @@ describe("session.message-v2.latest", () => {
   const summaryAssistant: SessionV1.WithParts = {
     info: {
       ...assistantInfo(SUMMARY_ASSISTANT, COMPACTION_USER),
+      seq: 4,
       summary: true,
       finish: "stop",
       tokens: { input: 150_000, output: 1_500, reasoning: 0, cache: { read: 0, write: 0 }, total: 151_500 },
@@ -1753,7 +1753,7 @@ describe("session.message-v2.latest", () => {
   }
 
   const continueUser: SessionV1.WithParts = {
-    info: userInfo(CONTINUE_USER),
+    info: { ...userInfo(CONTINUE_USER), seq: 5 } as SessionV1.User,
     parts: [
       {
         ...basePart(CONTINUE_USER, "p1"),
@@ -1765,17 +1765,19 @@ describe("session.message-v2.latest", () => {
     ] as SessionV1.Part[],
   }
 
-  test("selects latest messages by creation time when IDs are nonmonotonic", () => {
-    const oldUser = { ...userInfo("msg_z_user"), time: { created: 100 } }
-    const newUser = { ...userInfo("msg_a_user"), time: { created: 200 } }
+  test("selects latest messages by durable sequence when IDs and timestamps are nonmonotonic", () => {
+    const oldUser = { ...userInfo("msg_z_user"), seq: 1, time: { created: 400 } }
+    const newUser = { ...userInfo("msg_a_user"), seq: 3, time: { created: 200 } }
     const oldAssistant = {
       ...assistantInfo("msg_z_assistant", oldUser.id),
+      seq: 2,
       time: { created: 300 },
       finish: "stop",
     } as SessionV1.Assistant
     const newAssistant = {
       ...assistantInfo("msg_a_assistant", newUser.id),
-      time: { created: 400 },
+      seq: 4,
+      time: { created: 100 },
       finish: "stop",
     } as SessionV1.Assistant
 
@@ -1791,16 +1793,16 @@ describe("session.message-v2.latest", () => {
     expect(state.finished?.id).toBe(newAssistant.id)
   })
 
-  test("uses ID as a deterministic tie-breaker for equal creation times", () => {
-    const lower = { ...userInfo("msg_a_user"), time: { created: 100 } }
-    const higher = { ...userInfo("msg_z_user"), time: { created: 100 } }
+  test("does not infer ordering from IDs when durable sequence differs", () => {
+    const lower = { ...userInfo("msg_a_user"), seq: 2, time: { created: 100 } }
+    const higher = { ...userInfo("msg_z_user"), seq: 1, time: { created: 100 } }
 
     const state = MessageV2.latest([
       { info: higher, parts: [] },
       { info: lower, parts: [] },
     ])
 
-    expect(state.user?.id).toBe(higher.id)
+    expect(state.user?.id).toBe(lower.id)
   })
 
   // Regression for double auto-compaction. The reorder in filterCompacted
@@ -1827,7 +1829,7 @@ describe("session.message-v2.latest", () => {
 
   test("a fresh compaction-user newer than the latest summary surfaces in tasks", () => {
     const newCompactionUser: SessionV1.WithParts = {
-      info: userInfo(NEW_COMPACTION_USER),
+      info: { ...userInfo(NEW_COMPACTION_USER), seq: 6 } as SessionV1.User,
       parts: [
         {
           ...basePart(NEW_COMPACTION_USER, "p1"),
@@ -1852,18 +1854,19 @@ describe("session.message-v2.latest", () => {
     expect(state.tasks[0]).toMatchObject({ type: "compaction", auto: true })
   })
 
-  test("selects compaction and subtask work after the finished boundary by creation time", () => {
+  test("selects compaction and subtask work after the finished boundary by durable sequence", () => {
     const finished = {
       ...assistantInfo("msg_z_finished", "msg_parent"),
+      seq: 2,
       time: { created: 200 },
       finish: "stop",
     } as SessionV1.Assistant
     const oldTask: SessionV1.WithParts = {
-      info: { ...userInfo("msg_z_old"), time: { created: 100 } },
+      info: { ...userInfo("msg_z_old"), seq: 1, time: { created: 300 } } as SessionV1.StoredInfo,
       parts: [{ ...basePart("msg_z_old", "old"), type: "compaction", auto: true }] as SessionV1.Part[],
     }
     const newTask: SessionV1.WithParts = {
-      info: { ...userInfo("msg_a_new"), time: { created: 300 } },
+      info: { ...userInfo("msg_a_new"), seq: 3, time: { created: 100 } } as SessionV1.StoredInfo,
       parts: [
         {
           ...basePart("msg_a_new", "new"),
@@ -1879,5 +1882,26 @@ describe("session.message-v2.latest", () => {
 
     expect(state.tasks).toHaveLength(1)
     expect(state.tasks[0]).toMatchObject({ type: "subtask", prompt: "inspect" })
+  })
+
+  test("latest uses durable sequence when IDs and timestamps sort in the opposite order", () => {
+    const earlyUser = { ...userInfo("msg_z_user"), seq: 1, time: { created: 300 } }
+    const earlyAssistant = {
+      ...assistantInfo("msg_y_assistant", earlyUser.id),
+      seq: 2,
+      time: { created: 200 },
+      finish: "stop",
+    }
+    const lateUser = { ...userInfo("msg_a_user"), seq: 3, time: { created: 100 } }
+
+    const state = MessageV2.latest([
+      { info: lateUser, parts: [] },
+      { info: earlyAssistant, parts: [] },
+      { info: earlyUser, parts: [] },
+    ])
+
+    expect(state.user?.id).toBe(lateUser.id)
+    expect(state.assistant?.id).toBe(earlyAssistant.id)
+    expect(state.finished?.id).toBe(earlyAssistant.id)
   })
 })

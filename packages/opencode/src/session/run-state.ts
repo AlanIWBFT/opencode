@@ -1,14 +1,16 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { KeyedMutex } from "@opencode-ai/core/effect/keyed-mutex"
 import { InstanceState } from "@/effect/instance-state"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Runner } from "@/effect/runner"
 import { BackgroundJob } from "@/background/job"
-import { Effect, Latch, Layer, Scope, Context } from "effect"
+import { Deferred, Effect, Fiber, Latch, Layer, Scope, Context } from "effect"
 import { Session } from "./session"
 import { SessionID } from "./schema"
 import { SessionStatus } from "./status"
 
 export interface Interface {
+  readonly withMutation: (sessionID: SessionID) => <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>
   readonly assertNotBusy: (sessionID: SessionID) => Effect.Effect<void, Session.BusyError>
   readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
   readonly interrupt: (sessionID: SessionID) => Effect.Effect<void>
@@ -17,6 +19,12 @@ export interface Interface {
     onInterrupt: Effect.Effect<SessionV1.WithParts>,
     work: Effect.Effect<SessionV1.WithParts>,
   ) => Effect.Effect<SessionV1.WithParts>
+  readonly admit: <A, E, R>(
+    sessionID: SessionID,
+    admission: Effect.Effect<Admission<A>, E, R>,
+    onInterrupt: Effect.Effect<SessionV1.WithParts>,
+    work: Effect.Effect<SessionV1.WithParts>,
+  ) => Effect.Effect<A, E, R>
   readonly startShell: (
     sessionID: SessionID,
     onInterrupt: Effect.Effect<SessionV1.WithParts>,
@@ -25,6 +33,10 @@ export interface Interface {
   ) => Effect.Effect<SessionV1.WithParts, Session.BusyError>
 }
 
+export type Admission<A> =
+  | { readonly _tag: "done"; readonly value: A }
+  | { readonly _tag: "run"; readonly complete: (result: SessionV1.WithParts) => A }
+
 export class Service extends Context.Service<Service, Interface>()("@opencode/SessionRunState") {}
 
 const layer = Layer.effect(
@@ -32,6 +44,7 @@ const layer = Layer.effect(
   Effect.gen(function* () {
     const background = yield* BackgroundJob.Service
     const status = yield* SessionStatus.Service
+    const mutations = yield* KeyedMutex.make<SessionID>()
 
     const state = yield* InstanceState.make(
       Effect.fn("SessionRunState.state")(function* () {
@@ -57,11 +70,15 @@ const layer = Layer.effect(
       const data = yield* InstanceState.get(state)
       const existing = data.runners.get(sessionID)
       if (existing) return existing
-      const next = Runner.make<SessionV1.WithParts>(data.scope, {
-        onIdle: Effect.gen(function* () {
-          data.runners.delete(sessionID)
-          yield* status.set(sessionID, { type: "idle" })
-        }),
+      let next!: Runner.Runner<SessionV1.WithParts>
+      next = Runner.make<SessionV1.WithParts>(data.scope, {
+        onIdle: mutations.withLock(sessionID)(
+          Effect.gen(function* () {
+            if (data.runners.get(sessionID) !== next || next.busy) return
+            data.runners.delete(sessionID)
+            yield* status.set(sessionID, { type: "idle" })
+          }),
+        ),
         onBusy: status.set(sessionID, { type: "busy" }),
         onInterrupt,
       })
@@ -90,13 +107,65 @@ const layer = Layer.effect(
       yield* interrupt(sessionID)
     })
 
+    const beginRunning = Effect.fn("SessionRunState.beginRunning")(function* (
+      sessionID: SessionID,
+      onInterrupt: Effect.Effect<SessionV1.WithParts>,
+      work: Effect.Effect<SessionV1.WithParts>,
+      enqueue: boolean,
+    ) {
+      return yield* Effect.uninterruptible(
+        Effect.gen(function* () {
+          const current = yield* runner(sessionID, onInterrupt)
+          const claimed = yield* Deferred.make<void>()
+          const signal = () => Deferred.doneUnsafe(claimed, Effect.void)
+          const running = enqueue ? current.enqueueRunning : current.ensureRunning
+          const fiber = yield* running(work, signal).pipe(
+            Effect.ensuring(Effect.sync(signal)),
+            Effect.forkChild,
+          )
+          yield* Deferred.await(claimed)
+          return Fiber.join(fiber)
+        }),
+      )
+    })
+
     const ensureRunning = Effect.fn("SessionRunState.ensureRunning")(function* (
       sessionID: SessionID,
       onInterrupt: Effect.Effect<SessionV1.WithParts>,
       work: Effect.Effect<SessionV1.WithParts>,
     ) {
-      return yield* (yield* runner(sessionID, onInterrupt)).ensureRunning(work)
+      return yield* Effect.uninterruptibleMask((restore) =>
+        Effect.gen(function* () {
+          const wait = yield* restore(mutations.withLock(sessionID)(beginRunning(sessionID, onInterrupt, work, false)))
+          return yield* restore(wait)
+        }),
+      )
     })
+
+    const admit = <A, E, R>(
+      sessionID: SessionID,
+      admission: Effect.Effect<Admission<A>, E, R>,
+      onInterrupt: Effect.Effect<SessionV1.WithParts>,
+      work: Effect.Effect<SessionV1.WithParts>,
+    ): Effect.Effect<A, E, R> =>
+      Effect.uninterruptibleMask((restore) =>
+        Effect.gen(function* () {
+          const admitted = yield* restore(
+            mutations.withLock(sessionID)(
+              Effect.uninterruptible(
+                Effect.gen(function* () {
+                  const result = yield* admission
+                  if (result._tag === "done") return result
+                  const wait = yield* beginRunning(sessionID, onInterrupt, work, true)
+                  return { ...result, wait } as const
+                }),
+              ),
+            ),
+          )
+          if (admitted._tag === "done") return admitted.value
+          return admitted.complete(yield* restore(admitted.wait))
+        }),
+      )
 
     const startShell = Effect.fn("SessionRunState.startShell")(function* (
       sessionID: SessionID,
@@ -104,12 +173,37 @@ const layer = Layer.effect(
       work: Effect.Effect<SessionV1.WithParts>,
       ready?: Latch.Latch,
     ) {
-      return yield* (yield* runner(sessionID, onInterrupt))
-        .startShell(work, ready)
-        .pipe(Effect.catchTag("RunnerBusy", () => Effect.fail(busyError(sessionID))))
+      const begin = Effect.uninterruptible(
+        Effect.gen(function* () {
+          const current = yield* runner(sessionID, onInterrupt)
+          const claimed = yield* Deferred.make<boolean>()
+          const signal = (started: boolean) => Deferred.doneUnsafe(claimed, Effect.succeed(started))
+          const fiber = yield* current
+            .startShell(work, ready, signal)
+            .pipe(Effect.ensuring(Effect.sync(() => signal(false))))
+            .pipe(Effect.forkChild)
+          const started = yield* Deferred.await(claimed)
+          if (started && ready) yield* ready.await
+          return Fiber.join(fiber)
+        }),
+      )
+      return yield* Effect.uninterruptibleMask((restore) =>
+        Effect.gen(function* () {
+          const wait = yield* restore(mutations.withLock(sessionID)(begin))
+          return yield* restore(wait)
+        }),
+      ).pipe(Effect.catchTag("RunnerBusy", () => Effect.fail(busyError(sessionID))))
     })
 
-    return Service.of({ assertNotBusy, cancel, interrupt, ensureRunning, startShell })
+    return Service.of({
+      withMutation: mutations.withLock,
+      assertNotBusy,
+      cancel,
+      interrupt,
+      ensureRunning,
+      admit,
+      startShell,
+    })
   }),
 )
 

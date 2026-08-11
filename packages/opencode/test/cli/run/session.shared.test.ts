@@ -22,6 +22,7 @@ function userMessage(id: string, parts: Message["parts"], variant = "high"): Mes
   return {
     info: {
       id,
+      seq: 1,
       sessionID: "session-1",
       role: "user",
       time: {
@@ -41,6 +42,7 @@ function assistantMessage(id: string, parts: Message["parts"]): Message {
   return {
     info: {
       id,
+      seq: 1,
       sessionID: "session-1",
       role: "assistant",
       time: {
@@ -73,6 +75,7 @@ function assistantMessage(id: string, parts: Message["parts"]): Message {
 function textPart(id: string, messageID: string, text: string, input: Partial<TextPart> = {}): TextPart {
   return {
     id,
+    seq: 1,
     sessionID: "session-1",
     messageID,
     type: "text",
@@ -84,6 +87,7 @@ function textPart(id: string, messageID: string, text: string, input: Partial<Te
 function agentPart(id: string, messageID: string, name: string, source?: AgentPart["source"]): AgentPart {
   return {
     id,
+    seq: 1,
     sessionID: "session-1",
     messageID,
     type: "agent",
@@ -95,6 +99,7 @@ function agentPart(id: string, messageID: string, name: string, source?: AgentPa
 function filePart(id: string, messageID: string, url: string, input: Partial<FilePart> = {}): FilePart {
   return {
     id,
+    seq: 1,
     sessionID: "session-1",
     messageID,
     type: "file",
