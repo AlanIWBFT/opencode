@@ -21,6 +21,7 @@ import { SessionMessage } from "./message.js"
 import { SessionProjector } from "./projector.js"
 import { SessionRunner } from "./runner/index.js"
 import { SessionStore } from "./store.js"
+import { ExecSessionControl } from "../tool/exec-session/control.js"
 
 export class DestinationNotFoundError extends Schema.TaggedError<DestinationNotFoundError>()(
   "Session.DestinationNotFoundError",
@@ -64,6 +65,7 @@ const layer = Layer.effect(
     const admission = yield* SessionInbox.Service
     const database = yield* Database.Service
     const bus = yield* Bus.Service
+    const execControl = yield* ExecSessionControl.Service
 
     const get = Effect.fn("SessionMove.get")(function* (sessionID: Session.ID) {
       const session = yield* store.get(sessionID)
@@ -137,6 +139,7 @@ const layer = Layer.effect(
               latest.location.workspaceID === session.location.workspaceID &&
               !(yield* execution.isActive(input.sessionID))
             ) {
+              yield* ExecSessionControl.beforeMove(execControl, input.sessionID)
               const cancellations = (yield* SessionInbox.moveIDs(database.db, input.sessionID)).map(
                 (item) => [SessionEvent.InboxCancelled, { sessionID: input.sessionID, inboxID: item.id }] as const,
               )
@@ -175,5 +178,6 @@ export const node = makeGlobalNode({
     Database.node,
     Bus.node,
     SessionProjector.node,
+    ExecSessionControl.node,
   ],
 })

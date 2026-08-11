@@ -96,6 +96,10 @@ denies it: the host function is never called, and the program catches the failur
 fails the way the call itself would: a tool call or asynchronous global rejects its promise, and a synchronous global
 throws.
 
+The optional second argument to a tool's `execute(input, call)` is the same invocation object passed to its hooks.
+Hosts can use its identity to associate concurrent calls with their own progress and result records, including repeated
+calls with identical inputs. Session identity and persistence remain the host's responsibility.
+
 ### `Extension.make`
 
 Extensions are host functions a program calls directly as globals, such as `fetch`. Unlike tools they are not in the

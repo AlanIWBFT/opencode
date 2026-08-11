@@ -3,8 +3,8 @@ import { AppNodeBuilder } from "@opencode/core/effect/app-node-builder"
 import { Location } from "@opencode/core/location"
 import { AbsolutePath } from "@opencode/core/schema"
 import { Tool } from "@opencode/core/tool"
-import { Effect, Schema } from "effect"
 import type { Info } from "@opencode/schema/tool"
+import { Effect, Schema } from "effect"
 import { it } from "./lib/effect"
 
 const toolNode = AppNodeBuilder.build(Tool.node, [
@@ -46,7 +46,10 @@ describe("CodeMode", () => {
           },
         ],
       })
-    }).pipe(Effect.scoped, Effect.provide(toolNode)),
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(toolNode),
+    ),
   )
 
   it.effect("renders Effect numbers in built-in tool signatures as number", () =>
@@ -90,6 +93,29 @@ describe("CodeMode", () => {
       const direct = JSON.stringify(snapshot.definitions.find((tool) => tool.name === "direct"))
       expect(direct).toContain('{"anyOf":[{"type":"number"},{"type":"string","enum":["Infinity","-Infinity","NaN"]}]}')
       expect(direct).not.toContain("$ref")
-    }).pipe(Effect.scoped, Effect.provide(toolNode)),
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(toolNode),
+    ),
+  )
+
+  it.effect("keeps explicitly direct tools available when execute is denied", () =>
+    Effect.gen(function* () {
+      const tools = yield* Tool.Service
+      yield* tools.transform((editor) => editor.add({
+        name: "echo",
+        description: "Echo",
+        input: Schema.Struct({}),
+        output: Schema.String,
+        options: { codemode: false },
+        execute: () => Effect.succeed({ output: "ok" }),
+      }))
+      const snapshot = yield* tools.snapshot([{ action: "execute", resource: "*", effect: "deny" }])
+      expect(snapshot.definitions.map((tool) => tool.name)).toEqual(["echo"])
+      expect(snapshot.codeModeCatalog).toBeUndefined()
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(AppNodeBuilder.build(Tool.node, [Location.node.replace(Location.boundNode({ directory: AbsolutePath.make("/project") }))])),
+    ),
   )
 })
