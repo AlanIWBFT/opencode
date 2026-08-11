@@ -188,7 +188,7 @@ it.live(
         expect(remainingContextEntries).toEqual([{ key: "deploy-target", value: "production" }])
         expect(context.some((message) => message.type === "model-switched")).toBe(true)
         expect(event).toMatchObject({ type: "session.model.selected", durable: { seq: 1 } })
-        expect(message).toEqual(modelMessage)
+        expect(message).toEqual({ ...modelMessage, seq: expect.any(Number) })
         expect(missing.map((error) => error._tag)).toEqual([
           "SessionNotFoundError",
           "SessionNotFoundError",

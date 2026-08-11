@@ -136,11 +136,11 @@ export interface Interface {
   readonly remove: (sessionID: SessionSchema.ID) => Effect.Effect<void, NotFoundError>
   readonly messages: (
     input: SessionStore.MessagesInput,
-  ) => Effect.Effect<SessionMessage.Info[], NotFoundError | MessageDecodeError>
+  ) => Effect.Effect<SessionMessage.StoredInfo[], NotFoundError | MessageDecodeError>
   readonly message: (input: {
     sessionID: SessionSchema.ID
     messageID: SessionMessage.ID
-  }) => Effect.Effect<SessionMessage.Info | undefined>
+  }) => Effect.Effect<SessionMessage.StoredInfo | undefined>
   readonly context: (
     sessionID: SessionSchema.ID,
   ) => Effect.Effect<SessionMessage.Info[], NotFoundError | MessageDecodeError>

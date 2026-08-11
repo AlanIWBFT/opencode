@@ -1,6 +1,7 @@
 import { Session } from "@opencode/schema/session"
 import { SessionMessage } from "@opencode/schema/session-message"
 import { Location } from "@opencode/schema/location"
+import { NonNegativeInt } from "@opencode/schema/schema"
 import { Schema, Struct } from "effect"
 import { HttpApiEndpoint, HttpApiGroup, OpenApi } from "effect/unstable/httpapi"
 import { InvalidCursorError, SessionNotFoundError, UnknownError } from "../errors.js"
@@ -63,13 +64,36 @@ export const PublicSessionMessage = Schema.Union([
   SessionMessage.Idle,
 ]).annotate({ identifier: "Session.Message.Info" })
 
+const stored = Schema.fieldsAssign({
+  seq: NonNegativeInt.annotate({
+    description:
+      "Authoritative message creation order within its session. Stable across updates; not an event-update sequence or part order.",
+  }),
+})
+
+export const PublicStoredSessionMessage = Schema.Union([
+  stored(SessionMessage.AgentSelected),
+  stored(SessionMessage.ModelSelected),
+  stored(PublicLocationSwitched),
+  stored(SessionMessage.User),
+  stored(SessionMessage.Synthetic),
+  stored(SessionMessage.System),
+  stored(SessionMessage.Skill),
+  stored(SessionMessage.Shell),
+  stored(SessionMessage.Assistant),
+  stored(SessionMessage.CompactionRunning),
+  stored(SessionMessage.CompactionCompleted),
+  stored(SessionMessage.CompactionFailed),
+  stored(SessionMessage.Idle),
+]).annotate({ identifier: "Session.Message.StoredInfo" })
+
 export const MessageGroup = HttpApiGroup.make("server.message")
   .add(
     HttpApiEndpoint.get("session.messages", "/api/session/:sessionID/message", {
       params: { sessionID: Session.ID },
       query: SessionMessagesQuery,
       success: Schema.Struct({
-        data: Schema.Array(PublicSessionMessage),
+        data: Schema.Array(PublicStoredSessionMessage),
         cursor: Schema.Struct({
           previous: Schema.String.pipe(Schema.optional),
           next: Schema.String.pipe(Schema.optional),

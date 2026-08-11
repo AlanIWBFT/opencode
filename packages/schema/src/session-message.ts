@@ -318,3 +318,6 @@ export type Info =
   | Compaction
   | Idle
 export type Type = Info["type"]
+
+/** Read-model order from session_message.seq; never an update-event sequence or part index. */
+export type StoredInfo = Info & { readonly seq: number }

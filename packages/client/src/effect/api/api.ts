@@ -12,17 +12,19 @@ import type { Model } from "@opencode/schema/model"
 import type { DateTime } from "effect"
 import type { Permission } from "@opencode/schema/permission"
 import type { SessionMessage } from "@opencode/schema/session-message"
+import type { FileAttachment } from "@opencode/schema/prompt"
+import type { AgentAttachment } from "@opencode/schema/prompt"
+import type { PromptMention } from "@opencode/schema/prompt"
+import type { Provider } from "@opencode/schema/provider"
+import type { Shell } from "@opencode/schema/shell"
+import type { Skill } from "@opencode/schema/skill"
+import type { Schema } from "effect"
 import type { SessionInbox } from "@opencode/schema/session-inbox"
 import type { PromptInput } from "@opencode/schema/prompt-input"
-import type { AgentAttachment } from "@opencode/schema/prompt"
-import type { Skill } from "@opencode/schema/skill"
 import type { FileDiff } from "@opencode/schema/file-diff"
 import type { InstructionEntry } from "@opencode/schema/instruction-entry"
-import type { Schema } from "effect"
 import type { Event } from "@opencode/schema/event"
 import type { EventLog } from "@opencode/schema/event-log"
-import type { Shell } from "@opencode/schema/shell"
-import type { Provider } from "@opencode/schema/provider"
 import type { Form } from "@opencode/schema/form"
 import type { Integration } from "@opencode/schema/integration"
 import type { Mcp } from "@opencode/schema/mcp"
@@ -219,7 +221,283 @@ export type SessionImportOutput = Session.Info
 export type SessionImportOperation<E = never> = (input: SessionImportInput) => Effect.Effect<SessionImportOutput, E>
 
 export type SessionExportInput = { readonly sessionID: Session.ID; readonly sanitize?: boolean | undefined }
-export type SessionExportOutput = { readonly info: Session.Info; readonly messages: ReadonlyArray<SessionMessage.Info> }
+export type SessionExportOutput = {
+  readonly info: Session.Info
+  readonly messages: ReadonlyArray<
+    | {
+        readonly id: SessionMessage.ID
+        readonly metadata?: { readonly [x: string]: unknown } | undefined
+        readonly time: { readonly created: DateTime.Utc }
+        readonly type: "agent-switched"
+        readonly agent: Agent.ID
+        readonly previous?: Agent.ID | undefined
+        readonly seq: number
+      }
+    | {
+        readonly id: SessionMessage.ID
+        readonly metadata?: { readonly [x: string]: unknown } | undefined
+        readonly time: { readonly created: DateTime.Utc }
+        readonly type: "model-switched"
+        readonly model: Model.Ref
+        readonly previous?: Model.Ref | undefined
+        readonly seq: number
+      }
+    | {
+        readonly id: SessionMessage.ID
+        readonly metadata?: { readonly [x: string]: unknown } | undefined
+        readonly time: { readonly created: DateTime.Utc }
+        readonly type: "location-switched"
+        readonly projectID?: Project.ID | undefined
+        readonly subpath?: RelativePath | undefined
+        readonly location: Location.PublicRef
+        readonly previous?:
+          | {
+              readonly location: Location.PublicRef
+              readonly projectID?: Project.ID | undefined
+              readonly subpath?: RelativePath | undefined
+            }
+          | undefined
+        readonly seq: number
+      }
+    | {
+        readonly id: SessionMessage.ID
+        readonly metadata?: { readonly [x: string]: unknown } | undefined
+        readonly time: { readonly created: DateTime.Utc }
+        readonly text: string
+        readonly files?: ReadonlyArray<FileAttachment> | undefined
+        readonly agents?: ReadonlyArray<AgentAttachment> | undefined
+        readonly skills?:
+          | ReadonlyArray<{
+              readonly id: Skill.ID
+              readonly name: Skill.Name
+              readonly text?: string | undefined
+              readonly mention?: PromptMention | undefined
+            }>
+          | undefined
+        readonly type: "user"
+        readonly seq: number
+      }
+    | {
+        readonly id: SessionMessage.ID
+        readonly metadata?: { readonly [x: string]: unknown } | undefined
+        readonly time: { readonly created: DateTime.Utc }
+        readonly text: string
+        readonly description?: string | undefined
+        readonly type: "synthetic"
+        readonly seq: number
+      }
+    | {
+        readonly id: SessionMessage.ID
+        readonly metadata?: { readonly [x: string]: unknown } | undefined
+        readonly time: { readonly created: DateTime.Utc }
+        readonly type: "system"
+        readonly text: string
+        readonly description?: string | undefined
+        readonly seq: number
+      }
+    | {
+        readonly id: SessionMessage.ID
+        readonly metadata?: { readonly [x: string]: unknown } | undefined
+        readonly time: { readonly created: DateTime.Utc }
+        readonly type: "skill"
+        readonly skill: Skill.ID
+        readonly name: Skill.Name
+        readonly text: string
+        readonly seq: number
+      }
+    | {
+        readonly id: SessionMessage.ID
+        readonly metadata?: { readonly [x: string]: unknown } | undefined
+        readonly time: { readonly created: DateTime.Utc; readonly completed?: DateTime.Utc | undefined }
+        readonly type: "shell"
+        readonly shellID: Shell.ID
+        readonly command: string
+        readonly status: "running" | "exited" | "timeout" | "killed"
+        readonly exit?: number | undefined
+        readonly output?:
+          | { readonly output: string; readonly cursor: number; readonly size: number; readonly truncated: boolean }
+          | undefined
+        readonly seq: number
+      }
+    | {
+        readonly id: SessionMessage.ID
+        readonly metadata?: { readonly [x: string]: unknown } | undefined
+        readonly time: {
+          readonly created: DateTime.Utc
+          readonly streamed?: DateTime.Utc | undefined
+          readonly completed?: DateTime.Utc | undefined
+        }
+        readonly type: "assistant"
+        readonly agent: Agent.ID
+        readonly model: Model.Ref
+        readonly content: ReadonlyArray<
+          SessionMessage.AssistantText | SessionMessage.AssistantReasoning | SessionMessage.AssistantTool
+        >
+        readonly snapshot?:
+          | {
+              readonly start?: (string & Brand.Brand<"Snapshot.ID">) | undefined
+              readonly end?: (string & Brand.Brand<"Snapshot.ID">) | undefined
+              readonly files?: ReadonlyArray<RelativePath> | undefined
+            }
+          | undefined
+        readonly finish?: "stop" | "length" | "tool-calls" | "content-filter" | "error" | "unknown" | undefined
+        readonly rawFinish?: string | undefined
+        readonly providerState?: SessionMessage.ProviderState | undefined
+        readonly cost?: (number & Brand.Brand<"Money.USD">) | undefined
+        readonly tokens?:
+          | {
+              readonly input: number
+              readonly output: number
+              readonly reasoning: number
+              readonly cache: { readonly read: number; readonly write: number }
+            }
+          | undefined
+        readonly error?:
+          | {
+              readonly type: string
+              readonly message: string
+              readonly status?: number | undefined
+              readonly resolution?:
+                | {
+                    readonly kind:
+                      | "rate_limited"
+                      | "usage_limited"
+                      | "plan_not_included"
+                      | "quota_exceeded"
+                      | "policy_blocked"
+                      | "authentication"
+                      | "invalid_input"
+                      | "network"
+                      | "server"
+                    readonly retry: "automatic" | "never"
+                    readonly action:
+                      | "switch_model"
+                      | "wait"
+                      | "manage_billing"
+                      | "reauthenticate"
+                      | "fix_input"
+                      | "check_network"
+                      | "retry"
+                    readonly retryAfterMs?: number | undefined
+                    readonly providerCode?: string | undefined
+                  }
+                | undefined
+              readonly responseBody?: string | undefined
+              readonly responseHeaders?: { readonly [x: string]: string } | undefined
+              readonly url?: string | undefined
+            }
+          | undefined
+        readonly retry?: SessionMessage.AssistantRetry | undefined
+        readonly seq: number
+      }
+    | {
+        readonly type: "compaction"
+        readonly id: SessionMessage.ID
+        readonly metadata?: { readonly [x: string]: unknown } | undefined
+        readonly time: { readonly created: DateTime.Utc }
+        readonly status: "running"
+        readonly reason: "auto" | "manual"
+        readonly summary: string
+        readonly recent: string
+        readonly seq: number
+      }
+    | {
+        readonly type: "compaction"
+        readonly id: SessionMessage.ID
+        readonly metadata?: { readonly [x: string]: unknown } | undefined
+        readonly time: { readonly created: DateTime.Utc }
+        readonly status: "completed"
+        readonly reason: "auto" | "manual"
+        readonly model?: Model.Ref | undefined
+        readonly providerState?: SessionMessage.ProviderState | undefined
+        readonly summary: string
+        readonly recent: string
+        readonly providerContext?:
+          | {
+              readonly version: 1
+              readonly provenance: {
+                readonly providerID: Provider.ID
+                readonly provider: string
+                readonly modelID: string
+                readonly route: string
+                readonly protocol: string
+                readonly endpoint: string
+              }
+              readonly messages: Schema.Json
+            }
+          | undefined
+        readonly cost?: (number & Brand.Brand<"Money.USD">) | undefined
+        readonly tokens?:
+          | {
+              readonly input: number
+              readonly output: number
+              readonly reasoning: number
+              readonly cache: { readonly read: number; readonly write: number }
+            }
+          | undefined
+        readonly seq: number
+      }
+    | {
+        readonly type: "compaction"
+        readonly id: SessionMessage.ID
+        readonly metadata?: { readonly [x: string]: unknown } | undefined
+        readonly time: { readonly created: DateTime.Utc }
+        readonly status: "failed"
+        readonly reason: "auto" | "manual"
+        readonly error: {
+          readonly type: string
+          readonly message: string
+          readonly status?: number | undefined
+          readonly resolution?:
+            | {
+                readonly kind:
+                  | "rate_limited"
+                  | "usage_limited"
+                  | "plan_not_included"
+                  | "quota_exceeded"
+                  | "policy_blocked"
+                  | "authentication"
+                  | "invalid_input"
+                  | "network"
+                  | "server"
+                readonly retry: "automatic" | "never"
+                readonly action:
+                  | "switch_model"
+                  | "wait"
+                  | "manage_billing"
+                  | "reauthenticate"
+                  | "fix_input"
+                  | "check_network"
+                  | "retry"
+                readonly retryAfterMs?: number | undefined
+                readonly providerCode?: string | undefined
+              }
+            | undefined
+          readonly responseBody?: string | undefined
+          readonly responseHeaders?: { readonly [x: string]: string } | undefined
+          readonly url?: string | undefined
+        }
+        readonly cost?: (number & Brand.Brand<"Money.USD">) | undefined
+        readonly tokens?:
+          | {
+              readonly input: number
+              readonly output: number
+              readonly reasoning: number
+              readonly cache: { readonly read: number; readonly write: number }
+            }
+          | undefined
+        readonly seq: number
+      }
+    | {
+        readonly id: SessionMessage.ID
+        readonly metadata?: { readonly [x: string]: unknown } | undefined
+        readonly time: { readonly created: DateTime.Utc }
+        readonly type: "idle"
+        readonly outcome: "succeeded" | "failed" | "interrupted"
+        readonly seq: number
+      }
+  >
+}
 export type SessionExportOperation<E = never> = (input: SessionExportInput) => Effect.Effect<SessionExportOutput, E>
 
 export type SessionActiveOutput = { readonly [x: Session.ID]: { readonly type: "running" } }
@@ -1379,7 +1657,279 @@ export type SessionBackgroundOperation<E = never> = (
 ) => Effect.Effect<SessionBackgroundOutput, E>
 
 export type SessionMessageGetInput = { readonly sessionID: Session.ID; readonly messageID: SessionMessage.ID }
-export type SessionMessageGetOutput = SessionMessage.Info
+export type SessionMessageGetOutput =
+  | {
+      readonly id: SessionMessage.ID
+      readonly metadata?: { readonly [x: string]: unknown } | undefined
+      readonly time: { readonly created: DateTime.Utc }
+      readonly type: "agent-switched"
+      readonly agent: Agent.ID
+      readonly previous?: Agent.ID | undefined
+      readonly seq: number
+    }
+  | {
+      readonly id: SessionMessage.ID
+      readonly metadata?: { readonly [x: string]: unknown } | undefined
+      readonly time: { readonly created: DateTime.Utc }
+      readonly type: "model-switched"
+      readonly model: Model.Ref
+      readonly previous?: Model.Ref | undefined
+      readonly seq: number
+    }
+  | {
+      readonly id: SessionMessage.ID
+      readonly metadata?: { readonly [x: string]: unknown } | undefined
+      readonly time: { readonly created: DateTime.Utc }
+      readonly type: "location-switched"
+      readonly projectID?: Project.ID | undefined
+      readonly subpath?: RelativePath | undefined
+      readonly location: Location.PublicRef
+      readonly previous?:
+        | {
+            readonly location: Location.PublicRef
+            readonly projectID?: Project.ID | undefined
+            readonly subpath?: RelativePath | undefined
+          }
+        | undefined
+      readonly seq: number
+    }
+  | {
+      readonly id: SessionMessage.ID
+      readonly metadata?: { readonly [x: string]: unknown } | undefined
+      readonly time: { readonly created: DateTime.Utc }
+      readonly text: string
+      readonly files?: ReadonlyArray<FileAttachment> | undefined
+      readonly agents?: ReadonlyArray<AgentAttachment> | undefined
+      readonly skills?:
+        | ReadonlyArray<{
+            readonly id: Skill.ID
+            readonly name: Skill.Name
+            readonly text?: string | undefined
+            readonly mention?: PromptMention | undefined
+          }>
+        | undefined
+      readonly type: "user"
+      readonly seq: number
+    }
+  | {
+      readonly id: SessionMessage.ID
+      readonly metadata?: { readonly [x: string]: unknown } | undefined
+      readonly time: { readonly created: DateTime.Utc }
+      readonly text: string
+      readonly description?: string | undefined
+      readonly type: "synthetic"
+      readonly seq: number
+    }
+  | {
+      readonly id: SessionMessage.ID
+      readonly metadata?: { readonly [x: string]: unknown } | undefined
+      readonly time: { readonly created: DateTime.Utc }
+      readonly type: "system"
+      readonly text: string
+      readonly description?: string | undefined
+      readonly seq: number
+    }
+  | {
+      readonly id: SessionMessage.ID
+      readonly metadata?: { readonly [x: string]: unknown } | undefined
+      readonly time: { readonly created: DateTime.Utc }
+      readonly type: "skill"
+      readonly skill: Skill.ID
+      readonly name: Skill.Name
+      readonly text: string
+      readonly seq: number
+    }
+  | {
+      readonly id: SessionMessage.ID
+      readonly metadata?: { readonly [x: string]: unknown } | undefined
+      readonly time: { readonly created: DateTime.Utc; readonly completed?: DateTime.Utc | undefined }
+      readonly type: "shell"
+      readonly shellID: Shell.ID
+      readonly command: string
+      readonly status: "running" | "exited" | "timeout" | "killed"
+      readonly exit?: number | undefined
+      readonly output?:
+        | { readonly output: string; readonly cursor: number; readonly size: number; readonly truncated: boolean }
+        | undefined
+      readonly seq: number
+    }
+  | {
+      readonly id: SessionMessage.ID
+      readonly metadata?: { readonly [x: string]: unknown } | undefined
+      readonly time: {
+        readonly created: DateTime.Utc
+        readonly streamed?: DateTime.Utc | undefined
+        readonly completed?: DateTime.Utc | undefined
+      }
+      readonly type: "assistant"
+      readonly agent: Agent.ID
+      readonly model: Model.Ref
+      readonly content: ReadonlyArray<
+        SessionMessage.AssistantText | SessionMessage.AssistantReasoning | SessionMessage.AssistantTool
+      >
+      readonly snapshot?:
+        | {
+            readonly start?: (string & Brand.Brand<"Snapshot.ID">) | undefined
+            readonly end?: (string & Brand.Brand<"Snapshot.ID">) | undefined
+            readonly files?: ReadonlyArray<RelativePath> | undefined
+          }
+        | undefined
+      readonly finish?: "stop" | "length" | "tool-calls" | "content-filter" | "error" | "unknown" | undefined
+      readonly rawFinish?: string | undefined
+      readonly providerState?: SessionMessage.ProviderState | undefined
+      readonly cost?: (number & Brand.Brand<"Money.USD">) | undefined
+      readonly tokens?:
+        | {
+            readonly input: number
+            readonly output: number
+            readonly reasoning: number
+            readonly cache: { readonly read: number; readonly write: number }
+          }
+        | undefined
+      readonly error?:
+        | {
+            readonly type: string
+            readonly message: string
+            readonly status?: number | undefined
+            readonly resolution?:
+              | {
+                  readonly kind:
+                    | "rate_limited"
+                    | "usage_limited"
+                    | "plan_not_included"
+                    | "quota_exceeded"
+                    | "policy_blocked"
+                    | "authentication"
+                    | "invalid_input"
+                    | "network"
+                    | "server"
+                  readonly retry: "automatic" | "never"
+                  readonly action:
+                    | "switch_model"
+                    | "wait"
+                    | "manage_billing"
+                    | "reauthenticate"
+                    | "fix_input"
+                    | "check_network"
+                    | "retry"
+                  readonly retryAfterMs?: number | undefined
+                  readonly providerCode?: string | undefined
+                }
+              | undefined
+            readonly responseBody?: string | undefined
+            readonly responseHeaders?: { readonly [x: string]: string } | undefined
+            readonly url?: string | undefined
+          }
+        | undefined
+      readonly retry?: SessionMessage.AssistantRetry | undefined
+      readonly seq: number
+    }
+  | {
+      readonly type: "compaction"
+      readonly id: SessionMessage.ID
+      readonly metadata?: { readonly [x: string]: unknown } | undefined
+      readonly time: { readonly created: DateTime.Utc }
+      readonly status: "running"
+      readonly reason: "auto" | "manual"
+      readonly summary: string
+      readonly recent: string
+      readonly seq: number
+    }
+  | {
+      readonly type: "compaction"
+      readonly id: SessionMessage.ID
+      readonly metadata?: { readonly [x: string]: unknown } | undefined
+      readonly time: { readonly created: DateTime.Utc }
+      readonly status: "completed"
+      readonly reason: "auto" | "manual"
+      readonly model?: Model.Ref | undefined
+      readonly providerState?: SessionMessage.ProviderState | undefined
+      readonly summary: string
+      readonly recent: string
+      readonly providerContext?:
+        | {
+            readonly version: 1
+            readonly provenance: {
+              readonly providerID: Provider.ID
+              readonly provider: string
+              readonly modelID: string
+              readonly route: string
+              readonly protocol: string
+              readonly endpoint: string
+            }
+            readonly messages: Schema.Json
+          }
+        | undefined
+      readonly cost?: (number & Brand.Brand<"Money.USD">) | undefined
+      readonly tokens?:
+        | {
+            readonly input: number
+            readonly output: number
+            readonly reasoning: number
+            readonly cache: { readonly read: number; readonly write: number }
+          }
+        | undefined
+      readonly seq: number
+    }
+  | {
+      readonly type: "compaction"
+      readonly id: SessionMessage.ID
+      readonly metadata?: { readonly [x: string]: unknown } | undefined
+      readonly time: { readonly created: DateTime.Utc }
+      readonly status: "failed"
+      readonly reason: "auto" | "manual"
+      readonly error: {
+        readonly type: string
+        readonly message: string
+        readonly status?: number | undefined
+        readonly resolution?:
+          | {
+              readonly kind:
+                | "rate_limited"
+                | "usage_limited"
+                | "plan_not_included"
+                | "quota_exceeded"
+                | "policy_blocked"
+                | "authentication"
+                | "invalid_input"
+                | "network"
+                | "server"
+              readonly retry: "automatic" | "never"
+              readonly action:
+                | "switch_model"
+                | "wait"
+                | "manage_billing"
+                | "reauthenticate"
+                | "fix_input"
+                | "check_network"
+                | "retry"
+              readonly retryAfterMs?: number | undefined
+              readonly providerCode?: string | undefined
+            }
+          | undefined
+        readonly responseBody?: string | undefined
+        readonly responseHeaders?: { readonly [x: string]: string } | undefined
+        readonly url?: string | undefined
+      }
+      readonly cost?: (number & Brand.Brand<"Money.USD">) | undefined
+      readonly tokens?:
+        | {
+            readonly input: number
+            readonly output: number
+            readonly reasoning: number
+            readonly cache: { readonly read: number; readonly write: number }
+          }
+        | undefined
+      readonly seq: number
+    }
+  | {
+      readonly id: SessionMessage.ID
+      readonly metadata?: { readonly [x: string]: unknown } | undefined
+      readonly time: { readonly created: DateTime.Utc }
+      readonly type: "idle"
+      readonly outcome: "succeeded" | "failed" | "interrupted"
+      readonly seq: number
+    }
 export type SessionMessageGetOperation<E = never> = (
   input: SessionMessageGetInput,
 ) => Effect.Effect<SessionMessageGetOutput, E>
@@ -1514,7 +2064,280 @@ export type MessageListInput = {
     | undefined
 }
 export type MessageListOutput = {
-  readonly data: ReadonlyArray<SessionMessage.Info>
+  readonly data: ReadonlyArray<
+    | {
+        readonly id: SessionMessage.ID
+        readonly metadata?: { readonly [x: string]: unknown } | undefined
+        readonly time: { readonly created: DateTime.Utc }
+        readonly type: "agent-switched"
+        readonly agent: Agent.ID
+        readonly previous?: Agent.ID | undefined
+        readonly seq: number
+      }
+    | {
+        readonly id: SessionMessage.ID
+        readonly metadata?: { readonly [x: string]: unknown } | undefined
+        readonly time: { readonly created: DateTime.Utc }
+        readonly type: "model-switched"
+        readonly model: Model.Ref
+        readonly previous?: Model.Ref | undefined
+        readonly seq: number
+      }
+    | {
+        readonly id: SessionMessage.ID
+        readonly metadata?: { readonly [x: string]: unknown } | undefined
+        readonly time: { readonly created: DateTime.Utc }
+        readonly type: "location-switched"
+        readonly projectID?: Project.ID | undefined
+        readonly subpath?: RelativePath | undefined
+        readonly location: Location.PublicRef
+        readonly previous?:
+          | {
+              readonly location: Location.PublicRef
+              readonly projectID?: Project.ID | undefined
+              readonly subpath?: RelativePath | undefined
+            }
+          | undefined
+        readonly seq: number
+      }
+    | {
+        readonly id: SessionMessage.ID
+        readonly metadata?: { readonly [x: string]: unknown } | undefined
+        readonly time: { readonly created: DateTime.Utc }
+        readonly text: string
+        readonly files?: ReadonlyArray<FileAttachment> | undefined
+        readonly agents?: ReadonlyArray<AgentAttachment> | undefined
+        readonly skills?:
+          | ReadonlyArray<{
+              readonly id: Skill.ID
+              readonly name: Skill.Name
+              readonly text?: string | undefined
+              readonly mention?: PromptMention | undefined
+            }>
+          | undefined
+        readonly type: "user"
+        readonly seq: number
+      }
+    | {
+        readonly id: SessionMessage.ID
+        readonly metadata?: { readonly [x: string]: unknown } | undefined
+        readonly time: { readonly created: DateTime.Utc }
+        readonly text: string
+        readonly description?: string | undefined
+        readonly type: "synthetic"
+        readonly seq: number
+      }
+    | {
+        readonly id: SessionMessage.ID
+        readonly metadata?: { readonly [x: string]: unknown } | undefined
+        readonly time: { readonly created: DateTime.Utc }
+        readonly type: "system"
+        readonly text: string
+        readonly description?: string | undefined
+        readonly seq: number
+      }
+    | {
+        readonly id: SessionMessage.ID
+        readonly metadata?: { readonly [x: string]: unknown } | undefined
+        readonly time: { readonly created: DateTime.Utc }
+        readonly type: "skill"
+        readonly skill: Skill.ID
+        readonly name: Skill.Name
+        readonly text: string
+        readonly seq: number
+      }
+    | {
+        readonly id: SessionMessage.ID
+        readonly metadata?: { readonly [x: string]: unknown } | undefined
+        readonly time: { readonly created: DateTime.Utc; readonly completed?: DateTime.Utc | undefined }
+        readonly type: "shell"
+        readonly shellID: Shell.ID
+        readonly command: string
+        readonly status: "running" | "exited" | "timeout" | "killed"
+        readonly exit?: number | undefined
+        readonly output?:
+          | { readonly output: string; readonly cursor: number; readonly size: number; readonly truncated: boolean }
+          | undefined
+        readonly seq: number
+      }
+    | {
+        readonly id: SessionMessage.ID
+        readonly metadata?: { readonly [x: string]: unknown } | undefined
+        readonly time: {
+          readonly created: DateTime.Utc
+          readonly streamed?: DateTime.Utc | undefined
+          readonly completed?: DateTime.Utc | undefined
+        }
+        readonly type: "assistant"
+        readonly agent: Agent.ID
+        readonly model: Model.Ref
+        readonly content: ReadonlyArray<
+          SessionMessage.AssistantText | SessionMessage.AssistantReasoning | SessionMessage.AssistantTool
+        >
+        readonly snapshot?:
+          | {
+              readonly start?: (string & Brand.Brand<"Snapshot.ID">) | undefined
+              readonly end?: (string & Brand.Brand<"Snapshot.ID">) | undefined
+              readonly files?: ReadonlyArray<RelativePath> | undefined
+            }
+          | undefined
+        readonly finish?: "stop" | "length" | "tool-calls" | "content-filter" | "error" | "unknown" | undefined
+        readonly rawFinish?: string | undefined
+        readonly providerState?: SessionMessage.ProviderState | undefined
+        readonly cost?: (number & Brand.Brand<"Money.USD">) | undefined
+        readonly tokens?:
+          | {
+              readonly input: number
+              readonly output: number
+              readonly reasoning: number
+              readonly cache: { readonly read: number; readonly write: number }
+            }
+          | undefined
+        readonly error?:
+          | {
+              readonly type: string
+              readonly message: string
+              readonly status?: number | undefined
+              readonly resolution?:
+                | {
+                    readonly kind:
+                      | "rate_limited"
+                      | "usage_limited"
+                      | "plan_not_included"
+                      | "quota_exceeded"
+                      | "policy_blocked"
+                      | "authentication"
+                      | "invalid_input"
+                      | "network"
+                      | "server"
+                    readonly retry: "automatic" | "never"
+                    readonly action:
+                      | "switch_model"
+                      | "wait"
+                      | "manage_billing"
+                      | "reauthenticate"
+                      | "fix_input"
+                      | "check_network"
+                      | "retry"
+                    readonly retryAfterMs?: number | undefined
+                    readonly providerCode?: string | undefined
+                  }
+                | undefined
+              readonly responseBody?: string | undefined
+              readonly responseHeaders?: { readonly [x: string]: string } | undefined
+              readonly url?: string | undefined
+            }
+          | undefined
+        readonly retry?: SessionMessage.AssistantRetry | undefined
+        readonly seq: number
+      }
+    | {
+        readonly type: "compaction"
+        readonly id: SessionMessage.ID
+        readonly metadata?: { readonly [x: string]: unknown } | undefined
+        readonly time: { readonly created: DateTime.Utc }
+        readonly status: "running"
+        readonly reason: "auto" | "manual"
+        readonly summary: string
+        readonly recent: string
+        readonly seq: number
+      }
+    | {
+        readonly type: "compaction"
+        readonly id: SessionMessage.ID
+        readonly metadata?: { readonly [x: string]: unknown } | undefined
+        readonly time: { readonly created: DateTime.Utc }
+        readonly status: "completed"
+        readonly reason: "auto" | "manual"
+        readonly model?: Model.Ref | undefined
+        readonly providerState?: SessionMessage.ProviderState | undefined
+        readonly summary: string
+        readonly recent: string
+        readonly providerContext?:
+          | {
+              readonly version: 1
+              readonly provenance: {
+                readonly providerID: Provider.ID
+                readonly provider: string
+                readonly modelID: string
+                readonly route: string
+                readonly protocol: string
+                readonly endpoint: string
+              }
+              readonly messages: Schema.Json
+            }
+          | undefined
+        readonly cost?: (number & Brand.Brand<"Money.USD">) | undefined
+        readonly tokens?:
+          | {
+              readonly input: number
+              readonly output: number
+              readonly reasoning: number
+              readonly cache: { readonly read: number; readonly write: number }
+            }
+          | undefined
+        readonly seq: number
+      }
+    | {
+        readonly type: "compaction"
+        readonly id: SessionMessage.ID
+        readonly metadata?: { readonly [x: string]: unknown } | undefined
+        readonly time: { readonly created: DateTime.Utc }
+        readonly status: "failed"
+        readonly reason: "auto" | "manual"
+        readonly error: {
+          readonly type: string
+          readonly message: string
+          readonly status?: number | undefined
+          readonly resolution?:
+            | {
+                readonly kind:
+                  | "rate_limited"
+                  | "usage_limited"
+                  | "plan_not_included"
+                  | "quota_exceeded"
+                  | "policy_blocked"
+                  | "authentication"
+                  | "invalid_input"
+                  | "network"
+                  | "server"
+                readonly retry: "automatic" | "never"
+                readonly action:
+                  | "switch_model"
+                  | "wait"
+                  | "manage_billing"
+                  | "reauthenticate"
+                  | "fix_input"
+                  | "check_network"
+                  | "retry"
+                readonly retryAfterMs?: number | undefined
+                readonly providerCode?: string | undefined
+              }
+            | undefined
+          readonly responseBody?: string | undefined
+          readonly responseHeaders?: { readonly [x: string]: string } | undefined
+          readonly url?: string | undefined
+        }
+        readonly cost?: (number & Brand.Brand<"Money.USD">) | undefined
+        readonly tokens?:
+          | {
+              readonly input: number
+              readonly output: number
+              readonly reasoning: number
+              readonly cache: { readonly read: number; readonly write: number }
+            }
+          | undefined
+        readonly seq: number
+      }
+    | {
+        readonly id: SessionMessage.ID
+        readonly metadata?: { readonly [x: string]: unknown } | undefined
+        readonly time: { readonly created: DateTime.Utc }
+        readonly type: "idle"
+        readonly outcome: "succeeded" | "failed" | "interrupted"
+        readonly seq: number
+      }
+  >
   readonly cursor: { readonly previous?: string | undefined; readonly next?: string | undefined }
 }
 export type MessageListOperation<E = never> = (input: MessageListInput) => Effect.Effect<MessageListOutput, E>
