@@ -14,6 +14,10 @@ import { existsSync } from "node:fs"
 import path from "node:path"
 import type { Database as SQLiteDatabase } from "bun:sqlite"
 import { Project } from "@opencode/schema/project"
+import { Model } from "@opencode/schema/model"
+import { legacyNativeCheckpoint } from "./legacy-native-checkpoint.js"
+import { SessionProviderContext } from "../session/provider-context.js"
+import { toLLMMessages } from "../session/runner/to-llm-message.js"
 
 export type SourceMessage = {
   readonly id: string
@@ -270,6 +274,7 @@ export function transformSession(input: TransformInput): TransformResult {
   const byMessage = Map.groupBy(parts, (item) => item.row.message_id)
   const paired = new Set<string>()
   const used = new Set(messages.map((item) => item.row.id))
+  const nativeTails = new Map<string, string>()
   const projected = messages
     .flatMap((item) => {
       if (paired.has(item.row.id)) return []
@@ -287,6 +292,10 @@ export function transformSession(input: TransformInput): TransformResult {
           paired.add(pairedSummary.row.id)
           if (pairedSummary.value.error || pairedSummary.value.time.completed === undefined) return []
           const summary = pairedSummary
+          const providerContext = legacyNativeCheckpoint(
+            (byMessage.get(summary.row.id) ?? []).map((part) => part.value),
+          )
+          if (providerContext && compaction.tail_start_id) nativeTails.set(item.row.id, compaction.tail_start_id)
           const summaryText = (byMessage.get(summary.row.id) ?? [])
             .map((part) => part.value)
             .filter((part): part is SessionV1.TextPart => part.type === "text" && part.text.length > 0)
@@ -305,8 +314,9 @@ export function transformSession(input: TransformInput): TransformResult {
                 type: "compaction",
                 status: "completed",
                 reason: compaction.auto ? "auto" : "manual",
-                summary: summaryText,
-                recent: serializeRecent(tail, byMessage),
+                summary: providerContext ? "" : summaryText,
+                recent: providerContext ? "" : serializeRecent(tail, byMessage),
+                ...(providerContext ? { providerContext } : {}),
                 time: { created: item.row.time_created },
               },
             ),
@@ -438,6 +448,25 @@ export function transformSession(input: TransformInput): TransformResult {
       ]
     })
     .map((item, seq) => ({ ...item, seq }))
+  // The V1 checkpoint covered only its head; its tail precedes the marker in storage.
+  // Fold the already-converted tail into the canonical window exactly once.
+  for (const [markerID, tailID] of nativeTails) {
+    const start = projected.findIndex((item) => item.id === tailID)
+    const end = projected.findIndex((item) => item.id === markerID)
+    if (start < 0 || start >= end) throw new Error(`Cannot migrate native checkpoint tail: ${markerID}/${tailID}`)
+    const context = Schema.decodeUnknownSync(SessionProviderContext.Info)(projected[end].data.providerContext)
+    const tail = projected
+      .slice(start, end)
+      .filter((item) => item.type !== "compaction")
+      .map((item) => Schema.decodeUnknownSync(SessionMessage.Info)({ ...item.data, id: item.id, type: item.type }))
+    projected[end].data.providerContext = SessionProviderContext.encode(context.provenance, [
+      ...SessionProviderContext.decode(context),
+      ...toLLMMessages(tail, {
+        providerID: context.provenance.providerID,
+        id: Model.ID.make(context.provenance.modelID),
+      }),
+    ])
+  }
   const last = projected.at(-1)
   const notice = last === undefined ? undefined : legacyToolNotice(projected)
   const migrated =
@@ -904,8 +933,8 @@ const REMOVED_TOOLS = ["todowrite"]
 
 /**
  * Tells the model about V1 tools it called in the still-visible history whose
- * V2 names or arguments differ, so it does not repeat those calls. Only tools
- * that actually appear after the last compaction are mentioned.
+ * V2 names or arguments differ, so it does not repeat those calls. Include the
+ * last native checkpoint's structured replay window and the messages after it.
  */
 function legacyToolNotice(messages: ReadonlyArray<TransformResult["messages"][number]>) {
   const start = messages.findLastIndex((message) => message.type === "compaction")
@@ -917,6 +946,15 @@ function legacyToolNotice(messages: ReadonlyArray<TransformResult["messages"][nu
       )
     }),
   )
+  const checkpoint = messages[start]?.data.providerContext
+  if (checkpoint !== undefined) {
+    const context = Schema.decodeUnknownSync(SessionProviderContext.Info)(checkpoint)
+    for (const message of SessionProviderContext.decode(context)) {
+      for (const part of message.content) {
+        if (part.type === "tool-call") called.add(part.name)
+      }
+    }
+  }
   const list = (names: ReadonlyArray<string>) => names.map((name) => `\`${name}\``).join(", ")
   const renamed = Object.keys(RENAMED_TOOLS).filter((name) => called.has(name))
   const paths = PATH_TOOLS.filter((name) => called.has(name))

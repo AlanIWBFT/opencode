@@ -14,6 +14,9 @@ export type Info = SessionProviderContext.Info
 
 const messages = Schema.toCodecJson(Schema.Array(Message))
 
+/** V1 did not store an endpoint; bind once when the selected model's configuration is available. */
+export const legacyEndpoint = "legacy-openai-v1:unbound"
+
 /** No guessed endpoints. Dynamic URL builders cannot establish a durable deployment identity here. */
 export function provenance(resolved: Pick<SessionRunnerModel.Resolved, "model" | "ref">): Provenance | undefined {
   const model = resolved.model
@@ -35,8 +38,15 @@ export function provenance(resolved: Pick<SessionRunnerModel.Resolved, "model" |
   }
 }
 
+/** OpenAI Responses checkpoints can cross models within the same configured deployment. */
+export const replayIdentity = (value: Provenance) => {
+  if (value.provider !== "openai" || value.protocol !== "openai-responses") return value
+  const { modelID: _, ...identity } = value
+  return identity
+}
+
 export const compatible = (source: Provenance, target: Provenance | undefined) =>
-  target !== undefined && isDeepStrictEqual(source, target)
+  target !== undefined && isDeepStrictEqual(replayIdentity(source), replayIdentity(target))
 
 /** A completed compaction that installed a native replacement window instead of a local summary. */
 export const isCheckpoint = (
