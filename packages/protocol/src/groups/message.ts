@@ -1,6 +1,7 @@
 import { Session } from "@opencode/schema/session"
 import { SessionMessage } from "@opencode/schema/session-message"
 import { Location } from "@opencode/schema/location"
+import { NonNegativeInt } from "@opencode/schema/schema"
 import { Schema, Struct } from "effect"
 import { HttpApiEndpoint, HttpApiGroup, OpenApi } from "effect/http-api"
 import { InvalidCursorError, SessionNotFoundError, UnknownError } from "../errors.js"
@@ -65,22 +66,31 @@ export const PublicSessionMessage = Schema.Union([
   SessionMessage.Idle,
 ]).annotate({ identifier: "Session.Message.Info" })
 
+const stored = Schema.fieldsAssign({
+  seq: NonNegativeInt.annotate({
+    description:
+      "Authoritative message creation order within its session. Stable across updates; not an event-update sequence or part order.",
+  }),
+})
+
 /**
  * Experimental: {@link PublicSessionMessage} as sent to clients that opt in with `X-OpenCode-Capabilities:
  * experimental-media-uri` while `experimental.media_blob` is on. User files stored in `blob` stay `media:` refs.
  */
 export const PublicMediaSessionMessage = Schema.Union([
-  SessionMessage.AgentSelected,
-  SessionMessage.ModelSelected,
-  PublicLocationSwitched,
-  SessionMessage.MediaUser,
-  SessionMessage.Synthetic,
-  SessionMessage.System,
-  SessionMessage.Skill,
-  SessionMessage.Shell,
-  SessionMessage.Assistant,
-  SessionMessage.Compaction,
-  SessionMessage.Idle,
+  stored(SessionMessage.AgentSelected),
+  stored(SessionMessage.ModelSelected),
+  stored(PublicLocationSwitched),
+  stored(SessionMessage.MediaUser),
+  stored(SessionMessage.Synthetic),
+  stored(SessionMessage.System),
+  stored(SessionMessage.Skill),
+  stored(SessionMessage.Shell),
+  stored(SessionMessage.Assistant),
+  stored(SessionMessage.CompactionRunning),
+  stored(SessionMessage.CompactionCompleted),
+  stored(SessionMessage.CompactionFailed),
+  stored(SessionMessage.Idle),
 ]).annotate({ identifier: "Session.Message.MediaInfo" })
 
 const MessagesCursor = Schema.Struct({
@@ -96,6 +106,21 @@ export const SessionMediaMessagesResponse = Schema.Struct({
 
 /** Experimental: the `session.message` response for clients that opt into `experimental-media-uri`. */
 export const SessionMediaMessageResponse = Schema.Struct({ data: PublicMediaSessionMessage })
+export const PublicStoredSessionMessage = Schema.Union([
+  stored(SessionMessage.AgentSelected),
+  stored(SessionMessage.ModelSelected),
+  stored(PublicLocationSwitched),
+  stored(SessionMessage.User),
+  stored(SessionMessage.Synthetic),
+  stored(SessionMessage.System),
+  stored(SessionMessage.Skill),
+  stored(SessionMessage.Shell),
+  stored(SessionMessage.Assistant),
+  stored(SessionMessage.CompactionRunning),
+  stored(SessionMessage.CompactionCompleted),
+  stored(SessionMessage.CompactionFailed),
+  stored(SessionMessage.Idle),
+]).annotate({ identifier: "Session.Message.StoredInfo" })
 
 export const MessageGroup = HttpApiGroup.make("server.message")
   .add(
@@ -103,7 +128,7 @@ export const MessageGroup = HttpApiGroup.make("server.message")
       params: { sessionID: Session.ID },
       query: SessionMessagesQuery,
       success: Schema.Struct({
-        data: Schema.Array(PublicSessionMessage),
+        data: Schema.Array(PublicStoredSessionMessage),
         cursor: MessagesCursor,
       }).annotate({ identifier: "SessionMessagesResponse" }),
       error: [InvalidCursorError, SessionNotFoundError, UnknownError],

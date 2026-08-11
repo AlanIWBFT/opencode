@@ -54,7 +54,7 @@ export type MessagesInput = {
 export interface Interface {
   readonly get: (sessionID: Session.ID) => Effect.Effect<Session.Info | undefined>
   readonly list: (input?: ListInput) => Effect.Effect<Session.Info[]>
-  readonly messages: (input: MessagesInput) => Effect.Effect<SessionMessage.Info[], MessageDecodeError>
+  readonly messages: (input: MessagesInput) => Effect.Effect<SessionMessage.StoredInfo[], MessageDecodeError>
   readonly context: (sessionID: Session.ID) => Effect.Effect<SessionMessage.Info[], MessageDecodeError>
   /**
    * The newest completed, error-free assistant message above the sequence
@@ -67,13 +67,13 @@ export interface Interface {
   }) => Effect.Effect<SessionMessage.Assistant | undefined, MessageDecodeError>
   readonly message: (
     messageID: SessionMessage.ID,
-  ) => Effect.Effect<{ readonly sessionID: Session.ID; readonly message: SessionMessage.Info } | undefined>
+  ) => Effect.Effect<{ readonly sessionID: Session.ID; readonly message: SessionMessage.StoredInfo } | undefined>
   /** {@link Interface.messages} for clients that fetch media themselves: files stored in `blob` stay `media:` refs. */
-  readonly messagesWithRefs: (input: MessagesInput) => Effect.Effect<SessionMessage.MediaInfo[], MessageDecodeError>
+  readonly messagesWithRefs: (input: MessagesInput) => Effect.Effect<SessionMessage.StoredMediaInfo[], MessageDecodeError>
   /** {@link Interface.message} for clients that fetch media themselves. */
   readonly messageWithRefs: (
     messageID: SessionMessage.ID,
-  ) => Effect.Effect<{ readonly sessionID: Session.ID; readonly message: SessionMessage.MediaInfo } | undefined>
+  ) => Effect.Effect<{ readonly sessionID: Session.ID; readonly message: SessionMessage.StoredMediaInfo } | undefined>
   /**
    * Sessions holding an execution claim, including directly driven children.
    */
@@ -205,10 +205,14 @@ const layer = Layer.effect(
         return (direction === "previous" ? rows.toReversed() : rows).map((row) => fromRow(row))
       }),
       messages: Effect.fn("SessionStore.messages")(function* (input) {
-        return yield* SessionHistory.decodeMessageRows(db, yield* messageRows(input))
+        const rows = yield* messageRows(input)
+        const messages = yield* SessionHistory.decodeMessageRows(db, rows)
+        return messages.map((message, index) => ({ ...message, seq: rows[index]!.seq }))
       }),
       messagesWithRefs: Effect.fn("SessionStore.messagesWithRefs")(function* (input) {
-        return yield* SessionHistory.decodeMessageRowsWithRefs(db, yield* messageRows(input))
+        const rows = yield* messageRows(input)
+        const messages = yield* SessionHistory.decodeMessageRowsWithRefs(db, rows)
+        return messages.map((message, index) => ({ ...message, seq: rows[index]!.seq }))
       }),
       context: Effect.fn("SessionStore.context")((sessionID) => SessionHistory.load(db, sessionID, "latest")),
       lastAssistantAfter: Effect.fn("SessionStore.lastAssistantAfter")(function* (input) {
@@ -241,13 +245,13 @@ const layer = Layer.effect(
         const row = yield* messageRow(messageID)
         if (!row) return undefined
         const [message] = yield* SessionHistory.decodeMessageRows(db, [row]).pipe(Effect.orDie)
-        return message && { sessionID: row.session_id, message }
+        return message && { sessionID: row.session_id, message: { ...message, seq: row.seq } }
       }),
       messageWithRefs: Effect.fn("SessionStore.messageWithRefs")(function* (messageID) {
         const row = yield* messageRow(messageID)
         if (!row) return undefined
         const [message] = yield* SessionHistory.decodeMessageRowsWithRefs(db, [row]).pipe(Effect.orDie)
-        return message && { sessionID: row.session_id, message }
+        return message && { sessionID: row.session_id, message: { ...message, seq: row.seq } }
       }),
       listSuspended: Effect.fn("SessionStore.listSuspended")(function* () {
         return yield* db
