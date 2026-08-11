@@ -1397,6 +1397,22 @@ const scenarios: Scenario[] = [
       "status",
     ),
   http.protected
+    .post("/session/{sessionID}/stop", "session.stop")
+    .mutating()
+    .seeded((ctx) => ctx.session({ title: "Stop session" }))
+    .at((ctx) => ({
+      path: route("/session/{sessionID}/stop", { sessionID: ctx.state.id }),
+      headers: ctx.headers(),
+      body: { scope: "session-tree" },
+    }))
+    .json(200, (body) => {
+      object(body)
+      check(body.sessions === 1, "stop should include the root session")
+      check(body.matched === 0, "stop should not match missing exec sessions")
+      check(body.terminated === 0, "stop should not terminate missing exec sessions")
+      check(body.failed === 0, "stop should not report failures without exec sessions")
+    }),
+  http.protected
     .post("/session/{sessionID}/abort", "session.abort")
     .mutating()
     .seeded((ctx) => ctx.session({ title: "Abort session" }))

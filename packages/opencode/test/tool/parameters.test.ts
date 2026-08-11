@@ -22,6 +22,7 @@ import { Parameters as Shell } from "../../src/tool/shell"
 import { Parameters as Skill } from "../../src/tool/skill"
 import { Parameters as Task } from "../../src/tool/task"
 import { Parameters as Todo } from "../../src/tool/todo"
+import { ExecParameters } from "../../src/tool/unified-exec"
 import { Parameters as WebFetch } from "../../src/tool/webfetch"
 import { Parameters as WebSearch } from "../../src/tool/websearch"
 import { Parameters as Write } from "../../src/tool/write"
@@ -49,6 +50,16 @@ describe("tool parameters", () => {
     test("skill", () => expect(toJsonSchema(Skill)).toMatchSnapshot())
     test("task", () => expect(toJsonSchema(Task)).toMatchSnapshot())
     test("todo", () => expect(toJsonSchema(Todo)).toMatchSnapshot())
+    test("exec_command exposes numeric slot controls without an execution context", () => {
+      expect(toJsonSchema(ExecParameters)).toMatchObject({
+        required: ["cmd"],
+        properties: {
+          lane_id: { type: "integer" },
+          reset_lane: { type: "boolean" },
+        },
+      })
+      expect(toJsonSchema(ExecParameters).properties).not.toHaveProperty("context")
+    })
     test("webfetch", () => expect(toJsonSchema(WebFetch)).toMatchSnapshot())
     test("websearch", () => expect(toJsonSchema(WebSearch)).toMatchSnapshot())
     test("write", () => expect(toJsonSchema(Write)).toMatchSnapshot())
@@ -116,6 +127,24 @@ describe("tool parameters", () => {
     })
     test("rejects missing command", () => {
       expect(accepts(Shell, {})).toBe(false)
+    })
+  })
+
+  describe("exec_command", () => {
+    test("accepts slot and reset controls", () => {
+      expect(parse(ExecParameters, { cmd: "ls", lane_id: 1, reset_lane: true })).toEqual({
+        cmd: "ls",
+        lane_id: 1,
+        reset_lane: true,
+      })
+    })
+    test("accepts the default slot by omission", () => {
+      expect(parse(ExecParameters, { cmd: "ls" })).toEqual({ cmd: "ls" })
+    })
+    test("rejects invalid slot IDs", () => {
+      expect(accepts(ExecParameters, { cmd: "ls", lane_id: -1 })).toBe(false)
+      expect(accepts(ExecParameters, { cmd: "ls", lane_id: 1.5 })).toBe(false)
+      expect(accepts(ExecParameters, { cmd: "ls", lane_id: 8 })).toBe(false)
     })
   })
 

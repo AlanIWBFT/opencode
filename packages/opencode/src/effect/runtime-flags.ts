@@ -51,6 +51,7 @@ export class Service extends ConfigService.Service<Service>()("@opencode/Runtime
   experimentalOxfmt: enabledByExperimental("OPENCODE_EXPERIMENTAL_OXFMT"),
   experimentalPlanMode: Config.succeed(true),
   experimentalCodeMode: bool("OPENCODE_EXPERIMENTAL_CODE_MODE"),
+  experimentalUnifiedExecTool: boolDefaultTrue("OPENCODE_EXPERIMENTAL_UNIFIED_EXEC_TOOL"),
   experimentalEventSystem: enabledByExperimental("OPENCODE_EXPERIMENTAL_EVENT_SYSTEM"),
   experimentalWorkspaces: enabledByExperimental("OPENCODE_EXPERIMENTAL_WORKSPACES"),
   experimentalIconDiscovery: enabledByExperimental("OPENCODE_EXPERIMENTAL_ICON_DISCOVERY"),

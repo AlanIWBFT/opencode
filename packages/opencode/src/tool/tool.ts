@@ -43,6 +43,7 @@ export type Context<M extends Metadata = Metadata> = {
   messages: SessionV1.WithParts[]
   metadata(input: { title?: string; metadata?: M }): Effect.Effect<void>
   ask(input: Omit<PermissionV1.Request, "id" | "sessionID" | "tool">): Effect.Effect<void>
+  registerCleanup?(cleanup: Effect.Effect<unknown, never>): void
 }
 
 export interface ExecuteResult<M extends Metadata = Metadata> {
@@ -50,6 +51,13 @@ export interface ExecuteResult<M extends Metadata = Metadata> {
   metadata: M
   output: string
   attachments?: Omit<SessionV1.FilePart, "id" | "sessionID" | "messageID">[]
+}
+
+export type CodeModeOptions = {
+  concurrency: "parallel" | "serial"
+  group?: string
+  maxConcurrency?: number
+  key?: (input: unknown) => string
 }
 
 export interface Def<
@@ -60,6 +68,7 @@ export interface Def<
   description: string
   parameters: Parameters
   jsonSchema?: JSONSchema7
+  codeMode?: CodeModeOptions
   execute(args: Schema.Schema.Type<Parameters>, ctx: Context): Effect.Effect<ExecuteResult<M>>
   formatValidationError?(error: unknown): string
 }

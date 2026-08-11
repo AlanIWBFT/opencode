@@ -229,6 +229,7 @@ function runningTool(
   callID: string,
   output?: string,
   input: Record<string, unknown> = { cmd: "printf hello" },
+  tool = "bash",
 ) {
   return {
     id: `part_${callID}`,
@@ -236,7 +237,7 @@ function runningTool(
     messageID: `msg_${callID}`,
     type: "tool",
     callID,
-    tool: "bash",
+    tool,
     state: {
       status: "running",
       input,
@@ -601,6 +602,20 @@ describe("acp event routing", () => {
     })
     expect(updates[2]?.update).toMatchObject({ sessionUpdate: "tool_call_update", status: "in_progress" })
     expect("content" in updates[2]!.update).toBe(false)
+  })
+
+  it("streams unified exec output snapshots", async () => {
+    const harness = createHarness()
+    await Effect.runPromise(harness.session.create({ id: "ses_exec", cwd: "/workspace" }))
+
+    await harness.subscription.handle(
+      toolUpdated(runningTool("ses_exec", "call_exec", "partial output", { cmd: "echo ready" }, "exec_command")),
+    )
+
+    expect(toolUpdates(harness.updates)[1]?.update).toMatchObject({
+      sessionUpdate: "tool_call_update",
+      content: [{ type: "content", content: { type: "text", text: "partial output" } }],
+    })
   })
 
   it("clears shell snapshot marker when a tool returns to pending", async () => {

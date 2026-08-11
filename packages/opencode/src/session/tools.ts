@@ -89,12 +89,16 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
         .pipe(Effect.orDie),
   })
 
-  for (const item of yield* registry.tools({
+  const resolved = yield* registry.resolve({
     modelID: ModelV2.ID.make(input.model.api.id),
     providerID: input.model.providerID,
     agent: input.agent,
     permission: input.session.permission,
-  })) {
+    tools: input.messages.findLast(
+      (message): message is SessionV1.WithParts & { info: SessionV1.User } => message.info.role === "user",
+    )?.info.tools,
+  })
+  for (const item of resolved.direct) {
     const schema = ProviderTransform.schema(input.model, ToolJsonSchema.fromTool(item))
     tools[item.id] = tool({
       description: item.description,
@@ -103,6 +107,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
         return run.promise(
           Effect.gen(function* () {
             const ctx = context(args, options)
+            if (item.id === "execute") ctx.extra = { ...ctx.extra, codeModeTools: resolved.nested }
             yield* plugin.trigger(
               "tool.execute.before",
               { tool: item.id, sessionID: ctx.sessionID, callID: ctx.callID },

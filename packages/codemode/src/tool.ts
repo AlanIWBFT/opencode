@@ -38,7 +38,10 @@ export type Definition<R = never> = {
   readonly description: string
   readonly input: SchemaType
   readonly output: SchemaType | undefined
-  readonly run: (input: unknown) => Effect.Effect<unknown, unknown, R>
+  readonly run: (
+    input: unknown,
+    call?: { readonly index: number; readonly name: string },
+  ) => Effect.Effect<unknown, unknown, R>
 }
 
 /** The value `run` receives: the decoded type for Effect Schemas, `unknown` for JSON Schemas. */
@@ -52,7 +55,10 @@ export type Options<I extends SchemaType, O extends SchemaType | undefined, R = 
   readonly description: string
   readonly input: I
   readonly output?: O
-  readonly run: (input: InputType<I>) => Effect.Effect<ResultType<O>, unknown, R>
+  readonly run: (
+    input: InputType<I>,
+    call: { readonly index: number; readonly name: string },
+  ) => Effect.Effect<ResultType<O>, unknown, R>
 }
 
 export const isDefinition = <R = never>(value: unknown): value is Definition<R> =>
@@ -92,5 +98,5 @@ export const make = <I extends SchemaType, const O extends SchemaType | undefine
   description: options.description,
   input: options.input,
   output: options.output,
-  run: (input) => options.run(input as InputType<I>),
+  run: (input, call) => options.run(input as InputType<I>, call ?? { index: -1, name: "" }),
 })

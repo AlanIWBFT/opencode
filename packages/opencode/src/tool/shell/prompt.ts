@@ -7,6 +7,13 @@ import { ShellID } from "./id"
 const PS = new Set(["powershell", "pwsh"])
 const CMD = new Set(["cmd"])
 
+export function recycleBinSafetyNotes(platform: NodeJS.Platform) {
+  if (platform !== "win32") return ""
+  return `- In this tool process, direct filesystem deletion through \`Remove-Item\` or an alias that resolves to it (for example \`rm\`, \`ri\`, \`del\`, \`erase\`, \`rmdir\`, or \`rd\`) is sent to the Recycle Bin.
+   - This safeguard applies only to FileSystem provider items in the configured PowerShell process. It does not apply to providers such as \`env:\` or \`Registry:\`, or to a nested shell or external program.
+   - Do not bypass it with a module-qualified cmdlet, \`cmd /c\`, a nested shell, .NET APIs, or another runtime or deletion utility. If the target cannot be moved to the Recycle Bin, stop and ask the user; never retry with permanent deletion.`
+}
+
 export type Limits = {
   maxLines: number
   maxBytes: number
@@ -40,10 +47,15 @@ function shellDisplayName(name: string) {
   return name
 }
 
-function powershellNotes(name: string) {
+function powershellNotes(name: string, platform: NodeJS.Platform) {
+  const prelude =
+    platform === "win32"
+      ? "\n- PowerShell profiles are not loaded; profile-defined commands and aliases are unavailable.\n- Console input and output use UTF-8."
+      : ""
   if (name === "pwsh") {
     return `# PowerShell (7+) shell notes
 - This cross-platform shell supports pipeline chain operators (\`&&\` and \`||\`).
+${prelude}
 - Use double quotes for interpolated strings (\`"Hello $name"\`), single quotes for verbatim strings.
 - Prefer full cmdlet names like \`Get-ChildItem\`, \`Set-Content\`, \`Remove-Item\`, and \`New-Item\` over aliases.
 - Use \`$(...)\` for subexpressions. Use \`@(...)\` for array expressions.
@@ -53,6 +65,7 @@ function powershellNotes(name: string) {
   if (name === "powershell") {
     return `# Windows PowerShell (5.1) shell notes
 - Use \`cmd1; if ($?) { cmd2 }\` to chain dependent commands.
+${prelude}
 - Use double quotes for interpolated strings (\`"Hello $name"\`), single quotes for verbatim strings.
 - Prefer full cmdlet names like \`Get-ChildItem\`, \`Set-Content\`, \`Remove-Item\`, and \`New-Item\` over aliases.
 - Use \`$(...)\` for subexpressions. Use \`@(...)\` for array expressions.
@@ -122,10 +135,16 @@ function powershellCommandSection(
   name: string,
   chain: string,
   pathSep: string,
+  platform: NodeJS.Platform,
   limits: Limits,
   defaultTimeoutMs: number,
 ) {
-  return `${powershellNotes(name)}
+  const prelude =
+    platform === "win32"
+      ? `   - This invocation is non-interactive and parses the complete command before running it. Do not use \`Read-Host\` or another prompt; if parsing fails, none of the command runs.
+   - A final failing native program's exit code is propagated to the tool result.`
+      : ""
+  return `${powershellNotes(name, platform)}
 
 Before executing the command, please follow these steps:
 
@@ -144,12 +163,13 @@ Before executing the command, please follow these steps:
    - Capture the output of the command.
 
 Usage notes:
-  - The command argument is required.
-  - You can specify an optional timeout in milliseconds. If not specified, commands will time out after ${defaultTimeoutMs}ms.
-  - If the output exceeds ${limits.maxLines} lines or ${limits.maxBytes} bytes, it will be truncated and the full output will be written to a file. You can use Read with offset/limit to read specific sections or Grep to search the full content. Do NOT use \`Select-Object -First\`, \`Select-Object -Last\`, or other truncation commands to limit output; the full output will already be captured to a file for more precise searching.
-  - On Windows, filesystem deletion through \`Remove-Item\`, \`rm\`, \`del\`, \`erase\`, \`rmdir\`, or \`rd\` is routed to the Recycle Bin in this tool process only. If recycling is blocked or unavailable, do not retry with permanent deletion, fully qualified cmdlets, \`cmd /c\`, or external deletion tools; stop and ask the user.
+   - The command argument is required.
+   - You can specify an optional timeout in milliseconds. If not specified, commands will time out after ${defaultTimeoutMs}ms.
+   - If the output exceeds ${limits.maxLines} lines or ${limits.maxBytes} bytes, it will be truncated and the full output will be written to a file. You can use Read with offset/limit to read specific sections or Grep to search the full content. Do NOT use \`Select-Object -First\`, \`Select-Object -Last\`, or other truncation commands to limit output; the full output will already be captured to a file for more precise searching.
+${prelude}
+${recycleBinSafetyNotes(platform) ? `   ${recycleBinSafetyNotes(platform)}` : ""}
 
-  - Avoid using Shell with PowerShell file/content cmdlets unless explicitly instructed or when these cmdlets are truly necessary for the task. Instead, always prefer using the dedicated tools for these commands:
+   - Avoid using Shell with PowerShell file/content cmdlets unless explicitly instructed or when these cmdlets are truly necessary for the task. Instead, always prefer using the dedicated tools for these commands:
     - File search: Use Glob (NOT Get-ChildItem)
     - Content search: Use Grep (NOT Select-String)
     - Read files: Use Read (NOT Get-Content)
@@ -243,6 +263,7 @@ function profile(name: string, platform: NodeJS.Platform, limits: Limits, defaul
         name,
         chain,
         platform === "win32" ? "\\" : "/",
+        platform,
         limits,
         defaultTimeoutMs,
       ),

@@ -112,6 +112,62 @@ function basePart(messageID: string, id: string) {
 }
 
 describe("session.message-v2.toModelMessage", () => {
+  test("omits Code Mode projection tool parts from model history", async () => {
+    const messageID = "m-assistant"
+    const input: SessionV1.WithParts[] = [
+      {
+        info: assistantInfo(messageID, "m-parent"),
+        parts: [
+          {
+            ...basePart(messageID, "projection"),
+            type: "tool",
+            tool: "read",
+            callID: "call_projection",
+            state: {
+              status: "completed",
+              input: { filePath: "src/index.ts" },
+              output: "projected output",
+              title: "src/index.ts",
+              metadata: {},
+              time: { start: 1, end: 2 },
+            },
+            metadata: { codeMode: { parentCallID: "call_execute", runtimeCallID: "0" } },
+          },
+        ] as SessionV1.Part[],
+      },
+    ]
+
+    expect(await MessageV2.toModelMessages(input, model)).toStrictEqual([])
+  })
+
+  test("keeps tool parts with unrelated Code Mode metadata", async () => {
+    const messageID = "m-assistant"
+    const input: SessionV1.WithParts[] = [
+      {
+        info: assistantInfo(messageID, "m-parent"),
+        parts: [
+          {
+            ...basePart(messageID, "tool"),
+            type: "tool",
+            tool: "read",
+            callID: "call_tool",
+            state: {
+              status: "completed",
+              input: { filePath: "src/index.ts" },
+              output: "output",
+              title: "src/index.ts",
+              metadata: {},
+              time: { start: 1, end: 2 },
+            },
+            metadata: { codeMode: { projected: true } },
+          },
+        ] as SessionV1.Part[],
+      },
+    ]
+
+    expect(await MessageV2.toModelMessages(input, model)).toHaveLength(2)
+  })
+
   test("filters out messages with no parts", async () => {
     const input: SessionV1.WithParts[] = [
       {

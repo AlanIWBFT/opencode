@@ -33,6 +33,7 @@ import {
   PromptPayload,
   RevertPayload,
   ShellPayload,
+  StopPayload,
   SummarizePayload,
   UpdatePayload,
 } from "../groups/session"
@@ -232,6 +233,20 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
     const abort = Effect.fn("SessionHttpApi.abort")(function* (ctx: { params: { sessionID: SessionID } }) {
       yield* promptSvc.cancel(ctx.params.sessionID)
       return true
+    })
+
+    const stop = Effect.fn("SessionHttpApi.stop")(function* (ctx: {
+      params: { sessionID: SessionID }
+      payload: typeof StopPayload.Type
+    }) {
+      yield* requireSession(ctx.params.sessionID)
+      const result = yield* SessionError.mapStorageNotFound(
+        promptSvc.stop({ sessionID: ctx.params.sessionID, ...ctx.payload }),
+      ).pipe(Effect.uninterruptible)
+      if (ctx.payload.scope === "reverted-branch" && result.sessions === 0) {
+        return yield* new HttpApiError.BadRequest({})
+      }
+      return result
     })
 
     const init = Effect.fn("SessionHttpApi.init")(function* (ctx: {
@@ -437,6 +452,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       .handle("update", update)
       .handleRaw("fork", forkRaw)
       .handle("abort", abort)
+      .handle("stop", stop)
       .handle("init", init)
       .handle("share", share)
       .handle("unshare", unshare)

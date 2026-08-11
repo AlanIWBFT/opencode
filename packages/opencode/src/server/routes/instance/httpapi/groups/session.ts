@@ -71,6 +71,16 @@ export const PromptPayload = Schema.Struct(Struct.omit(SessionPrompt.PromptInput
 export const CommandPayload = Schema.Struct(Struct.omit(SessionPrompt.CommandInput.fields, ["sessionID"]))
 export const ShellPayload = Schema.Struct(Struct.omit(SessionPrompt.ShellInput.fields, ["sessionID"]))
 export const RevertPayload = Schema.Struct(Struct.omit(SessionRevert.RevertInput.fields, ["sessionID"]))
+export const StopPayload = Schema.Union([
+  Schema.Struct({ scope: Schema.Literal("session-tree") }),
+  Schema.Struct({ scope: Schema.Literal("reverted-branch"), messageID: MessageID }),
+]).annotate({ discriminator: "scope" })
+export const StopResponse = Schema.Struct({
+  sessions: Schema.Int.check(Schema.isGreaterThan(0)),
+  matched: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  terminated: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  failed: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+})
 export const PermissionResponsePayload = Schema.Struct({
   response: PermissionV1.Reply,
 })
@@ -89,6 +99,7 @@ export const SessionPaths = {
   update: `${root}/:sessionID`,
   fork: `${root}/:sessionID/fork`,
   abort: `${root}/:sessionID/abort`,
+  stop: `${root}/:sessionID/stop`,
   share: `${root}/:sessionID/share`,
   init: `${root}/:sessionID/init`,
   summarize: `${root}/:sessionID/summarize`,
@@ -259,7 +270,21 @@ export const SessionApi = HttpApi.make("session")
           OpenApi.annotations({
             identifier: "session.abort",
             summary: "Abort session",
-            description: "Abort an active session and stop any ongoing AI processing or command execution.",
+            description: "Abort active AI processing and tool calls without terminating detached exec command processes.",
+          }),
+        ),
+        HttpApiEndpoint.post("stop", SessionPaths.stop, {
+          params: { sessionID: SessionID },
+          query: WorkspaceRoutingQuery,
+          payload: StopPayload,
+          success: described(StopResponse, "Stopped session execution"),
+          error: [HttpApiError.BadRequest, ApiNotFoundError],
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "session.stop",
+            summary: "Stop session",
+            description:
+              "Stop a user-selected session scope and explicitly terminate matching exec command processes.",
           }),
         ),
         HttpApiEndpoint.post("init", SessionPaths.init, {
