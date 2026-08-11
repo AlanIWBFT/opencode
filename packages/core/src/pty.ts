@@ -42,7 +42,9 @@ export type Info = Types.DeepMutable<typeof Info.Type>
 
 export const CreateInput = Pty.CreateInput
 
-export type CreateInput = Types.DeepMutable<typeof CreateInput.Type>
+export type CreateInput = Types.DeepMutable<typeof CreateInput.Type> & {
+  readonly login?: boolean
+}
 
 export const UpdateInput = Pty.UpdateInput
 
@@ -70,6 +72,19 @@ export type Attachment = {
   readonly detach: () => void
 }
 
+export type ReadInput = {
+  // Absolute output cursor to read from. -1 tails from the current end; omitted reads the retained buffer.
+  readonly cursor?: number
+}
+
+export type ReadOutput = {
+  readonly output: string
+  readonly cursor: number
+  readonly status: Info["status"]
+  readonly exitCode?: number
+  readonly truncated: boolean
+}
+
 export class NotFoundError extends Schema.TaggedError<NotFoundError>()("Pty.NotFoundError", {
   ptyID: ID,
 }) {}
@@ -84,7 +99,9 @@ export interface Interface {
   readonly create: (input: CreateInput) => Effect.Effect<Info>
   readonly update: (id: ID, input: UpdateInput) => Effect.Effect<Info, NotFoundError>
   readonly remove: (id: ID) => Effect.Effect<void, NotFoundError>
-  readonly write: (id: ID, data: string) => Effect.Effect<void, NotFoundError>
+  readonly kill: (id: ID) => Effect.Effect<void, NotFoundError>
+  readonly write: (id: ID, data: string) => Effect.Effect<void, NotFoundError | ExitedError>
+  readonly read: (id: ID, input?: ReadInput) => Effect.Effect<ReadOutput, NotFoundError>
   readonly attach: (id: ID, input: AttachInput) => Effect.Effect<Attachment, NotFoundError | ExitedError>
 }
 
@@ -155,6 +172,30 @@ const layer = Layer.effect(
       yield* removeSession(id)
     })
 
+    function readBuffer(session: Active, cursor: number | undefined) {
+      const start = session.bufferCursor
+      const end = session.cursor
+      const from =
+        cursor === -1
+          ? end
+          : typeof cursor === "number" && Number.isSafeInteger(cursor)
+            ? Math.max(0, cursor)
+            : 0
+      if (!session.buffer || from >= end) {
+        return {
+          output: "",
+          cursor: end,
+          truncated: from < start,
+        }
+      }
+      const offset = Math.max(0, from - start)
+      return {
+        output: offset >= session.buffer.length ? "" : session.buffer.slice(offset),
+        cursor: end,
+        truncated: from < start,
+      }
+    }
+
     const list = Effect.fn("Pty.list")(function* () {
       return Array.from(sessions.values()).map((session) => session.info)
     })
@@ -166,7 +207,7 @@ const layer = Layer.effect(
     const create = Effect.fn("Pty.create")(function* (input: CreateInput) {
       const id = ID.ascending()
       const command = input.command || (yield* shell.resolve({ priority: "config" }))
-      const args = ShellSelect.login(command) ? [...(input.args ?? []), "-l"] : [...(input.args ?? [])]
+      const args = ShellSelect.login(command) && input.login !== false ? [...(input.args ?? []), "-l"] : [...(input.args ?? [])]
       const cwd = input.cwd || location.directory
       const env = {
         ...process.env,
@@ -254,7 +295,22 @@ const layer = Layer.effect(
 
     const write = Effect.fn("Pty.write")(function* (id: ID, data: string) {
       const session = yield* requireSession(id)
-      if (session.info.status === "running") session.process.write(data)
+      if (session.info.status !== "running") return yield* new ExitedError({ ptyID: id })
+      session.process.write(data)
+    })
+
+    const kill = Effect.fn("Pty.kill")(function* (id: ID) {
+      const session = yield* requireSession(id)
+      if (session.info.status === "running") session.process.kill()
+    })
+
+    const read = Effect.fn("Pty.read")(function* (id: ID, input?: ReadInput) {
+      const session = yield* requireSession(id)
+      return {
+        ...readBuffer(session, input?.cursor),
+        status: session.info.status,
+        exitCode: session.info.exitCode,
+      }
     })
 
     const attach = Effect.fn("Pty.attach")(function* (id: ID, input: AttachInput) {
@@ -270,23 +326,10 @@ const layer = Layer.effect(
         pending: [],
       }
       session.subscribers.set(token, subscriber)
-      const start = session.bufferCursor
-      const end = session.cursor
-      const from =
-        input.cursor === -1
-          ? end
-          : typeof input.cursor === "number" && Number.isSafeInteger(input.cursor)
-            ? Math.max(0, input.cursor)
-            : 0
-      const replay = (() => {
-        if (!session.buffer || from >= end) return ""
-        const offset = Math.max(0, from - start)
-        if (offset >= session.buffer.length) return ""
-        return session.buffer.slice(offset)
-      })()
+      const replay = readBuffer(session, input.cursor)
       return {
-        replay,
-        cursor: end,
+        replay: replay.output,
+        cursor: replay.cursor,
         write: (data: string) => {
           if (session.info.status === "running") session.process.write(data)
         },
@@ -310,7 +353,7 @@ const layer = Layer.effect(
       }
     })
 
-    return Service.of({ list, get, create, update, remove, write, attach })
+    return Service.of({ list, get, create, update, remove, kill, write, read, attach })
   }),
 )
 

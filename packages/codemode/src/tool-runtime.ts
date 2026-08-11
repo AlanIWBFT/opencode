@@ -411,12 +411,13 @@ export const make = <R>(
           ),
       })
       yield* Effect.sync(() => recordCall({ name }))
+      const call = { name, input }
       return yield* hooked(
-        { name, input },
+        call,
         hooks["tool.before"],
         hooks["tool.after"],
         Effect.gen(function* () {
-          const raw = yield* Effect.suspend(() => tool.execute(input)).pipe(
+          const raw = yield* Effect.suspend(() => tool.execute(input, call)).pipe(
             Effect.catchCause((cause) => {
               if (Cause.hasInterruptsOnly(cause)) return Effect.interrupt
               return Effect.fail(

@@ -21,6 +21,7 @@ import { SessionEvent } from "./event.js"
 import { SessionMessage } from "./message.js"
 import { SessionProjector } from "./projector.js"
 import { SessionMessageTable, SessionTable } from "./sql.js"
+import { detachExecMetadata } from "./exec-metadata.js"
 
 export const Data = SessionTransfer.Data
 export type Data = SessionTransfer.Data
@@ -75,7 +76,7 @@ const layer = Layer.effect(
         yield* upsertProject(db, project).pipe(Effect.orDie)
         const importedAt = yield* Clock.currentTimeMillis
         const messages = input.data.messages.filter(isSettled).map((message, index) => {
-          const encoded = encodeMessage(message)
+          const encoded = encodeMessage(detachExecMetadata(message))
           const { id: _, type, ...data } = encoded
           return {
             id: message.id,

@@ -1,4 +1,5 @@
 import type { Hooks } from "./registration.js"
+import type { SessionID } from "@opencode/schema/session-id"
 
 export interface ShellCreateBefore {
   command: string
@@ -10,6 +11,13 @@ export interface ShellCreateBefore {
 
 export interface ShellHooks {
   readonly "create.before": ShellCreateBefore
+  /** Persistent-command environment overlay. Changes require a new lane generation. */
+  readonly "exec.env": {
+    readonly cwd: string
+    readonly sessionID: SessionID
+    readonly callID: string
+    env: Record<string, string>
+  }
 }
 
 export interface ShellDomain {

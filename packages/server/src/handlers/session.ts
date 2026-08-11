@@ -274,6 +274,10 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
             yield* session
               .setPermissions({ sessionID: ctx.params.sessionID, permissions: ctx.payload.permissions })
               .pipe(Effect.catchTag("Session.NotFoundError", missingSession))
+          if (ctx.payload.archivedAt !== undefined)
+            yield* session
+              .setArchived({ sessionID: ctx.params.sessionID, archivedAt: ctx.payload.archivedAt })
+              .pipe(Effect.catchTag("Session.NotFoundError", missingSession))
           return HttpApiSchema.NoContent.make()
         }),
       )
@@ -611,6 +615,14 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
         "session.interrupt",
         Effect.fn(function* (ctx) {
           return { interrupted: yield* session.interrupt(ctx.params.sessionID, { resume: ctx.query.resume }) }
+        }),
+      )
+      .handle(
+        "session.stop",
+        Effect.fn(function* (ctx) {
+          return yield* session
+            .stop(ctx.params.sessionID)
+            .pipe(Effect.catchTag("Session.NotFoundError", missingSession))
         }),
       )
       .handle(
