@@ -73,7 +73,10 @@ export const layer = Layer.effect(
       if (prepared.event.result !== undefined) return prepared.event.result
       yield* llm.stream(prepared.request, prepared.options).pipe(
         Stream.runForEach((event) => {
-          if (LLMEvent.is.providerError(event)) failed = true
+          if (LLMEvent.is.providerError(event)) {
+            failed = true
+            return Effect.logWarning("title provider error", { sessionID: input.session.id, model: input.model.ref, error: event.message })
+          }
           if (LLMEvent.is.textDelta(event)) chunks.push(event.text)
           if (LLMEvent.is.stepFinish(event)) {
             const step = SessionUsage.record(event.usage, input.model.cost)
@@ -81,6 +84,7 @@ export const layer = Layer.effect(
           }
           return Effect.void
         }),
+        Effect.tapError((error) => Effect.logWarning("title request failed", { sessionID: input.session.id, model: input.model.ref, error: error.message })),
         Effect.catchTag("AI.Error", () =>
           Effect.sync(() => {
             failed = true
@@ -101,7 +105,10 @@ export const layer = Layer.effect(
       const session = yield* store.get(sessionID)
       if (!session) return
       const firstUser = yield* SessionHistory.firstUserMessage(db, session.id)
-      if (!firstUser) return
+      if (!firstUser) {
+        yield* Effect.logWarning("skipping title generation: no user message", { sessionID })
+        return
+      }
       const text = !isUntitled(session)
         ? yield* store.context(session.id).pipe(
             Effect.map((messages) => {
@@ -125,13 +132,19 @@ export const layer = Layer.effect(
           )
         : firstUser.text
       const selection = yield* context.selectTitle(session)
-      if (!selection) return
+      if (!selection) {
+        yield* Effect.logWarning("skipping title generation: title agent or model unavailable", { sessionID })
+        return
+      }
       const title =
         (yield* attempt({ session, agent: selection.agent, text, model: selection.selected })) ??
         (selection.primary && !isDeepStrictEqual(selection.selected.ref, selection.primary.ref)
           ? yield* attempt({ session, agent: selection.agent, text, model: selection.primary })
           : undefined)
-      if (!title) return
+      if (!title) {
+        yield* Effect.logWarning("skipping title generation: model returned no usable title", { sessionID, model: selection.selected.ref })
+        return
+      }
       const expectedSequence = (yield* Bus.latestSequence(db, sessionID)) + 1
       const current = yield* store.get(sessionID)
       if (!current || current.title !== session.title || current.title === truncate(title)) return
@@ -144,7 +157,10 @@ export const layer = Layer.effect(
           },
           { commit: (sequence) => (sequence === expectedSequence ? Effect.void : Effect.die(titleChanged)) },
         )
-        .pipe(Effect.catchDefect((defect) => (defect === titleChanged ? Effect.void : Effect.die(defect))))
+        .pipe(
+          Effect.tap(() => Effect.logInfo("generated session title", { sessionID })),
+          Effect.catchDefect((defect) => (defect === titleChanged ? Effect.void : Effect.die(defect))),
+        )
     })
     return Service.of({ generate })
   }),
