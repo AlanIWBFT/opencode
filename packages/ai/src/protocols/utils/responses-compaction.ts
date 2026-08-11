@@ -58,7 +58,7 @@ const MessageFields = {
   status: Schema.optional(Schema.String),
   phase: Schema.optional(OpenResponses.MessagePhase),
 }
-const Response = Schema.Struct({
+export const Response = Schema.Struct({
   object: Schema.Literal("response.compaction"),
   output: Schema.Array(
     Schema.Union([
@@ -157,14 +157,18 @@ export const make = (
     if (!result.output.some((item) => item.type === "compaction"))
       return yield* invalid("Compaction response did not contain a checkpoint")
     return new CompactionResponse({
-      replacement: result.output
-        .filter((item): item is Output => item.type !== "message" || item.role !== "developer")
-        .map((item) => toMessage(item, request.model)),
+      replacement: replacement(result.output, request.model),
       usage: OpenResponses.mapUsage(result.usage, OpenResponses.metadataKey(request.model)),
     })
   })
 
 type Output = Exclude<(typeof Response.Type.output)[number], { readonly role: "developer" }>
+
+export function replacement(output: typeof Response.Type.output, model: LLMRequest["model"]): Message[] {
+  return output
+    .filter((item): item is Output => item.type !== "message" || item.role !== "developer")
+    .map((item) => toMessage(item, model))
+}
 
 function toMessage(item: Output, model: LLMRequest["model"]): Message {
   if (item.type === "compaction")

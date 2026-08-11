@@ -145,11 +145,11 @@ describe("SessionLegacy", () => {
         native: { step: true },
         providerContext,
       }),
-    ).toEqual({ status: "completed", summary: "", native: { messages } })
+    ).toEqual({ status: "completed", summary: "", native: { messages, openchamberNativeIdentity: providerContext.provenance } })
     expect(SessionLegacy.event("session.compaction.ended", { reason: "auto", text: "", providerContext })).toEqual({
       reason: "auto",
       text: "",
-      native: { messages },
+      native: { messages, openchamberNativeIdentity: providerContext.provenance },
     })
   })
 

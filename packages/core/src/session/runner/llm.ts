@@ -14,6 +14,7 @@ import { SessionInbox } from "../inbox.js"
 import { SessionBackground } from "../background.js"
 import { Job } from "../../job.js"
 import { SessionHistory } from "../history.js"
+import { SessionNativeIdentity } from "../native-identity.js"
 import { SessionModelRequest } from "../model-request.js"
 import { SessionModelTransport } from "../model-transport.js"
 import { SessionMessage } from "../message.js"
@@ -139,7 +140,7 @@ const layer = Layer.effect(
                       agent: selected.agent.id,
                     })
                     // Preview updates without admitting them after the already-delivered compaction marker.
-                    const history = yield* SessionHistory.preview(db, sessionID, selected.instructions, model.ref)
+                    const history = yield* SessionHistory.preview(db, sessionID, selected.instructions, SessionNativeIdentity.target(model))
                     return yield* compaction.compact({
                       reason: "manual",
                       inputID: pending.id,
