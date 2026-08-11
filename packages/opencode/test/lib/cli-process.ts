@@ -31,7 +31,7 @@ import { testProviderConfig } from "./test-provider"
 import { it } from "./effect"
 
 const opencodeRoot = path.resolve(import.meta.dir, "../../")
-const cliEntry = path.join(opencodeRoot, "src/index.ts")
+const cliEntry = path.join(opencodeRoot, "src/bootstrap.ts")
 
 export const testModelID = "test/test-model"
 
@@ -103,7 +103,7 @@ export type RunOpts = SpawnOpts & {
   readonly extraArgs?: string[]
 }
 
-// `opencode serve` is a long-lived process — it never exits on its own.
+// `opencode serve` is a long-lived process unless its private shutdown protocol is enabled.
 // `serve(opts)` therefore returns a handle inside the caller's Scope: the
 // subprocess is killed when the scope closes (test end), and the URL the
 // server actually bound to (port 0 means OS-assigned) is parsed off stdout.
@@ -126,6 +126,8 @@ export type ServeHandle = {
   // Sends SIGTERM. The scope finalizer also calls this, so tests rarely need
   // to invoke it directly — useful for tests that assert exit behavior.
   readonly kill: () => void
+  // Sends the private versioned shutdown message and closes stdin.
+  readonly shutdown: () => void
   // Resolves with the exit code once the process exits. Bun returns a number.
   readonly exited: Promise<number>
 }
@@ -319,14 +321,13 @@ export function withCliFixture<A, E>(
       if (opts?.hostname) argv.push("--hostname", opts.hostname)
       if (opts?.extraArgs) argv.push(...opts.extraArgs)
 
-      // Acquire the subprocess; release sends SIGTERM and awaits exit on
-      // scope close. Wrapped in Effect.ignore so a flaky kill doesn't surface
-      // as a finalizer error during test teardown.
+      // Acquire the subprocess; the scope finalizer terminates it.
       const proc = yield* Effect.acquireRelease(
         Effect.sync(() =>
           Bun.spawn(["bun", "run", cliEntry, ...argv], {
             cwd: home,
             env: { ...process.env, ...env, ...opts?.env },
+            stdin: "pipe",
             stdout: "pipe",
             stderr: "pipe",
           }),
@@ -380,6 +381,10 @@ export function withCliFixture<A, E>(
         port: match.port,
         kill: () => {
           proc.kill()
+        },
+        shutdown: () => {
+          proc.stdin.write(`${JSON.stringify({ version: 1, type: "shutdown" })}\n`)
+          proc.stdin.end()
         },
         exited: proc.exited as Promise<number>,
       } satisfies ServeHandle

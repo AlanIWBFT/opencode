@@ -8,7 +8,9 @@
 import { describe, expect } from "bun:test"
 import { Effect } from "effect"
 import { HttpClient } from "effect/unstable/http"
+import { Database } from "bun:sqlite"
 import { cliIt } from "../../lib/cli-process"
+import path from "node:path"
 
 describe("opencode serve (subprocess)", () => {
   // Smoke test: server starts, binds a port, and /global/health responds.
@@ -55,6 +57,35 @@ describe("opencode serve (subprocess)", () => {
         // (typically 143 on POSIX). We just require resolution within a sane
         // window — anything else means the kill didn't take.
         expect(typeof code === "number" || code === null).toBe(true)
+      }),
+    60_000,
+  )
+
+  cliIt.live(
+    "shuts down gracefully and checkpoints SQLite",
+    ({ opencode, home }) =>
+      Effect.gen(function* () {
+        const db = path.join(home, "managed.db")
+        const server = yield* opencode.serve({
+          env: {
+            OPENCODE_DB: db,
+            OPENCHAMBER_SHUTDOWN_PROTOCOL: "1",
+          },
+        })
+        expect(yield* Effect.promise(() => Bun.file(`${db}-wal`).exists())).toBe(true)
+
+        server.shutdown()
+        expect(yield* Effect.promise(() => server.exited)).toBe(0)
+        expect(yield* Effect.promise(() => Bun.file(`${db}-wal`).exists())).toBe(false)
+        expect(yield* Effect.promise(() => Bun.file(`${db}-shm`).exists())).toBe(false)
+        const reopened = new Database(db, { create: false, readonly: true })
+        try {
+          expect(reopened.query<{ count: number }, []>("SELECT count(*) AS count FROM session").get()).toEqual({
+            count: 0,
+          })
+        } finally {
+          reopened.close()
+        }
       }),
     60_000,
   )

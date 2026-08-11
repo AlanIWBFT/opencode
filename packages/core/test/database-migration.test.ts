@@ -113,6 +113,7 @@ describe("DatabaseMigration", () => {
         { concurrency: "unbounded" },
       ),
     )
+
   })
   if (process.platform === "linux") {
     test("declared schema has no ungenerated migrations", async () => {
