@@ -9,11 +9,6 @@ import type { Transport, TransportRuntime } from "./transport"
 import { WebSocketExecutor } from "./transport"
 import type { Protocol } from "./protocol"
 import { applyCachePolicy } from "../cache-policy"
-import { OpenAIResponsesCompact } from "../protocols/openai-responses-compact"
-import type {
-  Output as OpenAIResponsesCompactOutput,
-  Result as OpenAIResponsesCompactResult,
-} from "../protocols/openai-responses-compact"
 import * as ProviderShared from "../protocols/shared"
 import type { LLMError, LLMEvent, PreparedRequestOf, ProtocolID, ProviderOptions } from "../schema"
 import {
@@ -155,8 +150,6 @@ export interface Interface {
    * route the request will resolve to.
    */
   readonly prepare: <Body = unknown>(request: LLMRequest) => Effect.Effect<PreparedRequestOf<Body>, LLMError>
-  readonly compact: (request: LLMRequest) => Effect.Effect<OpenAIResponsesCompactOutput, LLMError>
-  readonly compactWithInput: (request: LLMRequest) => Effect.Effect<OpenAIResponsesCompactResult, LLMError>
   readonly stream: StreamMethod
   readonly generate: GenerateMethod
 }
@@ -378,19 +371,6 @@ const prepareWith = Effect.fn("LLMClient.prepare")(function* (request: LLMReques
   })
 })
 
-const compactWith = (executor: RequestExecutor.Interface) =>
-  Effect.fn("LLM.compact")(function* (request: LLMRequest) {
-    return (yield* compactWithInputWith(executor)(request)).output
-  })
-
-const compactWithInputWith = (executor: RequestExecutor.Interface) =>
-  Effect.fn("LLM.compactWithInput")(function* (request: LLMRequest) {
-    const compiled = yield* compile(request)
-    if (!OpenAIResponsesCompact.supports(compiled))
-      return yield* ProviderShared.invalidRequest("LLM.compact is only supported for OpenAI Responses requests")
-    return yield* OpenAIResponsesCompact.compactWithInput({ compiled, executor })
-  })
-
 const streamRequestWith = (runtime: TransportRuntime) => (request: LLMRequest) =>
   Stream.unwrap(
     Effect.gen(function* () {
@@ -412,18 +392,6 @@ const generateWith = (stream: Interface["stream"]) =>
 
 export const prepare = <Body = unknown>(request: LLMRequest) =>
   prepareWith(request) as Effect.Effect<PreparedRequestOf<Body>, LLMError>
-
-export function compact(request: LLMRequest): Effect.Effect<OpenAIResponsesCompactOutput, LLMError> {
-  return Effect.gen(function* () {
-    return yield* (yield* Service).compact(request)
-  }) as Effect.Effect<OpenAIResponsesCompactOutput, LLMError>
-}
-
-export function compactWithInput(request: LLMRequest): Effect.Effect<OpenAIResponsesCompactResult, LLMError> {
-  return Effect.gen(function* () {
-    return yield* (yield* Service).compactWithInput(request)
-  }) as Effect.Effect<OpenAIResponsesCompactResult, LLMError>
-}
 
 export function stream(request: LLMRequest): Stream.Stream<LLMEvent, LLMError> {
   return Stream.unwrap(
@@ -450,15 +418,12 @@ export const layer: Layer.Layer<Service, never, RequestExecutor.Service> = Layer
   Service,
   Effect.gen(function* () {
     const executor = yield* RequestExecutor.Service
-    const compactWithInput = compactWithInputWith(executor)
     const stream = streamRequestWith({
       http: executor,
       webSocket: Option.getOrUndefined(yield* Effect.serviceOption(WebSocketExecutor.Service)),
     })
     return Service.of({
       prepare: prepareWith as Interface["prepare"],
-      compact: compactWith(executor),
-      compactWithInput,
       stream,
       generate: generateWith(stream),
     })
@@ -471,8 +436,6 @@ export const LLMClient = {
   Service,
   layer,
   prepare,
-  compact,
-  compactWithInput,
   stream,
   generate,
 } as const

@@ -123,7 +123,7 @@ export const checkpointMetadata = (message: SessionV1.WithParts | undefined) => 
     .find((item) => item !== undefined)
 }
 
-export const findCheckpoint = (messages: readonly SessionV1.WithParts[]): Checkpoint | undefined => {
+function checkpointCandidates(messages: readonly SessionV1.WithParts[]) {
   const markers = new Map(
     messages.flatMap((message) => {
       if (message.info.role !== "user") return []
@@ -132,8 +132,7 @@ export const findCheckpoint = (messages: readonly SessionV1.WithParts[]): Checkp
     }),
   )
   return messages
-    .toReversed()
-    .flatMap((message): Checkpoint[] => {
+    .flatMap((message): { checkpoint: Checkpoint; seq: number }[] => {
       if (message.info.role !== "assistant") return []
       const marker = markers.get(message.info.parentID)
       if (!marker) return []
@@ -141,34 +140,49 @@ export const findCheckpoint = (messages: readonly SessionV1.WithParts[]): Checkp
       if (!decoded) return []
       return [
         {
-          markerID: message.info.parentID,
-          summaryID: message.info.id,
-          auto: marker.auto,
-          tailStartID: marker.tail_start_id,
-          lock: decoded[LOCK_KEY],
-          window: decoded[WINDOW_KEY],
+          checkpoint: {
+            markerID: message.info.parentID,
+            summaryID: message.info.id,
+            auto: marker.auto,
+            tailStartID: marker.tail_start_id,
+            lock: decoded[LOCK_KEY],
+            window: decoded[WINDOW_KEY],
+          },
+          seq: sequence(message),
         },
       ]
-    })[0]
+    })
+    .toSorted((a, b) => b.seq - a.seq)
 }
 
+export const findCheckpoint = (messages: readonly SessionV1.WithParts[]): Checkpoint | undefined =>
+  checkpointCandidates(messages)[0]?.checkpoint
+
 export const replayMessages = (messages: readonly SessionV1.WithParts[]) => {
-  const checkpoint = findCheckpoint(messages)
-  if (!checkpoint) return { messages: [...messages], checkpoint: undefined }
-  const replayStartID = checkpoint.tailStartID ?? checkpoint.markerID
+  const candidates = checkpointCandidates(messages)
+  const checkpoint = candidates[0]?.checkpoint
+  if (!checkpoint) return { messages: [...messages], checkpoint }
+  const marker = messages.find((message) => message.info.id === checkpoint.markerID)
+  if (!marker) throw new Error(`OpenAI native compaction marker missing: ${checkpoint.markerID}`)
+  const replayStart = checkpoint.tailStartID
+    ? (messages.find((message) => message.info.id === checkpoint.tailStartID) ?? marker)
+    : marker
+  const replayStartSequence = sequence(replayStart)
+  const internal = new Set([
+    ...candidates.map((candidate) => candidate.checkpoint.markerID),
+    ...messages.flatMap((message) => (checkpointMetadata(message) ? [message.info.id] : [])),
+  ])
   return {
     checkpoint,
-    messages: messages.filter(
-      (message) =>
-        message.info.id !== checkpoint.markerID &&
-        message.info.id !== checkpoint.summaryID &&
-        message.info.id >= replayStartID,
-    ),
+    messages: messages.filter((message) => !internal.has(message.info.id) && sequence(message) >= replayStartSequence),
   }
 }
 
-export const normalizeOutput = (output: readonly Record<string, unknown>[]) =>
-  output.filter((item): item is Record<string, unknown> => isRecord(item))
+function sequence(message: SessionV1.WithParts) {
+  if (!("seq" in message.info) || typeof message.info.seq !== "number")
+    throw new Error(`Message sequence missing: ${message.info.id}`)
+  return message.info.seq
+}
 
 export const buildReplacementWindow = (input: {
   readonly compactInput: readonly unknown[]

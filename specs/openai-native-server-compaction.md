@@ -1,4 +1,10 @@
-# OpenAI Native Server-Side Compaction Plan
+# Historical: OpenAI Native Server-Side Compaction Plan
+
+> Historical design note. The `/responses/compact` route and the native
+> `@opencode-ai/llm` compact API described below were removed after the
+> explicit compaction implementation moved into the OpenAI AI SDK adapter.
+> See `openai-native-codex-parity-compaction.md` for the retained checkpoint
+> and replay design.
 
 ## 背景
 

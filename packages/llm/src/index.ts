@@ -8,10 +8,6 @@ export type {
   Interface as LLMClientShape,
   Service as LLMClientService,
 } from "./route/client"
-export type {
-  Output as OpenAIResponsesCompactOutput,
-  Result as OpenAIResponsesCompactResult,
-} from "./protocols/openai-responses-compact"
 export * from "./schema"
 export { Tool, ToolFailure, toDefinitions } from "./tool"
 export { ToolRuntime } from "./tool-runtime"

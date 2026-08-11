@@ -66,17 +66,6 @@ const OpenAIResponsesItemReference = Schema.Struct({
   id: Schema.String,
 })
 
-const OpenAIResponsesCompactionItem = Schema.Struct({
-  type: Schema.tag("compaction"),
-  id: Schema.optionalKey(Schema.String),
-  encrypted_content: Schema.String,
-  internal_chat_message_metadata_passthrough: Schema.optional(Schema.Unknown),
-})
-
-const OpenAIResponsesCompactionTrigger = Schema.Struct({
-  type: Schema.tag("compaction_trigger"),
-})
-
 // `function_call_output.output` accepts either a plain string or an ordered
 // array of content items so tools can return images in addition to text.
 // https://platform.openai.com/docs/api-reference/responses/object
@@ -93,8 +82,6 @@ const OpenAIResponsesInputItem = Schema.Union([
   Schema.Struct({ role: Schema.tag("assistant"), content: Schema.Array(OpenAIResponsesOutputText) }),
   OpenAIResponsesReasoningItem,
   OpenAIResponsesItemReference,
-  OpenAIResponsesCompactionItem,
-  OpenAIResponsesCompactionTrigger,
   Schema.Struct({
     type: Schema.tag("function_call"),
     call_id: Schema.String,
@@ -108,16 +95,6 @@ const OpenAIResponsesInputItem = Schema.Union([
   }),
 ])
 type OpenAIResponsesInputItem = Schema.Schema.Type<typeof OpenAIResponsesInputItem>
-
-const replayInputItems = (request: LLMRequest): OpenAIResponsesInputItem[] => {
-  const value = request.providerOptions?.openai?.responsesReplayInput
-  if (!Array.isArray(value)) return []
-  const decode = Schema.decodeUnknownOption(OpenAIResponsesInputItem)
-  return value.flatMap((item) => {
-    const parsed = decode(item)
-    return parsed._tag === "Some" ? [parsed.value] : []
-  })
-}
 
 // Mutable counterpart of the schema reasoning item so `lowerMessages` can fold
 // multiple streamed summary parts into the same item before flushing.
@@ -375,7 +352,7 @@ const lowerToolResultOutput = Effect.fn("OpenAIResponses.lowerToolResultOutput")
 const lowerMessages = Effect.fn("OpenAIResponses.lowerMessages")(function* (request: LLMRequest) {
   const system: OpenAIResponsesInputItem[] =
     request.system.length === 0 ? [] : [{ role: "system", content: ProviderShared.joinText(request.system) }]
-  const input: OpenAIResponsesInputItem[] = [...system, ...replayInputItems(request)]
+  const input: OpenAIResponsesInputItem[] = [...system]
   const store = OpenAIOptions.store(request)
 
   for (const message of request.messages) {
@@ -963,7 +940,7 @@ const providerError = (event: OpenAIResponsesEvent, fallback: string) => {
   const message = providerErrorMessage(event, fallback)
   return LLMEvent.providerError({
     message,
-    classification: code === "context_length_exceeded" || isContextOverflow(message) ? "context-overflow" : undefined,
+    ...(code === "context_length_exceeded" || isContextOverflow(message) ? { classification: "context-overflow" as const } : {}),
   })
 }
 

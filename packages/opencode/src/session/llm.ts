@@ -4,10 +4,10 @@ import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { Provider } from "@/provider/provider"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
-import { Context, Effect, Layer } from "effect"
+import { Context, Effect, Exit, Layer, Result } from "effect"
 import * as Stream from "effect/Stream"
 import { streamText, wrapLanguageModel, type ModelMessage, type Tool } from "ai"
-import type { LLMEvent, OpenAIResponsesCompactResult } from "@opencode-ai/llm"
+import type { LLMEvent } from "@opencode-ai/llm"
 import { LLMClient } from "@opencode-ai/llm/route"
 import type { LLMClientService } from "@opencode-ai/llm/route"
 import { GitLabWorkflowLanguageModel } from "gitlab-ai-provider"
@@ -27,11 +27,15 @@ import { RuntimeFlags } from "@/effect/runtime-flags"
 import * as Option from "effect/Option"
 import * as OtelTracer from "@effect/opentelemetry/Tracer"
 import { LLMAISDK } from "./llm/ai-sdk"
+import type { ExplicitCompactionResult } from "./llm/ai-sdk"
 import { LLMNativeRuntime, type TurnState } from "./llm/native-runtime"
 import { LLMRequestPrep } from "./llm/request"
 import { OpenAINativeCompaction } from "./openai-native-compaction"
 
 export const OUTPUT_TOKEN_MAX = ProviderTransform.OUTPUT_TOKEN_MAX
+
+const CODEX_BETA_FEATURES_HEADER = "x-codex-beta-features"
+const REMOTE_COMPACTION_V2_FEATURE = "remote_compaction_v2"
 
 export type StreamInput = {
   user: SessionV1.User
@@ -56,7 +60,7 @@ export type StreamRequest = StreamInput & {
 
 export interface Interface {
   readonly stream: (input: StreamInput) => Stream.Stream<LLMEvent, unknown>
-  readonly compact: (input: StreamInput) => Effect.Effect<OpenAIResponsesCompactResult, unknown>
+  readonly compact: (input: StreamInput) => Effect.Effect<ExplicitCompactionResult, unknown>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/LLM") {}
@@ -115,6 +119,8 @@ const live: Layer.Layer<
         flags,
         isWorkflow,
       })
+      if (input.nativeCompactionWindow && !OpenAINativeCompaction.supportsModel(input.model))
+        return yield* Effect.fail(new Error("OpenAI Responses compaction replay requires the official OpenAI provider"))
 
       // Wire up toolExecutor for DWS workflow models so that tool calls
       // from the workflow service are executed via opencode's tool system
@@ -227,7 +233,7 @@ const live: Layer.Layer<
 
       // Runtime seam: native is an opt-in adapter over @opencode-ai/llm. It
       // either returns a ready LLMEvent stream or a concrete fallback reason.
-      if (flags.experimentalNativeLlm || input.nativeCompactionWindow) {
+      if (flags.experimentalNativeLlm && !input.nativeCompactionWindow) {
         const native = LLMNativeRuntime.stream({
           model: input.model,
           provider: item,
@@ -241,9 +247,10 @@ const live: Layer.Layer<
           topK: prepared.params.topK,
           maxOutputTokens: prepared.params.maxOutputTokens,
           providerOptions: prepared.params.options,
-          headers: prepared.headers,
+          headers: OpenAINativeCompaction.supportsModel(input.model)
+            ? withRemoteCompactionV2(prepared.headers)
+            : prepared.headers,
           abort: input.abort,
-          nativeCompactionWindow: input.nativeCompactionWindow,
           turnState: input.turnState,
         })
         if (native.type === "supported") {
@@ -256,11 +263,6 @@ const live: Layer.Layer<
             type: "native" as const,
             stream: native.stream,
           }
-        }
-        if (input.nativeCompactionWindow) {
-          return yield* Effect.fail(
-            new Error(`Native LLM runtime required for OpenAI native compaction replay: ${native.reason}`),
-          )
         }
         yield* Effect.logInfo("llm runtime selected", {
           "llm.runtime": "ai-sdk",
@@ -290,6 +292,19 @@ const live: Layer.Layer<
       }
       // Default runtime path: AI SDK owns provider execution and tool dispatch;
       // LLMAISDK.toLLMEvents below normalizes fullStream parts for the processor.
+      const providerOptions = ProviderTransform.providerOptions(input.model, {
+        ...prepared.params.options,
+        ...(input.nativeCompactionWindow
+          ? {
+              opencode: {
+                version: 1,
+                instructions: prepared.system.join("\n"),
+                replayInput: input.nativeCompactionWindow.output,
+              },
+            }
+          : {}),
+      })
+
       return {
         type: "ai-sdk" as const,
         result: streamText({
@@ -330,15 +345,20 @@ const live: Layer.Layer<
           temperature: prepared.params.temperature,
           topP: prepared.params.topP,
           topK: prepared.params.topK,
-          providerOptions: ProviderTransform.providerOptions(input.model, prepared.params.options),
+          providerOptions,
           activeTools: Object.keys(prepared.tools).filter((x) => x !== "invalid"),
           tools: prepared.tools,
           toolChoice: input.toolChoice,
           maxOutputTokens: prepared.params.maxOutputTokens,
           abortSignal: input.abort,
-          headers,
+          headers: OpenAINativeCompaction.supportsModel(input.model) ? withRemoteCompactionV2(headers) : headers,
           maxRetries: input.retries ?? 0,
-          messages: prepared.messages,
+          // OpenAI OAuth carries the system prompt in `instructions`. Give AI SDK
+          // a message to validate; the private provider contract removes it from input.
+          messages:
+            input.nativeCompactionWindow && prepared.messages.length === 0
+              ? [{ role: "system", content: prepared.system.join("\n") }]
+              : prepared.messages,
           model: wrapLanguageModel({
             model: language,
             middleware: [
@@ -372,8 +392,12 @@ const live: Layer.Layer<
     })
 
     const compact: Interface["compact"] = Effect.fn("LLM.compact")(function* (input) {
-      const [item, info] = yield* Effect.all(
-        [provider.getProvider(input.model.providerID), auth.get(input.model.providerID)],
+      const [language, item, info] = yield* Effect.all(
+        [
+          provider.getLanguage(input.model),
+          provider.getProvider(input.model.providerID),
+          auth.get(input.model.providerID),
+        ],
         { concurrency: "unbounded" },
       )
       const prepared = yield* LLMRequestPrep.prepare({
@@ -384,25 +408,90 @@ const live: Layer.Layer<
         flags,
         isWorkflow: false,
       })
-      const result = yield* LLMNativeRuntime.compact({
-        model: input.model,
-        provider: item,
-        auth: info,
-        llmClient,
-        messages: prepared.messages,
-        tools: prepared.tools,
-        temperature: prepared.params.temperature,
-        topP: prepared.params.topP,
-        topK: prepared.params.topK,
-        maxOutputTokens: prepared.params.maxOutputTokens,
-        providerOptions: prepared.params.options,
-        headers: prepared.headers,
-        nativeCompactionWindow: input.nativeCompactionWindow,
-        turnState: input.turnState,
+      if (!OpenAINativeCompaction.supportsModel(input.model))
+        return yield* Effect.fail(
+          new Error("OpenAI Responses explicit compaction requires the official OpenAI provider"),
+        )
+
+      // The hidden compaction agent prompt belongs to text-summary fallback, not opaque compaction.
+      const options = { ...prepared.params.options }
+      delete options.instructions
+      const bridge = yield* EffectBridge.make()
+      const attempt = Effect.fnUntraced(function* () {
+        const compactResult = yield* Effect.tryPromise({
+          try: (abortSignal) => {
+            const result = streamText({
+              includeRawChunks: true,
+              onError(error) {
+                bridge.fork(Effect.logError("explicit compaction stream error", { error }))
+              },
+              temperature: prepared.params.temperature,
+              topP: prepared.params.topP,
+              topK: prepared.params.topK,
+              providerOptions: ProviderTransform.providerOptions(input.model, {
+                ...options,
+                opencode: {
+                  version: 1,
+                  explicitCompaction: true,
+                  ...(input.nativeCompactionWindow ? { replayInput: input.nativeCompactionWindow.output } : {}),
+                },
+              }),
+              tools: {},
+              maxOutputTokens: prepared.params.maxOutputTokens,
+              headers: withRemoteCompactionV2({
+                ...prepared.headers,
+                ...LLMNativeRuntime.withTurnStateHeaders({ model: input.model, turnState: input.turnState }),
+              }),
+              maxRetries: 0,
+              messages: prepared.messages.filter((message) => message.role !== "system"),
+              model: wrapLanguageModel({
+                model: language,
+                middleware: [
+                  {
+                    specificationVersion: "v3" as const,
+                    async transformParams(args) {
+                      if (args.type === "stream") {
+                        // @ts-expect-error
+                        args.params.prompt = ProviderTransform.message(
+                          args.params.prompt,
+                          input.model,
+                          prepared.messageTransformOptions,
+                        )
+                      }
+                      return args.params
+                    },
+                  },
+                ],
+              }),
+              abortSignal,
+            })
+            return LLMAISDK.collectExplicitCompaction(result, (metadata) =>
+              LLMNativeRuntime.captureTurnState(input.turnState, metadata),
+            )
+          },
+          catch: (error) =>
+            error instanceof LLMAISDK.ExplicitCompactionError
+              ? error
+              : new LLMAISDK.ExplicitCompactionError({
+                  message: "OpenAI Responses explicit compaction stream failed",
+                  retryable: false,
+                  cause: error,
+                }),
+        })
+        LLMNativeRuntime.captureTurnState(input.turnState, compactResult.providerMetadata)
+        return compactResult
       })
-      if (result.type === "supported")
-        return { output: result.output, input: result.input, providerMetadata: result.providerMetadata }
-      return yield* Effect.fail(new Error(`OpenAI native compaction unavailable: ${result.reason}`))
+
+      for (let retry = 0; ; retry++) {
+        const exit = yield* attempt().pipe(Effect.exit)
+        if (exit._tag === "Success") return exit.value
+        const found = Exit.findError(exit)
+        const failure = Result.isSuccess(found) ? found.success : undefined
+        if (!(failure instanceof LLMAISDK.ExplicitCompactionError) || !failure.retryable || retry >= 2)
+          return yield* Effect.failCause(exit.cause)
+        const delay = failure.retryAfterMs ?? 200 * 2 ** retry
+        yield* Effect.sleep(`${delay} millis`)
+      }
     })
 
     const stream: Interface["stream"] = (input) =>
@@ -437,6 +526,19 @@ const live: Layer.Layer<
 )
 
 export const hasToolCalls = LLMRequestPrep.hasToolCalls
+
+function withRemoteCompactionV2(headers: Record<string, string>) {
+  const current = Object.entries(headers).find(([key]) => key.toLowerCase() === CODEX_BETA_FEATURES_HEADER)
+  const features = (current?.[1] ?? "")
+    .split(",")
+    .map((feature) => feature.trim())
+    .filter(Boolean)
+  if (!features.includes(REMOTE_COMPACTION_V2_FEATURE)) features.push(REMOTE_COMPACTION_V2_FEATURE)
+  return {
+    ...Object.fromEntries(Object.entries(headers).filter(([key]) => key.toLowerCase() !== CODEX_BETA_FEATURES_HEADER)),
+    [current?.[0] ?? CODEX_BETA_FEATURES_HEADER]: features.join(","),
+  }
+}
 
 export const node = LayerNode.make({
   service: Service,

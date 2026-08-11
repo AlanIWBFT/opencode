@@ -171,6 +171,33 @@ describe("plugin.openai.ws-pool", () => {
     fetch.close()
   })
 
+  test("reuses a websocket negotiated for remote compaction", async () => {
+    let connections = 0
+    let betaFeatures: string | undefined
+    const bodies: Record<string, unknown>[] = []
+    await using server = await createWebSocketServer((socket, request) => {
+      connections += 1
+      const header = request.headers["x-codex-beta-features"]
+      betaFeatures = Array.isArray(header) ? header.join(",") : header
+      socket.on("message", (data) => {
+        bodies.push(JSON.parse(data.toString()))
+        socket.send(JSON.stringify({ type: "response.completed", response: { id: `resp_${bodies.length}` } }))
+      })
+    })
+    const fetch = OpenAIWebSocketPool.createWebSocketFetch({ url: server.url })
+    const headers = { "x-codex-beta-features": "remote_compaction_v2" }
+
+    const first = await fetch(server.url, streamRequest(headers))
+    expect(await first.text()).toContain("data: [DONE]")
+    const second = await fetch(server.url, streamRequest(headers, undefined, [{ type: "compaction_trigger" }]))
+    expect(await second.text()).toContain("data: [DONE]")
+
+    expect(betaFeatures).toBe("remote_compaction_v2")
+    expect(connections).toBe(1)
+    expect(bodies[1]?.input).toEqual([{ type: "compaction_trigger" }])
+    fetch.close()
+  })
+
   test("replays turn state through websocket client metadata", async () => {
     const bodies: unknown[] = []
     await using server = await createWebSocketServer((socket) => {
@@ -875,7 +902,7 @@ describe("plugin.openai.ws-pool", () => {
   })
 })
 
-function streamRequest(headers?: Record<string, string>, signal?: AbortSignal): RequestInit {
+function streamRequest(headers?: Record<string, string>, signal?: AbortSignal, input: unknown = "hi"): RequestInit {
   return {
     method: "POST",
     headers: {
@@ -883,7 +910,7 @@ function streamRequest(headers?: Record<string, string>, signal?: AbortSignal): 
       authorization: "Bearer test",
       ...headers,
     },
-    body: JSON.stringify({ stream: true, input: "hi" }),
+    body: JSON.stringify({ stream: true, input }),
     signal,
   }
 }

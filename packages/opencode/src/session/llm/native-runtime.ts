@@ -18,7 +18,6 @@ import {
   type ProviderMetadata,
 } from "@opencode-ai/llm"
 import type { LLMClientShape } from "@opencode-ai/llm/route"
-import { OpenAINativeCompaction } from "../openai-native-compaction"
 import { LLMNative } from "./native-request"
 
 export type RuntimeStatus =
@@ -47,12 +46,7 @@ type StreamInput = {
   readonly providerOptions?: Record<string, any>
   readonly headers: Record<string, string>
   readonly abort: AbortSignal
-  readonly nativeCompactionWindow?: OpenAINativeCompaction.Window
   readonly turnState?: TurnState
-}
-
-type CompactInput = Omit<StreamInput, "tools" | "toolChoice" | "abort"> & {
-  readonly tools?: Record<string, Tool>
 }
 
 type RequestInput = Pick<
@@ -97,8 +91,6 @@ function statusWithFetch(
 
 export function stream(input: StreamInput): StreamResult {
   const fetch = providerFetch(input)
-  if (input.nativeCompactionWindow && !OpenAINativeCompaction.supportsModel(input.model))
-    return { type: "unsupported", reason: "native compaction replay requires OpenAI Responses" }
   const current = statusWithFetch(input, fetch)
   if (current.type === "unsupported") return current
 
@@ -117,15 +109,12 @@ export function stream(input: StreamInput): StreamResult {
   const stream = Stream.scoped(
     Stream.unwrap(
       Effect.gen(function* () {
-        const request = input.nativeCompactionWindow
-          ? applyNativeReplayWindow(baseRequest, input.nativeCompactionWindow)
-          : baseRequest
         const settlements = yield* FiberSet.make<void>()
         const results = yield* Queue.unbounded<LLMEvent, Cause.Done>()
         const provider = input.llmClient
           .stream(
-            LLMRequest.update(request, {
-              tools: [...request.tools, ...toDefinitions(tools)],
+            LLMRequest.update(baseRequest, {
+              tools: [...baseRequest.tools, ...toDefinitions(tools)],
             }),
           )
           .pipe(
@@ -162,33 +151,6 @@ export function stream(input: StreamInput): StreamResult {
     stream: fetch ? stream.pipe(Stream.provideService(FetchHttpClient.Fetch, fetch)) : stream,
   }
 }
-
-export const compact = Effect.fn("LLMNativeRuntime.compact")(function* (input: CompactInput) {
-  if (!OpenAINativeCompaction.supportsModel(input.model))
-    return { type: "unsupported" as const, reason: "native compaction requires OpenAI Responses" }
-  const fetch = providerFetch(input)
-  const current = statusWithFetch(input, fetch)
-  if (current.type === "unsupported") return current
-  const providerOptions = compactProviderOptions(input.providerOptions)
-  const baseRequest = buildRequest({
-    ...input,
-    apiKey: current.apiKey,
-    baseURL: current.baseURL,
-    messages: compactMessages(input.messages),
-    providerOptions,
-  })
-  const request = Effect.gen(function* () {
-    const compactRequest = input.nativeCompactionWindow
-      ? applyNativeReplayWindow(baseRequest, input.nativeCompactionWindow)
-      : baseRequest
-    return yield* input.llmClient.compactWithInput(compactRequest).pipe(
-      Effect.tap((result) => Effect.sync(() => captureTurnState(input.turnState, result.providerMetadata))),
-    )
-  })
-    .pipe(Effect.map((result) => ({ ...result, output: OpenAINativeCompaction.normalizeOutput(result.output) })))
-  const result = yield* (fetch ? request.pipe(Effect.provideService(FetchHttpClient.Fetch, fetch)) : request)
-  return { ...current, output: result.output, input: result.input, providerMetadata: result.providerMetadata }
-})
 
 function buildRequest(input: RequestInput) {
   return LLMNative.request({
@@ -252,21 +214,6 @@ function headerValue(headers: Record<string, unknown>, name: string) {
   return undefined
 }
 
-function applyNativeReplayWindow(
-  request: LLMRequest,
-  window: OpenAINativeCompaction.Window,
-) {
-  return LLMRequest.update(request, {
-    providerOptions: {
-      ...request.providerOptions,
-      openai: {
-        ...request.providerOptions?.openai,
-        responsesReplayInput: window.output,
-      },
-    },
-  })
-}
-
 function providerFetch(input: Pick<StreamInput, "provider" | "auth">): typeof globalThis.fetch | undefined {
   if (input.provider.id !== "openai" || input.auth?.type !== "oauth") return undefined
   const value: unknown = input.provider.options.fetch
@@ -279,17 +226,6 @@ function providerHeaders(value: unknown): Record<string, string> | undefined {
   return Object.fromEntries(
     Object.entries(value).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
   )
-}
-
-function compactMessages(messages: readonly ModelMessage[]) {
-  return messages.filter((message) => message.role !== "system")
-}
-
-function compactProviderOptions(options: Record<string, any> | undefined) {
-  if (!options || !("instructions" in options)) return options
-  const result = { ...options }
-  delete result.instructions
-  return result
 }
 
 function nativeSchema(value: unknown): JsonSchema {
