@@ -45,13 +45,14 @@ const request = Effect.fn(function* (
   providerID: Provider.ID,
   baseURL: string,
   sessionID = Session.ID.make("ses_test"),
+  kind: "primary" | "title" = "primary",
 ) {
   const hooks = yield* PluginHooks.Service
   const event = yield* hooks.trigger("session", "model.request", {
     sessionID,
     agent: Agent.ID.make("build"),
     model: Model.Ref.make({ providerID, id: Model.ID.make("gpt-5.5") }),
-    kind: "primary",
+    kind,
     baseURL,
     headers: {},
   })
@@ -156,6 +157,8 @@ describe("OpenAIPlugin", () => {
       })
       expect(direct.baseURL).toBe("https://chatgpt.com/backend-api/codex")
       expect(direct.headers).toMatchObject({ originator: "opencode", "session-id": "ses_test" })
+      const title = yield* request(Provider.ID.openai, "https://api.openai.com/v1", undefined, "title")
+      expect(title.headers).toMatchObject({ "session-id": "ses_test-title", "x-session-affinity": "ses_test-title" })
       expect(direct.hasHttpHooks).toBe(false)
       expect(custom.headers).not.toHaveProperty("originator")
       expect(proxy.baseURL).toBe("https://proxy.example/v1?region=us")

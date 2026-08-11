@@ -8,6 +8,7 @@ import {
   ProviderInternalError,
   QuotaExceededError,
   RateLimitError,
+  TransportError,
   UnknownProviderError,
   type HttpContext,
   type HttpRateLimitDetails,
@@ -108,6 +109,7 @@ const decodeJson = Schema.decodeUnknownOption(Schema.fromJsonString(Schema.Unkno
 const QUOTA_CODES = new Set([
   "insufficient_quota",
   "usage_not_included",
+  "usage_limit_reached",
   "billing_error",
   "gousagelimiterror",
   "freeusagelimiterror",
@@ -143,6 +145,8 @@ const CONTENT_POLICY_CODES = new Set([
   "content_policy_violation",
   "image_content_policy_violation",
   "refusal",
+  "cyber_policy",
+  "bio_policy",
 ])
 // OpenCode Zen replaces upstream codes outside its allow-list but keeps the original
 // as a `[code]` label at the start of the rewritten message.
@@ -215,7 +219,6 @@ export interface ProviderFailure {
 // unpredictable shapes while deterministic rejections almost always carry a
 // status or known code.
 export function classifyProviderFailure(input: ProviderFailure): AIError["reason"] {
-  const details = { message: input.message, body: input.rawBody, http: input.http, cause: input.cause }
   const body = input.rawBody ?? ""
   const codes = [
     ...providerCodes(input.data),
@@ -223,10 +226,13 @@ export function classifyProviderFailure(input: ProviderFailure): AIError["reason
     ...providerCodes(input.message),
     ...(GATEWAY_CODE_LABEL.exec(input.message)?.slice(1) ?? []),
   ].map((code) => code.toLowerCase())
+  const providerCode = codes.find((code) => code === "usage_limit_reached" || code === "usage_not_included") ?? codes[0]
+  const details = { message: input.message, body: input.rawBody, http: input.http, cause: input.cause, providerCode }
   // Scan the raw payload too so signals missing from the summary message
   // (e.g. overflow phrases nested in a JSON error body) still classify.
   const text = [input.message, body].filter((value) => value.length > 0).join("\n")
   const clientScoped = input.status === undefined || (input.status >= 400 && input.status < 500)
+  const retryAfterMs = input.retryAfterMs ?? retryDelayFromMessage(input.message)
 
   if (
     clientScoped &&
@@ -246,6 +252,8 @@ export function classifyProviderFailure(input: ProviderFailure): AIError["reason
     (input.status === 429 && QUOTA_TEXT.test(text))
   )
     return new QuotaExceededError(details)
+  if (input.status === 403 && /cloudflare.*blocked|blocked.*cloudflare/i.test(body))
+    return new TransportError({ ...details, transport: "http", operation: "request", delivery: "rejected" })
   if (input.status === 401 || input.status === 403 || codes.some((code) => AUTH_CODES.has(code)))
     return new AuthenticationError(details)
   if (
@@ -257,7 +265,7 @@ export function classifyProviderFailure(input: ProviderFailure): AIError["reason
   )
     return new RateLimitError({
       ...details,
-      retryAfterMs: input.retryAfterMs,
+      retryAfterMs,
       rateLimit: input.rateLimit,
     })
   if (
@@ -273,12 +281,19 @@ export function classifyProviderFailure(input: ProviderFailure): AIError["reason
   )
     return new ProviderInternalError({
       ...details,
-      retryAfterMs: input.retryAfterMs,
+      retryAfterMs,
     })
   if (codes.some((code) => INVALID_REQUEST_CODES.has(code))) return new InvalidRequestError(details)
   // Any remaining 4xx is a deterministic rejection of this request.
   if (input.status !== undefined && input.status >= 400 && input.status < 500) return new InvalidRequestError(details)
   return new UnknownProviderError(details)
+}
+
+function retryDelayFromMessage(message: string) {
+  const match = /try again in\s*(\d+(?:\.\d+)?)\s*(ms|s|seconds?)/i.exec(message)
+  if (!match) return undefined
+  const delay = Number(match[1]) * (match[2]!.toLowerCase() === "ms" ? 1 : 1000)
+  return Number.isFinite(delay) ? Math.ceil(delay) : undefined
 }
 
 function providerCodes(value: unknown) {

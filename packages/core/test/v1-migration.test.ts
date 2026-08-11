@@ -575,7 +575,11 @@ describe("V1Migration.transformSession", () => {
       ["MessageAbortedError", { message: "stopped" }, "aborted", "stopped"],
       [
         "APIError",
-        { message: "api", statusCode: 503, isRetryable: true, responseBody: "discard" },
+        {
+          message: "api", statusCode: 503, isRetryable: false, responseBody: "retained",
+          responseHeaders: { "x-request-id": "request-1" }, metadata: { url: "https://example.com/responses" },
+          resolution: { kind: "model_capacity", retry: "never", action: "switch_model" },
+        },
         "provider.error",
         "api",
       ],
@@ -594,7 +598,13 @@ describe("V1Migration.transformSession", () => {
       expect(result.messages[index + 1].data.error).toMatchObject({ type: entry[2], message: entry[3] })
       const error = result.messages[index + 1].data.error
       if (!error || typeof error !== "object") throw new Error("Expected assistant error")
-      expect(Object.keys(error).sort()).toEqual(["message", "type"])
+      if (entry[0] === "APIError") {
+        expect(error).toEqual({
+          type: "provider.error", message: "api", status: 503, responseBody: "retained",
+          responseHeaders: { "x-request-id": "request-1" }, url: "https://example.com/responses",
+          resolution: { kind: "server", retry: "automatic", action: "retry" },
+        })
+      } else expect(Object.keys(error).sort()).toEqual(["message", "type"])
     })
     expect(result.messages[1].data.finish).toBe("unknown")
   })

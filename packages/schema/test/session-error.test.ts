@@ -1,11 +1,11 @@
 import { describe, expect, test } from "bun:test"
 import { Schema } from "effect"
-import { LLM, SessionError } from "../src/index.js"
+import { SessionError } from "../src/session-error.js"
 
 describe("SessionError", () => {
   test("exports one identified open envelope", () => {
     expect(SessionError.Error.ast.annotations?.identifier).toBe("Session.StructuredError")
-    expect(Object.keys(SessionError).filter((key) => key !== "SessionError")).toEqual(["Error"])
+    expect(Object.keys(SessionError).filter((key) => key !== "SessionError").sort()).toEqual(["Error", "Resolution"])
   })
 
   test("round trips current and future error types through JSON", () => {
@@ -43,8 +43,20 @@ describe("SessionError", () => {
   })
 })
 
-test("FinishReason is the closed normalized provider set", () => {
-  const reasons = ["stop", "length", "tool-calls", "content-filter", "error", "unknown"] as const
-  expect(reasons.map((reason) => Schema.decodeUnknownSync(LLM.FinishReason)(reason))).toEqual([...reasons])
-  expect(() => Schema.decodeUnknownSync(LLM.FinishReason)("other")).toThrow()
+test("session errors round-trip recovery hints and response diagnostics", () => {
+  const value: SessionError.Error = {
+    type: "provider.quota",
+    message: "Usage limit reached",
+    status: 429,
+    resolution: { kind: "usage_limited", retry: "never", action: "switch_model", providerCode: "usage_limit_reached" },
+    responseBody: '{"error":{"code":"usage_limit_reached"}}',
+    responseHeaders: { "x-request-id": "request-1" },
+    url: "https://example.com/responses",
+  }
+  expect(Schema.decodeUnknownSync(SessionError.Error)(Schema.encodeSync(SessionError.Error)(value))).toEqual(value)
+})
+
+test("session errors omit absent optional diagnostics", () => {
+  expect(Schema.encodeSync(SessionError.Error)({ type: "unknown", message: "error", resolution: undefined })).toEqual({ type: "unknown", message: "error" })
+  expect(SessionError.Resolution.ast.annotations?.identifier).toBe("Session.Error.Resolution")
 })
