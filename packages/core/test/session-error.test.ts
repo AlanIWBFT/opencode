@@ -25,6 +25,7 @@ import { Provider } from "@opencode/core/provider"
 import { Tool } from "@opencode/schema/tool"
 import { toSessionError } from "@opencode/core/session/to-session-error"
 import { SessionRunnerRetry } from "@opencode/core/session/runner/retry"
+import { classifyProviderFailure } from "@opencode/ai/route"
 
 const llm = (reason: AIError["reason"]) => new AIError({ reason })
 
@@ -34,12 +35,14 @@ describe("toSessionError", () => {
       type: "provider.rate-limit",
       message: "rate",
       retryAfterMs: 123,
+      resolution: { kind: "rate_limited", action: "wait", retry: "automatic", retryAfterMs: 123 },
     })
     expect(toSessionError(llm(new AuthenticationError({ message: "auth" }))).type).toBe("provider.auth")
     expect(toSessionError(llm(new QuotaExceededError({ message: "quota", retryAfterMs: 456 })))).toEqual({
       type: "provider.quota",
       message: "quota",
       retryAfterMs: 456,
+      resolution: { kind: "quota_exceeded", action: "manage_billing", retry: "never" },
     })
     expect(toSessionError(llm(new ContentPolicyError({ message: "blocked" }))).type).toBe("provider.content-filter")
     expect(
@@ -49,6 +52,7 @@ describe("toSessionError", () => {
       type: "provider.internal",
       message: "internal",
       retryAfterMs: 789,
+      resolution: { kind: "server", action: "retry", retry: "automatic", retryAfterMs: 789 },
     })
     expect(toSessionError(llm(new InvalidProviderOutputError({ message: "output" }))).type).toBe(
       "provider.invalid-output",
@@ -103,6 +107,9 @@ describe("toSessionError", () => {
       status: 429,
       response: { body: JSON.stringify(freeBody) },
       retryAfterMs: 3_600_000,
+      resolution: { kind: "quota_exceeded", action: "manage_billing", retry: "never", providerCode: "freeusagelimiterror" },
+      responseHeaders: { "retry-after": "3600" },
+      url: "https://opencode.ai/inference/openai/v1/chat/completions",
     })
 
     const paid = fail(
@@ -150,6 +157,9 @@ describe("toSessionError", () => {
       message: "You've reached the spend limit for this model. Switch models to keep going.",
       status: 429,
       response: { body: JSON.stringify(modelBody) },
+      resolution: { kind: "usage_limited", action: "switch_model", retry: "never", providerCode: "budgetlimiterror" },
+      responseHeaders: {},
+      url: "https://opencode.ai/inference/openai/v1/chat/completions",
     })
 
     // Google clients get Google's envelope, with the same metadata in its ErrorInfo.
@@ -172,6 +182,7 @@ describe("toSessionError", () => {
     expect(toSessionError(all)).toMatchObject({
       type: "provider.budget-limit",
       message: "Workspace usage limit reached. Model use is paused until the limit resets.",
+      resolution: { kind: "usage_limited", action: "wait", retry: "never" },
     })
   })
 
@@ -191,7 +202,7 @@ describe("toSessionError", () => {
     })
   })
 
-  test("preserves provider HTTP status without exposing runtime diagnostics", () => {
+  test("preserves native response diagnostics without serializing runtime causes", () => {
     const http = new HttpContext({
       url: "https://example.com",
       status: 413,
@@ -215,6 +226,9 @@ describe("toSessionError", () => {
       message: "too large",
       status: 413,
       response: { body: '{"error":"context limit"}' },
+      resolution: { kind: "invalid_input", action: "fix_input", retry: "never" },
+      responseHeaders: { "x-request-id": "request-1" },
+      url: "https://example.com",
     })
     expect(
       toSessionError(
@@ -229,6 +243,9 @@ describe("toSessionError", () => {
       type: "provider.internal",
       message: "bad gateway",
       status: 502,
+      resolution: { kind: "server", action: "retry", retry: "automatic" },
+      responseHeaders: {},
+      url: "https://example.com",
     })
   })
 
@@ -237,6 +254,7 @@ describe("toSessionError", () => {
       type: "provider.rate-limit",
       message: "Slow down",
       response: { body: '{"error":"rate limit"}' },
+      resolution: { kind: "rate_limited", action: "wait", retry: "automatic" },
     })
   })
 
@@ -275,6 +293,36 @@ describe("toSessionError", () => {
       message:
         "Cannot initialize cloudflare-workers-ai/model: CLOUDFLARE_ACCOUNT_ID is required to resolve the provider endpoint",
     })
+  })
+
+  test("retains actionable native errors while using the official HTTP rejection precedence", () => {
+    for (const [code, status, kind, action, retry] of [
+      ["usage_limit_reached", 429, "usage_limited", "switch_model", "never"],
+      ["usage_not_included", 400, "plan_not_included", "switch_model", "never"],
+      ["insufficient_quota", 429, "quota_exceeded", "manage_billing", "never"],
+      ["cyber_policy", 400, "policy_blocked", "fix_input", "never"],
+      ["bio_policy", 400, "policy_blocked", "fix_input", "never"],
+      ["server_error", 400, "invalid_input", "fix_input", "never"],
+      ["api_error", 422, "invalid_input", "fix_input", "never"],
+      ["server_error", 503, "server", "retry", "automatic"],
+      ["rate_limit_exceeded", 429, "rate_limited", "wait", "automatic"],
+    ] as const) {
+      const rawBody = JSON.stringify({ error: { code, message: "Provider rejected the request" } })
+      const error = llm(classifyProviderFailure({ message: "Provider rejected the request", rawBody, status }))
+      expect(toSessionError(error)).toMatchObject({ response: { body: rawBody }, resolution: { kind, action, retry, providerCode: code } })
+      expect(SessionRunnerRetry.isRetryable(error)).toBe(retry === "automatic")
+    }
+  })
+
+  test("keeps network blocks and provider-requested retry delays actionable", () => {
+    const blocked = llm(classifyProviderFailure({ message: "Forbidden", status: 403, rawBody: "Cloudflare blocked this request" }))
+    expect(toSessionError(blocked).resolution).toMatchObject({ kind: "network", action: "check_network", retry: "never" })
+    expect(SessionRunnerRetry.isRetryable(blocked)).toBe(false)
+    const limited = llm(classifyProviderFailure({ message: "Rate limit exceeded. Try again in 1.25 seconds.", status: 429 }))
+    expect(toSessionError(limited).resolution).toMatchObject({ kind: "rate_limited", retry: "automatic", retryAfterMs: 1_250 })
+    const denied = llm(new RateLimitError({ message: "rate", http: new HttpContext({ url: "https://example.com", status: 429, headers: { "x-should-retry": "false" } }) }))
+    expect(toSessionError(denied).resolution?.retry).toBe("never")
+    expect(SessionRunnerRetry.isRetryable(denied)).toBe(false)
   })
 
   test("preserves provider configuration and initialization errors", () => {
