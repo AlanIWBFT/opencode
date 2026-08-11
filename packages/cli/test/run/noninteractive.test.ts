@@ -318,7 +318,9 @@ async function run(input: {
   )
   spyOn(sdk.message, "list").mockImplementation(() =>
     ok({
-      data: input.messages?.(promptID) ?? [{ id: promptID, type: "user", text: "hello", time: { created: 1 } }],
+      data: (
+        input.messages?.(promptID) ?? [{ id: promptID, type: "user" as const, text: "hello", time: { created: 1 } }]
+      ).map((message, index) => ({ ...message, seq: index + 1 })),
       cursor: {},
     }),
   )
