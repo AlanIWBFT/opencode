@@ -1024,7 +1024,17 @@ function migrateError(error: NonNullable<(typeof SessionV1.Assistant.Type)["erro
               : error.name === "APIError"
                 ? "provider.error"
                 : "unknown"
-  return { type, message }
+  if (error.name !== "APIError") return { type, message }
+  const data = error.data
+  return {
+    type,
+    message,
+    ...(data.statusCode !== undefined && data.statusCode >= 100 && data.statusCode <= 599 ? { status: data.statusCode } : {}),
+    ...(data.resolution === undefined ? {} : { resolution: data.resolution }),
+    ...(data.responseBody === undefined ? {} : { responseBody: data.responseBody }),
+    ...(data.responseHeaders === undefined ? {} : { responseHeaders: data.responseHeaders }),
+    ...(data.metadata?.url === undefined ? {} : { url: data.metadata.url }),
+  }
 }
 
 function normalizeFinish(finish: string | undefined) {

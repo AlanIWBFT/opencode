@@ -6,6 +6,7 @@ import { Integration } from "../integration.js"
 import { AgentNotFoundError, StepFailedError } from "./error.js"
 import { ModelResolver } from "../model-resolver.js"
 import { SessionRunnerModel } from "./runner/model.js"
+import { ProviderRecovery } from "./provider-recovery.js"
 
 const tokenSharingMessages = {
   subscription_sharing_user_not_eligible:
@@ -96,10 +97,13 @@ export function contentFilterError(summary: string, reason: FinishReasonDetails)
 
 function providerError(type: string, reason: AIError["reason"]): SessionError.Error {
   const status = reason.http?.status
+  const resolution = ProviderRecovery.resolution(reason)
   return {
     type,
     message: Object.entries(tokenSharingMessages).find(([code]) => reason.body?.includes(code))?.[1] ?? reason.message,
     ...(status === undefined ? {} : { status }),
     ...(reason.body === undefined ? {} : { response: { body: reason.body } }),
+    ...(resolution === undefined ? {} : { resolution }),
+    ...(reason.http === undefined ? {} : { responseHeaders: reason.http.headers, url: reason.http.url }),
   }
 }

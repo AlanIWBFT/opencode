@@ -1,6 +1,6 @@
 export * as SessionV1 from "./session.js"
 
-import { Effect, Schema, Types } from "effect"
+import { Effect, Schema, SchemaGetter, Types } from "effect"
 import { durable, ephemeral, inventory } from "../event.js"
 import { Project } from "../project.js"
 import { Provider } from "../provider.js"
@@ -11,6 +11,7 @@ import { SessionID } from "../session-id.js"
 import { WorkspaceID } from "../workspace-id.js"
 import { PermissionV1 } from "./permission.js"
 import { FileDiff } from "../file-diff.js"
+import { SessionError } from "../session-error.js"
 
 const Timestamp = Schema.Finite.check(Schema.isGreaterThanOrEqualTo(0))
 
@@ -45,10 +46,21 @@ export const StructuredOutputError = namedError("StructuredOutputError", {
   message: Schema.String,
   retries: NonNegativeInt,
 })
+const LegacyResolution = Schema.Union([
+  SessionError.Resolution,
+  Schema.Struct({ ...SessionError.Resolution.fields, kind: Schema.Literal("model_capacity") }),
+]).pipe(Schema.decodeTo(Schema.toType(SessionError.Resolution), {
+  decode: SchemaGetter.transform((value) => value.kind === "model_capacity"
+    ? { ...value, kind: "server" as const, retry: "automatic" as const, action: "retry" as const }
+    : value),
+  encode: SchemaGetter.transform((value) => value),
+}))
+
 export const APIError = namedError("APIError", {
   message: Schema.String,
   statusCode: Schema.optional(NonNegativeInt),
   isRetryable: Schema.Boolean,
+  resolution: LegacyResolution.pipe(optional),
   responseHeaders: Schema.optional(Schema.Record(Schema.String, Schema.String)),
   responseBody: Schema.optional(Schema.String),
   metadata: Schema.optional(Schema.Record(Schema.String, Schema.String)),

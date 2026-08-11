@@ -22,6 +22,7 @@ const ReasonFields = {
   message: Schema.String,
   // Preserve the complete original response or triggering event before decoding narrows it.
   body: Schema.optional(Schema.String),
+  providerCode: Schema.optional(Schema.String),
   http: Schema.optional(HttpContext),
   cause: Schema.optional(Schema.Defect({ includeStack: true })),
 }
