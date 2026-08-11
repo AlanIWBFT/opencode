@@ -76,11 +76,11 @@ it.live("filters message types before paginating in either direction through the
         expect(end).toEqual({ data: [], cursor: { previous: null, next: null } })
       }
       expect((await fixture.api.message.list({ sessionID: fixture.sessionID, type: "compaction" })).data).toEqual([
-        messages[4],
+        { ...messages[4], seq: 5 },
       ])
       expect(
         (await fixture.api.message.list({ sessionID: fixture.sessionID, type: "assistant", limit: 1 })).data,
-      ).toEqual([messages[1]])
+      ).toEqual([{ ...messages[1], seq: 2 }])
       expect((await fixture.api.message.list({ sessionID: fixture.sessionID, type: "shell" })).data).toEqual([])
     })
   }),

@@ -113,6 +113,7 @@ const image = {
 function compaction(status: "running" | "completed", summary: string): SessionMessages[number] {
   const message = {
     id: "msg_compaction",
+    seq: 0,
     type: "compaction" as const,
     reason: "auto" as const,
     summary,
@@ -163,6 +164,7 @@ function sdk(input: {
       data: input.messages?.[request.sessionID] ?? [
         {
           id: "msg_old",
+          seq: 0,
           type: "user" as const,
           text: "previous prompt",
           files: [],
@@ -380,7 +382,7 @@ describe("V2 mini transport", () => {
     })
     while (!ui.events.some((event) => event.type === "stream.patch" && event.patch.status === "waiting for assistant"))
       await Bun.sleep(0)
-    messages.push({ id: pending.id, type: "user", ...pending.payload, time: { created: 1 } })
+    messages.push({ id: pending.id, seq: 0, type: "user", ...pending.payload, time: { created: 1 } })
     if (first === "projection") {
       await transport.replayOnResize({ localRows: () => [], reset: async () => {} })
     }
@@ -456,6 +458,7 @@ describe("V2 mini transport", () => {
             ses_1: [
               {
                 id: "msg_images",
+                seq: 0,
                 type: "user",
                 text: "",
                 files: [
@@ -730,6 +733,7 @@ describe("V2 mini transport", () => {
           ses_1: [
             {
               id: "msg_final",
+              seq: 2,
               type: "assistant",
               agent: "build",
               model: { providerID: "test", id: "model" },
@@ -738,6 +742,7 @@ describe("V2 mini transport", () => {
             },
             {
               id: "msg_work",
+              seq: 1,
               type: "assistant",
               agent: "build",
               model: { providerID: "test", id: "model" },
@@ -747,7 +752,7 @@ describe("V2 mini transport", () => {
               ],
               time: { created: 2, completed: 3 },
             },
-            { id: "msg_user", type: "user", text: "what happened", files: [], agents: [], time: { created: 1 } },
+            { id: "msg_user", seq: 0, type: "user", text: "what happened", files: [], agents: [], time: { created: 1 } },
           ],
         },
       }),
@@ -811,6 +816,7 @@ describe("V2 mini transport", () => {
     events.push(connected())
     const sourceMessage = {
       id: "msg_child_source",
+      seq: 0,
       type: "assistant" as const,
       agent: "build",
       model: { providerID: "test", id: "model" },
@@ -1053,9 +1059,10 @@ describe("V2 mini transport", () => {
     await Bun.sleep(0)
     expect(done).toBe(false)
     messages.push(
-      { id: "msg_prompt", type: "user", text: "hello", time: { created: 2 } },
+      { id: "msg_prompt", seq: 0, type: "user", text: "hello", time: { created: 2 } },
       {
         id: "msg_assistant",
+        seq: 1,
         type: "assistant",
         agent: "build",
         model: { providerID: "test", id: "model" },
@@ -1319,8 +1326,8 @@ describe("V2 mini transport", () => {
     })
     await Bun.sleep(0)
     messages.push(
-      { id: "msg_prompt", type: "user", text: "hello", time: { created: 2 } },
-      { id: "msg_queued", type: "user", text: "follow up", time: { created: 3 } },
+      { id: "msg_prompt", seq: 0, type: "user", text: "hello", time: { created: 2 } },
+      { id: "msg_queued", seq: 1, type: "user", text: "follow up", time: { created: 3 } },
     )
     idle.resolve()
 
@@ -1643,6 +1650,7 @@ describe("V2 mini transport", () => {
           ? [
               {
                 id: "msg_prompt",
+                seq: 0,
                 type: "user",
                 text: "hello",
                 files: [],
@@ -1725,6 +1733,7 @@ describe("V2 mini transport", () => {
           ? [
               {
                 id: "msg_prompt",
+                seq: 0,
                 type: "user",
                 text: "hello",
                 files: [image],
@@ -1792,6 +1801,7 @@ describe("V2 mini transport", () => {
         data: [
           {
             id: "msg_assistant",
+            seq: 0,
             type: "assistant",
             agent: "build",
             model: { providerID: "test", id: "model" },
@@ -1820,6 +1830,7 @@ describe("V2 mini transport", () => {
         data: [
           {
             id: "msg_assistant",
+            seq: 0,
             type: "assistant",
             agent: "build",
             model: { providerID: "test", id: "model" },
@@ -2005,6 +2016,7 @@ describe("V2 mini transport", () => {
         data: [
           {
             id: "msg_assistant",
+            seq: 0,
             type: "assistant",
             agent: "build",
             model: { providerID: "test", id: "model" },
@@ -2060,6 +2072,7 @@ describe("V2 mini transport", () => {
         data: [
           {
             id: "msg_assistant",
+            seq: 0,
             type: "assistant",
             agent: "build",
             model: { providerID: "test", id: "model" },
@@ -2127,6 +2140,7 @@ describe("V2 mini transport", () => {
         data: [
           {
             id: "msg_assistant",
+            seq: 0,
             type: "assistant",
             agent: "build",
             model: { providerID: "test", id: "model" },
@@ -2327,6 +2341,7 @@ describe("V2 mini transport", () => {
         data: [
           {
             id: "msg_assistant",
+            seq: 0,
             type: "assistant",
             agent: "build",
             model: { providerID: "test", id: "model" },
@@ -2395,6 +2410,7 @@ describe("V2 mini transport", () => {
         data: [
           {
             id: "msg_assistant",
+            seq: 0,
             type: "assistant",
             agent: "build",
             model: { providerID: "test", id: "model" },
@@ -2433,6 +2449,7 @@ describe("V2 mini transport", () => {
         data: [
           {
             id: "msg_prompt",
+            seq: 0,
             type: "user",
             text: "hello",
             files: [],
@@ -2472,6 +2489,7 @@ describe("V2 mini transport", () => {
         data: [
           {
             id: "msg_b",
+            seq: 1,
             type: "assistant",
             agent: "build",
             model: { providerID: "test", id: "model" },
@@ -2483,6 +2501,7 @@ describe("V2 mini transport", () => {
           },
           {
             id: "msg_a",
+            seq: 0,
             type: "assistant",
             agent: "build",
             model: { providerID: "test", id: "model" },
@@ -2763,6 +2782,7 @@ describe("V2 mini transport", () => {
 
       const message = {
         id: "msg_tool",
+        seq: 0,
         type: "assistant" as const,
         agent: "build",
         model: { providerID: "test", id: "model" },
@@ -3247,6 +3267,7 @@ describe("V2 mini transport", () => {
         ses_1: [
           {
             id: "msg_shell",
+            seq: 0,
             type: "shell" as const,
             shellID: "sh_1",
             status: "exited",
@@ -3306,6 +3327,7 @@ describe("V2 mini transport", () => {
         ses_1: [
           {
             id: "msg_failed_shell",
+            seq: 0,
             type: "shell" as const,
             shellID: "sh_failed",
             status: "exited",
@@ -3596,6 +3618,7 @@ describe("V2 mini transport", () => {
         ses_1: [
           {
             id: "msg_skill",
+            seq: 0,
             type: "skill" as const,
             skill: "tigerstyle",
             name: "tigerstyle",
@@ -3884,6 +3907,7 @@ describe("V2 mini transport", () => {
         ses_child: [
           {
             id: "msg_task",
+            seq: 0,
             type: "user" as const,
             text: "task prompt",
             files: [],
@@ -3892,6 +3916,7 @@ describe("V2 mini transport", () => {
           },
           {
             id: "msg_child_a",
+            seq: 1,
             type: "assistant" as const,
             agent: "explore",
             model: { providerID: "test", id: "model" },
@@ -4068,9 +4093,10 @@ describe("V2 mini transport", () => {
         sessions: [{ id: "ses_child", parentID: "ses_1", time: { updated: 1 } }],
         messages: {
           ses_child: [
-            { id: "msg_old_image", type: "user", text: "", files: [image, image], time: { created: 1 } },
+            { id: "msg_old_image", seq: 0, type: "user", text: "", files: [image, image], time: { created: 1 } },
             {
               id: "msg_child_tool",
+              seq: 1,
               type: "assistant",
               agent: "build",
               model: { providerID: "test", id: "model" },
@@ -4232,6 +4258,7 @@ describe("V2 mini transport", () => {
         data: [
           {
             id: "msg_overflow_assistant",
+            seq: 1,
             type: "assistant" as const,
             agent: "explore",
             model: { providerID: "test", id: "model" },
@@ -4240,6 +4267,7 @@ describe("V2 mini transport", () => {
           },
           {
             id: "msg_overflow_baseline",
+            seq: 0,
             type: "user" as const,
             text: "baseline history",
             files: [],
@@ -4323,6 +4351,7 @@ describe("V2 mini transport", () => {
         data: [
           {
             id: "msg_tool_projected",
+            seq: 0,
             type: "assistant" as const,
             agent: "explore",
             model: { providerID: "test", id: "model" },
@@ -4625,6 +4654,7 @@ describe("V2 mini transport", () => {
         ses_1: [
           {
             id: "msg_parent",
+            seq: 0,
             type: "assistant" as const,
             agent: "build",
             model: { providerID: "test", id: "model" },
