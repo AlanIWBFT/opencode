@@ -34,6 +34,7 @@ import { Tool } from "../tool.js"
 import { SessionAffinity } from "./affinity.js"
 import { SessionModelTransport } from "./model-transport.js"
 import { SessionProviderContext } from "./provider-context.js"
+import { OpenAITurnState } from "./openai-turn-state.js"
 import { SessionRunnerModel } from "./runner/model.js"
 import { SessionSchema } from "./schema.js"
 import { SessionSystemPrompt } from "./system-prompt.js"
@@ -331,10 +332,14 @@ export const layer = Layer.effect(
           new Error("Provider context is incompatible with the route selected by model request hooks"),
         )
 
+      const turnState =
+        kind === "primary" || kind === "compaction"
+          ? yield* OpenAITurnState.select(SessionProviderContext.provenance({ model: request.model, ref: model.ref }))
+          : undefined
       const hasHttpHooks =
         (yield* hooks.has("session", "http.request", model.ref.providerID)) ||
         (yield* hooks.has("session", "http.response", model.ref.providerID))
-      const http: StreamOptions["http"] = hasHttpHooks
+      const httpHooks: StreamOptions["http"] = hasHttpHooks
         ? (req, handler) =>
             Effect.gen(function* () {
               const before = yield* hooks.trigger("session", "http.request", {
@@ -360,6 +365,17 @@ export const layer = Layer.effect(
               return HttpClientResponse.fromWeb(sent, after.response)
             }).pipe(Effect.mapError((cause) => (cause instanceof Error ? cause : new Error(String(cause)))))
         : undefined
+      const http: StreamOptions["http"] = turnState
+        ? (req, handler) =>
+            Effect.gen(function* () {
+              const sent = turnState.value
+                ? HttpClientRequest.setHeader(req, OpenAITurnState.header, turnState.value)
+                : req
+              const response = yield* httpHooks ? httpHooks(sent, handler) : handler(sent)
+              OpenAITurnState.capture(turnState, response.headers)
+              return response
+            })
+        : httpHooks
       // HTTP hooks wrap every HTTP request, including the WebSocket fallback path. The route decides
       // which transport actually carries the request, so both hook families are always offered.
       const webSocket =
@@ -378,11 +394,15 @@ export const layer = Layer.effect(
                 send: (frame) =>
                   hooks
                     .trigger("session", "experimental.ws.send", { ...scope, frame })
-                    .pipe(Effect.map((event) => event.frame)),
+                    .pipe(Effect.map((event) => OpenAITurnState.send(turnState, event.frame))),
                 receive: (frame) =>
-                  hooks
-                    .trigger("session", "experimental.ws.receive", { ...scope, frame })
-                    .pipe(Effect.map((event) => event.frame)),
+                  Effect.sync(() => OpenAITurnState.receive(turnState, frame)).pipe(
+                    Effect.andThen(
+                      hooks
+                        .trigger("session", "experimental.ws.receive", { ...scope, frame })
+                        .pipe(Effect.map((event) => event.frame)),
+                    ),
+                  ),
               },
               model.chunkTimeout,
             )

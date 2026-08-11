@@ -18,8 +18,10 @@ import { SessionInbox } from "@opencode/core/session/inbox"
 import { InstructionState } from "@opencode/core/session/instruction-state"
 import { SessionMessage } from "@opencode/core/session/message"
 import { SessionModelRequest } from "@opencode/core/session/model-request"
+import { SessionModelTransport } from "@opencode/core/session/model-transport"
 import { SessionProjector } from "@opencode/core/session/projector"
 import { SessionProviderContext } from "@opencode/core/session/provider-context"
+import { OpenAITurnState } from "@opencode/core/session/openai-turn-state"
 import { SessionRunnerModel } from "@opencode/core/session/runner/model"
 import { SessionSchema } from "@opencode/core/session/schema"
 import { SessionStore } from "@opencode/core/session/store"
@@ -37,6 +39,7 @@ const it = testEffect(
       SessionStore.node,
       SessionCompaction.node,
       SessionModelRequest.node,
+      SessionModelTransport.node,
       PluginHooks.node,
       llmClient,
     ]),
@@ -44,7 +47,9 @@ const it = testEffect(
   ),
 )
 
-const setup = Effect.fnUntraced(function* (options: { endpoint?: boolean } = {}) {
+const setup = Effect.fnUntraced(function* (
+  options: { endpoint?: boolean; webSocket?: boolean } = {},
+) {
   const endpoint = options.endpoint ?? false
   const db = (yield* Database.Service).db
   const bus = yield* Bus.Service
@@ -55,15 +60,28 @@ const setup = Effect.fnUntraced(function* (options: { endpoint?: boolean } = {})
   const hooks = yield* PluginHooks.Service
   const blocked = Deferred.makeUnsafe<void>()
   const hanging = Promise.withResolvers<Response>()
-  const state = { failure: false, flaky: false, hang: false, overflow: false, calls: 0 }
+  const state = {
+    failure: false,
+    flaky: false,
+    hang: false,
+    overflow: false,
+    calls: 0,
+    connections: 0,
+  }
   const bodies: Record<string, unknown>[] = []
   const headers: Headers[] = []
   const server = yield* Effect.acquireRelease(
     Effect.sync(() =>
-      Bun.serve({
+      Bun.serve<undefined>({
         hostname: "127.0.0.1",
         port: 0,
-        async fetch(request) {
+        async fetch(request, server) {
+          if (
+            options.webSocket &&
+            request.headers.get("upgrade")?.toLowerCase() === "websocket" &&
+            server.upgrade(request)
+          )
+            return undefined
           state.calls++
           headers.push(request.headers)
           bodies.push(
@@ -122,8 +140,41 @@ const setup = Effect.fnUntraced(function* (options: { endpoint?: boolean } = {})
                 usage: { input_tokens: 20, output_tokens: 4, total_tokens: 24 },
               },
             })}\n\n`,
-            { headers: { "content-type": "text/event-stream" } },
+            { headers: { "content-type": "text/event-stream", "x-codex-turn-state": `turn_${state.calls}` } },
           )
+        },
+        websocket: {
+          open() {
+            state.connections++
+          },
+          message(socket, data) {
+            state.calls++
+            const body = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Record(Schema.String, Schema.Unknown)))(
+              String(data),
+            )
+            bodies.push(body)
+            const id = `resp_${state.calls}`
+            const output = JSON.stringify(body).includes("compaction_trigger")
+              ? [{ type: "compaction", id: `cmp_${state.calls}`, encrypted_content: `encrypted_${state.calls}` }]
+              : []
+            socket.send(
+              JSON.stringify({
+                type: "response.created",
+                response: { id, metadata: { headers: { "x-codex-turn-state": `turn_${state.calls}` } } },
+              }),
+            )
+            socket.send(
+              JSON.stringify({
+                type: "response.completed",
+                response: {
+                  id,
+                  status: "completed",
+                  output,
+                  usage: { input_tokens: 20, output_tokens: 4, total_tokens: 24 },
+                },
+              }),
+            )
+          },
         },
       }),
     ),
@@ -145,6 +196,7 @@ const setup = Effect.fnUntraced(function* (options: { endpoint?: boolean } = {})
       cost: [],
       limit: { context: 200_000, output: 32_000 },
       compaction: { type: "native" },
+      ...(options.webSocket ? { transport: "websocket" as const } : {}),
     },
   )
   const sessionID = SessionSchema.ID.create()
@@ -170,7 +222,7 @@ const setup = Effect.fnUntraced(function* (options: { endpoint?: boolean } = {})
   yield* InstructionState.prepare(db, bus, instructions, sessionID)
   yield* hooks.register("session", "model.request", (event) =>
     Effect.sync(() => {
-      event.headers["x-test-hook"] = event.kind
+      event.headers["x-test-hook"] = options.webSocket ? "fixture" : event.kind
     }),
   )
   yield* hooks.register("session", "http.request", (event) =>
@@ -341,6 +393,81 @@ it.live("manual and automatic endpoint compaction keep the provider replacement 
     expect(fixture.headers[0]?.get("x-http-hook")).toBe("compaction")
     expect(fixture.bodies[0]).toMatchObject({ tools: [expect.objectContaining({ name: "read" })] })
     expect(fixture.bodies[0]).not.toHaveProperty("context_management")
+  }),
+)
+
+it.live(
+  "preserves the first HTTP turn state across primary, compaction and continuation without sharing title or new turns",
+  () =>
+    Effect.gen(function* () {
+      const fixture = yield* setup()
+      yield* fixture.prompt("Original request")
+      const context = yield* fixture.load
+      const input = {
+        session: context.session,
+        agent: context.agent.id,
+        model: context.model,
+        tools: context.tools,
+        ...SessionModelRequest.baseTranscript({ ...context, agent: context.agent.info }),
+      }
+      const llm = yield* LLMClient.Service
+      const primary = Effect.gen(function* () {
+        const prepared = yield* fixture.requests.primary(input)
+        yield* llm.generate(prepared.request, prepared.options)
+      })
+      yield* Effect.gen(function* () {
+        yield* primary
+        expect(yield* fixture.compact).toEqual({ status: "completed" })
+        const title = yield* fixture.requests.title(input)
+        yield* llm.generate(title.request, title.options)
+        yield* primary
+      }).pipe(OpenAITurnState.scoped)
+      yield* primary.pipe(OpenAITurnState.scoped)
+      expect(fixture.headers.map((headers) => headers.get(OpenAITurnState.header))).toEqual([
+        null,
+        "turn_1",
+        null,
+        "turn_1",
+        null,
+      ])
+    }),
+)
+
+it.live("replays turn state through real WebSocket compaction without rotating the pooled connection", () =>
+  Effect.gen(function* () {
+    const fixture = yield* setup({ webSocket: true })
+    yield* fixture.prompt("Original request")
+    const llm = yield* LLMClient.Service
+    const primary = Effect.gen(function* () {
+      const context = yield* fixture.load
+      const prepared = yield* fixture.requests.primary({
+        session: context.session,
+        agent: context.agent.id,
+        model: context.model,
+        tools: context.tools,
+        webSocket: "session",
+        ...SessionModelRequest.baseTranscript({ ...context, agent: context.agent.info }),
+      })
+      yield* llm.generate(prepared.request, prepared.options)
+    })
+    yield* Effect.gen(function* () {
+      yield* primary
+      expect(yield* fixture.compact).toEqual({ status: "completed" })
+      yield* primary
+    }).pipe(OpenAITurnState.scoped)
+    yield* primary.pipe(OpenAITurnState.scoped)
+    expect(fixture.headers).toHaveLength(0)
+    expect(fixture.state.connections).toBe(1)
+    expect(fixture.bodies.map((body) => body.client_metadata)).toEqual([
+      undefined,
+      { "x-codex-turn-state": "turn_1" },
+      { "x-codex-turn-state": "turn_1" },
+      undefined,
+    ])
+    expect(fixture.bodies[2]).not.toHaveProperty("previous_response_id")
+    expect(JSON.stringify(fixture.bodies[2])).toContain("encrypted_2")
+    const transport = yield* SessionModelTransport.Service
+    yield* transport.close(fixture.sessionID)
   }),
 )
 
