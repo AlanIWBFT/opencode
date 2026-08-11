@@ -361,6 +361,10 @@ export const makeSessionGroup = <I extends HttpApiMiddleware.AnyId, S, FormI ext
         params: { sessionID: Session.ID },
         payload: Schema.Struct({
           title: Schema.String.pipe(Schema.optional),
+          archivedAt: Schema.NullOr(PositiveInt).pipe(Schema.optional).annotate({
+            description:
+              "Archive at this timestamp in milliseconds, or null to restore. Archiving closes persistent command slots and blocks new commands until restored.",
+          }),
           metadata: Session.Metadata.pipe(Schema.optional),
           permissions: Permission.Ruleset.pipe(Schema.optional),
         }),
@@ -758,6 +762,26 @@ export const makeSessionGroup = <I extends HttpApiMiddleware.AnyId, S, FormI ext
             summary: "Interrupt session execution",
             description:
               "Interrupt active execution owned by this OpenCode process. Returns interrupted=true when an active execution was interrupted and false for the idle no-op. When resume=true, execution resumes pending steering input and next-in-line control items (manual compaction, moves) while queued prompts remain parked.",
+          }),
+        ),
+    )
+    .add(
+      HttpApiEndpoint.post("session.stop", "/api/session/:sessionID/stop", {
+        params: { sessionID: Session.ID },
+        success: Schema.Struct({
+          matched: NonNegativeInt,
+          terminated: NonNegativeInt,
+          failed: NonNegativeInt,
+        }).annotate({ identifier: "SessionStopResponse" }),
+        error: SessionNotFoundError,
+      })
+        .middleware(sessionLocationMiddleware)
+        .annotateMerge(
+          OpenApi.annotations({
+            identifier: "session.stop",
+            summary: "Stop session and its persistent commands",
+            description:
+              "Interrupt this session's execution and close its persistent command slots, including detached commands. Background child sessions are not stopped. Later input and background notifications may resume this session. Counts describe attempted termination of running commands; failed may be nonzero.",
           }),
         ),
     )

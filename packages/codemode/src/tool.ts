@@ -1,6 +1,7 @@
 import { Effect, Schema } from "effect"
 import type { Namespace } from "./namespace.js"
 import type { Tools } from "./tools.js"
+import type { ToolInvocation } from "./tool-runtime.js"
 
 /**
  * JSON Schema subset for model-visible signatures. CodeMode does not validate values against
@@ -46,7 +47,7 @@ export type Tool<R = never> = {
   readonly description: string
   readonly input: SchemaType
   readonly output: SchemaType | undefined
-  readonly execute: (input: unknown) => Effect.Effect<unknown, unknown, R>
+  readonly execute: (input: unknown, call?: ToolInvocation) => Effect.Effect<unknown, unknown, R>
 }
 
 type InputType<S> = S extends Schema.Decoder<unknown> ? S["Type"] : unknown
@@ -58,7 +59,7 @@ export type Options<I extends SchemaType, O extends SchemaType | undefined, R = 
   readonly description: string
   readonly input: I
   readonly output?: O
-  readonly execute: (input: InputType<I>) => Effect.Effect<ResultType<O>, unknown, R>
+  readonly execute: (input: InputType<I>, call?: ToolInvocation) => Effect.Effect<ResultType<O>, unknown, R>
 }
 
 export const isTool = <R = never>(value: Tool<R> | Namespace<R> | Tools<R> | undefined): value is Tool<R> =>
@@ -78,5 +79,5 @@ export const make = <I extends SchemaType, const O extends SchemaType | undefine
   description: options.description,
   input: options.input,
   output: options.output,
-  execute: (input) => options.execute(input as InputType<I>),
+  execute: (input, call) => options.execute(input as InputType<I>, call),
 })
