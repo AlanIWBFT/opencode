@@ -35,6 +35,7 @@ import { Plugin } from "../../plugin.js"
 import { PluginHooks } from "../../plugin/hooks.js"
 import { MAX_STEPS_PROMPT } from "./max-steps.js"
 import { ExecSessionControl } from "../../tool/exec-session/control.js"
+import { OpenAITurnState } from "../openai-turn-state.js"
 
 const CONTINUE_AFTER_INCOMPLETE_STREAM =
   "The previous response was interrupted. Continue from where you left off without repeating completed content."
@@ -62,6 +63,7 @@ const layer = Layer.effect(
     const titles = yield* FiberMap.make<SessionSchema.ID, void, never>()
 
     const drain = Effect.fn("SessionRunner.drain")(function* (input: Parameters<Interface["drain"]>[0]) {
+      const turnState = yield* OpenAITurnState.Current
       const sessionID = input.sessionID
       let force = input.force
       let continuing = input.continuation !== undefined
@@ -120,6 +122,7 @@ const layer = Layer.effect(
                 }),
               )
               if (!continuing && pending?.delivery !== "steer") {
+                turnState?.clear()
                 entering = true
                 step = 1
               }
@@ -219,7 +222,7 @@ const layer = Layer.effect(
         force = false
         entering = false
       }
-    })
+    }, OpenAITurnState.scoped)
 
     const prepareContext = Effect.fn("SessionRunner.prepareContext")(function* (sessionID: SessionSchema.ID) {
       // Plugins can reload mid-turn; each step and retry must read the settled agents, models and skills.
