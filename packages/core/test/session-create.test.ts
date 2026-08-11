@@ -1166,7 +1166,7 @@ describe("Session.create", () => {
         yield* session.shell({ sessionID: created.id, command })
 
         const messages = yield* session.messages({ sessionID: created.id, order: "asc" })
-        const shell = messages.find((message): message is SessionMessage.Shell => message.type === "shell")
+        const shell = messages.find((message) => message.type === "shell")
         expect(shell).toMatchObject({ type: "shell", command, status: "exited", exit: 0 })
         expect(shell?.output?.output).toContain("attached")
         expect(shell?.output?.truncated).toBe(false)
@@ -1186,7 +1186,7 @@ describe("Session.create", () => {
         yield* session.shell({ sessionID: created.id, command: "false" })
 
         const messages = yield* session.messages({ sessionID: created.id, order: "asc" })
-        const shell = messages.find((message): message is SessionMessage.Shell => message.type === "shell")
+        const shell = messages.find((message) => message.type === "shell")
         expect(shell).toMatchObject({ type: "shell", command: "false", status: "exited" })
         expect(shell?.exit).not.toBe(0)
         expect(shell?.time.completed).toBeDefined()

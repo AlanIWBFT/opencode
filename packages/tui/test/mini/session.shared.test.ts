@@ -206,6 +206,7 @@ describe("run session shared", () => {
         data: [
           {
             id: "msg_prompt",
+            seq: 0,
             type: "user",
             text: "Review @note.ts",
             files: [

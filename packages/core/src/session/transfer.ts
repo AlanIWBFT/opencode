@@ -28,6 +28,7 @@ import { detachExecMetadata } from "./exec-metadata.js"
 
 export const Data = SessionTransfer.Data
 export type Data = SessionTransfer.Data
+export type Exported = Omit<Data, "messages"> & { readonly messages: readonly SessionMessage.StoredInfo[] }
 
 export class ImportConflictError extends Schema.TaggedError<ImportConflictError>()(
   "SessionTransfer.ImportConflictError",
@@ -38,7 +39,7 @@ export interface Interface {
   readonly export: (input: {
     sessionID: Session.ID
     sanitize?: boolean
-  }) => Effect.Effect<Data, Session.NotFoundError | Session.MessageDecodeError>
+  }) => Effect.Effect<Exported, Session.NotFoundError | Session.MessageDecodeError>
   readonly import: (input: {
     data: Data
     location: Location.Ref
@@ -217,7 +218,7 @@ function metadata(kind: string, id: string, value: Readonly<Record<string, unkno
   return Object.keys(value).length > 0 ? { redacted: `${kind}:${id}` } : value
 }
 
-function sanitize(data: Data): Data {
+function sanitize(data: Exported): Exported {
   return {
     info: {
       ...data.info,
@@ -241,7 +242,7 @@ function sanitize(data: Data): Data {
           }
         : undefined,
     },
-    messages: data.messages.map(sanitizeMessage),
+    messages: data.messages.map((message) => ({ ...sanitizeMessage(message), seq: message.seq })),
   }
 }
 
