@@ -386,6 +386,9 @@ export const layer = Layer.effect(
           ? transport.bind(
               session.id,
               {
+                ...(request.model.provider === "openai" && request.model.route.protocol === "openai-responses"
+                  ? { maxMessageBytes: 15 * 1024 * 1024 }
+                  : {}),
                 handshake: (connect) =>
                   hooks
                     .trigger("session", "experimental.ws.handshake", {
