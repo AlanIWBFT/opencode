@@ -21,6 +21,7 @@ export interface ConnectResponsesWebSocketOptions {
 export interface StreamResponsesWebSocketOptions {
   socket: WebSocket
   body: Record<string, unknown>
+  message?: string
   idleTimeout?: number
   signal?: AbortSignal
   onFirstEvent?: (error?: WrappedError) => void
@@ -28,8 +29,13 @@ export interface StreamResponsesWebSocketOptions {
   onEvent?: (event: Record<string, unknown>) => void
   onTerminal?: (event: Record<string, unknown>) => void
   onRetryableTerminal?: (event: Record<string, unknown>) => Promise<WebSocket | undefined>
-  onConnectionInvalid?: (error: ProviderError.ResponseStreamError, closeCode?: number) => void
+  onConnectionInvalid?: (error: ProviderError.ResponseStreamError, info: ConnectionInvalidInfo) => void
   onAbort?: (error: Error) => void
+}
+
+export interface ConnectionInvalidInfo {
+  closeCode?: number
+  emitted: boolean
 }
 
 export interface WrappedError {
@@ -68,6 +74,11 @@ export function normalizeHeaders(headers: HeadersInit | undefined): Record<strin
 
 export function isAbortError(error: unknown): error is DOMException {
   return error instanceof DOMException && error.name === "AbortError"
+}
+
+export function responseCreateMessage(body: Record<string, unknown>) {
+  const { stream: _stream, background: _background, ...payload } = body
+  return JSON.stringify({ type: "response.create", ...payload })
 }
 
 export function connectResponsesWebSocket(options: ConnectResponsesWebSocketOptions) {
@@ -168,7 +179,7 @@ export function streamResponsesWebSocket(options: StreamResponsesWebSocketOption
     if (completed) return
     completed = true
     cleanup()
-    options.onConnectionInvalid?.(error, closeCode)
+    options.onConnectionInvalid?.(error, { closeCode, emitted })
     controller?.error(error)
   }
 
@@ -311,9 +322,8 @@ export function streamResponsesWebSocket(options: StreamResponsesWebSocketOption
       socket.off("error", onError)
       socket.off("close", onClose)
     }
-    const { stream: _stream, background: _background, ...payload } = options.body
     resetIdleTimeout("idle timeout sending websocket request")
-    socket.send(JSON.stringify({ type: "response.create", ...payload }), (error) => {
+    socket.send(options.message ?? responseCreateMessage(options.body), (error) => {
       if (completed) return
       resetIdleTimeout("idle timeout waiting for websocket")
       if (error) invalidate(new ProviderError.ResponseStreamError(error.message, { cause: error }))
