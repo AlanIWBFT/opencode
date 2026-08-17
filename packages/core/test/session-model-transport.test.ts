@@ -104,6 +104,149 @@ const automatic = () => {
 }
 
 describe("SessionModelTransport", () => {
+  test("preflights final rewritten UTF-8 bytes and returns to WebSocket for smaller requests", async () => {
+    const fixture = automatic()
+    await run(
+      fixture.connector,
+      Effect.gen(function* () {
+        const transport = yield* SessionModelTransport.Service
+        const executor = transport.bind(session, {
+          maxMessageBytes: 8,
+          send: (frame) => Effect.succeed(frame === "first" ? "中文中文" : frame),
+        })
+        expect(yield* collect(executor, exchange("first"))).toEqual(["fallback:first"])
+        expect(fixture.connections[0].sent).toEqual([])
+        expect(fixture.connections[0].closed).toBe(1)
+        expect(yield* collect(executor, exchange("small"))).toEqual(["completed:small"])
+      }),
+    )
+  })
+
+  test("measures the incremental frame and invalidates its baseline after size fallback", async () => {
+    const fixture = automatic()
+    const candidate = { protocol: "test", value: { response: "one" } }
+    const seen: unknown[] = []
+    const item = (id: string, full: string, delta = full): WebSocketChannelExchange => ({
+      ...exchange(id),
+      driver: {
+        create: (checkpoint) =>
+          Effect.sync(() => {
+            seen.push(checkpoint)
+            return { message: checkpoint ? delta : full, mode: checkpoint ? "incremental" : "full" }
+          }),
+        observe: (_create, frame) => Effect.succeed({ type: "completed", frame, checkpoint: candidate }),
+      },
+    })
+    await run(
+      fixture.connector,
+      Effect.gen(function* () {
+        const transport = yield* SessionModelTransport.Service
+        const executor = transport.bind(session, { maxMessageBytes: 8 })
+        yield* collectComplete(executor, item("first", "first"))
+        expect(yield* collectComplete(executor, item("delta", "a".repeat(100), "small"))).toEqual(["completed:small"])
+        expect(yield* collectComplete(executor, item("large", "b".repeat(100)))).toEqual(["fallback:large"])
+        expect(yield* collectComplete(executor, item("next", "next"))).toEqual(["completed:next"])
+        expect(seen).toEqual([undefined, candidate, candidate, undefined])
+      }),
+    )
+  })
+
+  test("learns a per-request 1009 limit without consuming the sticky failure budget", async () => {
+    const sent: string[] = []
+    const connector: WebSocketConnector = {
+      open: () =>
+        Effect.gen(function* () {
+          const messages = yield* Queue.unbounded<string | Uint8Array, AIError>()
+          return {
+            sendText: (message) =>
+              Effect.sync(() => {
+                sent.push(message)
+                if (message === "ok") {
+                  Queue.offerUnsafe(messages, "completed")
+                  return
+                }
+                Queue.failCauseUnsafe(
+                  messages,
+                  Cause.fail(
+                    new AIError({
+                      reason: new TransportError({
+                        message: "too big",
+                        transport: "websocket",
+                        operation: "read",
+                        phase: "close",
+                        code: "1009",
+                      }),
+                    }),
+                  ),
+                )
+              }),
+            messages: Stream.fromQueue(messages),
+            close: Queue.shutdown(messages).pipe(Effect.asVoid),
+          }
+        }),
+    }
+    await run(
+      connector,
+      Effect.gen(function* () {
+        const transport = yield* SessionModelTransport.Service
+        const executor = transport.bind(session, { maxMessageBytes: 1000 })
+        expect(yield* collect(executor, exchange("x".repeat(100)))).toEqual([`fallback:${"x".repeat(100)}`])
+        expect(yield* collect(executor, exchange("x".repeat(95)))).toEqual([`fallback:${"x".repeat(95)}`])
+        for (const size of [80, 60, 40, 20])
+          expect(yield* collect(executor, exchange("x".repeat(size)))).toEqual([`fallback:${"x".repeat(size)}`])
+        expect(sent.map((message) => message.length)).toEqual([100, 80, 60, 40, 20])
+        expect(yield* collect(executor, exchange("ok"))).toEqual(["completed"])
+        expect(sent.at(-1)).toBe("ok")
+      }),
+    )
+  })
+
+  test("1009 after provider output fails without HTTP replay but still learns the smaller limit", async () => {
+    const fixture = automatic()
+    let fallback = 0
+    await run(
+      fixture.connector,
+      Effect.gen(function* () {
+        const transport = yield* SessionModelTransport.Service
+        const executor = transport.bind(session, { maxMessageBytes: 100 })
+        const first: WebSocketChannelExchange = {
+          ...exchange("x".repeat(20), {
+            fallback: () => {
+              fallback++
+              return Stream.make("http")
+            },
+          }),
+          driver: {
+            create: () => Effect.succeed({ message: "x".repeat(20), mode: "full" }),
+            observe: (_create, frame) =>
+              Effect.sync(() => {
+                Queue.failCauseUnsafe(
+                  fixture.connections[0].messages,
+                  Cause.fail(
+                    new AIError({
+                      reason: new TransportError({
+                        message: "too big",
+                        transport: "websocket",
+                        operation: "read",
+                        phase: "close",
+                        code: "1009",
+                      }),
+                    }),
+                  ),
+                )
+                return { type: "frame", frame }
+              }),
+          },
+        }
+        const failure = yield* collect(executor, first).pipe(Effect.flip)
+        expect(failure.reason).toMatchObject({ code: "1009", delivery: "accepted" })
+        expect(fallback).toBe(0)
+        expect(yield* collect(executor, exchange("x".repeat(19)))).toEqual([`fallback:${"x".repeat(19)}`])
+        expect(yield* collect(executor, exchange("small"))).toEqual(["completed:small"])
+      }),
+    )
+  })
+
   test("exposes response metadata once the lazy connection opens", async () => {
     const http = new HttpContext({
       url: "https://provider.test/responses",
