@@ -330,7 +330,21 @@ export async function CodexAuthPlugin(input: PluginInput, options: CodexAuthPlug
       async loader(getAuth) {
         const auth = await getAuth()
         const websocketFetch = options.experimentalWebSockets
-          ? OpenAIWebSocketPool.createWebSocketFetch({ httpFetch: fetch })
+          ? OpenAIWebSocketPool.createWebSocketFetch({
+              httpFetch: fetch,
+              diagnostic(message, extra) {
+                void input.client.app
+                  .log({
+                    body: {
+                      service: "openai.websocket",
+                      level: "info",
+                      message,
+                      extra: { ...extra, service: "openai.websocket" },
+                    },
+                  })
+                  .catch(() => {})
+              },
+            })
           : undefined
         if (websocketFetch) {
           websocketFetches.push(websocketFetch)

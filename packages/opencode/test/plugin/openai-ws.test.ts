@@ -171,6 +171,258 @@ describe("plugin.openai.ws-pool", () => {
     fetch.close()
   })
 
+  test("sends only the input delta with previous_response_id on a healthy socket", async () => {
+    const bodies: Record<string, unknown>[] = []
+    const diagnostics: Array<{ message: string; extra: Record<string, unknown> }> = []
+    const assistant = {
+      role: "assistant",
+      id: "msg_1",
+      content: [{ type: "output_text", text: "assistant output" }],
+    }
+    await using server = await createWebSocketServer((socket) => {
+      socket.on("message", (data) => {
+        bodies.push(JSON.parse(data.toString()))
+        const response =
+          bodies.length === 1
+            ? {
+                id: "resp_1",
+                output: [
+                  {
+                    type: "message",
+                    role: "assistant",
+                    id: "msg_1",
+                    status: "completed",
+                    phase: null,
+                    content: [{ type: "output_text", text: "assistant output", annotations: [], logprobs: null }],
+                  },
+                ],
+              }
+            : { id: "resp_2", output: [] }
+        socket.send(JSON.stringify({ type: "response.completed", response }))
+      })
+    })
+    const fetch = OpenAIWebSocketPool.createWebSocketFetch({
+      url: server.url,
+      diagnostic: (message, extra) => diagnostics.push({ message, extra }),
+    })
+    const firstInput = [{ role: "user", content: [{ type: "input_text", text: "hello" }] }]
+    const next = { role: "user", content: [{ type: "input_text", text: "next" }] }
+
+    const first = await fetch(server.url, streamRequest({}, undefined, firstInput, { model: "gpt-test" }))
+    expect(await first.text()).toContain("data: [DONE]")
+    const second = await fetch(
+      server.url,
+      streamRequest({}, undefined, [...firstInput, assistant, next], { model: "gpt-test" }),
+    )
+    expect(await second.text()).toContain("data: [DONE]")
+
+    expect(bodies).toHaveLength(2)
+    expect(bodies[1]?.previous_response_id).toBe("resp_1")
+    expect(bodies[1]?.input).toEqual([next])
+    expect(diagnostics.at(-1)).toEqual({
+      message: "openai responses transport",
+      extra: {
+        sessionID: "session-1",
+        transport: "websocket",
+        socket: "reused",
+        continuation: true,
+        messageBytes: expect.any(Number),
+        maxMessageBytes: 15 * 1024 * 1024,
+      },
+    })
+    fetch.close()
+  })
+
+  test("sends full input after replacing the socket", async () => {
+    let connections = 0
+    const bodies: Record<string, unknown>[] = []
+    const assistant = {
+      role: "assistant",
+      id: "msg_1",
+      content: [{ type: "output_text", text: "assistant output" }],
+    }
+    await using server = await createWebSocketServer((socket) => {
+      connections += 1
+      socket.once("message", (data) => {
+        bodies.push(JSON.parse(data.toString()))
+        const response =
+          connections === 1
+            ? { id: "resp_1", output: [{ type: "message", status: "completed", ...assistant }] }
+            : { id: "resp_2", output: [] }
+        socket.send(JSON.stringify({ type: "response.completed", response }))
+      })
+    })
+    const fetch = OpenAIWebSocketPool.createWebSocketFetch({ url: server.url, maxConnectionAge: 0 })
+    const firstInput = [{ role: "user", content: [{ type: "input_text", text: "hello" }] }]
+    const secondInput = [...firstInput, assistant, { role: "user", content: [{ type: "input_text", text: "next" }] }]
+
+    const first = await fetch(server.url, streamRequest({}, undefined, firstInput))
+    expect(await first.text()).toContain("data: [DONE]")
+    const second = await fetch(server.url, streamRequest({}, undefined, secondInput))
+    expect(await second.text()).toContain("data: [DONE]")
+
+    expect(connections).toBe(2)
+    expect(bodies[1]?.previous_response_id).toBeUndefined()
+    expect(bodies[1]?.input).toEqual(secondInput)
+    fetch.close()
+  })
+
+  test("sends the full input when non-input request properties change", async () => {
+    const bodies: Record<string, unknown>[] = []
+    await using server = await createWebSocketServer((socket) => {
+      socket.on("message", (data) => {
+        bodies.push(JSON.parse(data.toString()))
+        socket.send(
+          JSON.stringify({ type: "response.completed", response: { id: `resp_${bodies.length}`, output: [] } }),
+        )
+      })
+    })
+    const fetch = OpenAIWebSocketPool.createWebSocketFetch({ url: server.url })
+    const firstInput = [{ role: "user", content: [{ type: "input_text", text: "hello" }] }]
+    const secondInput = [...firstInput, { role: "user", content: [{ type: "input_text", text: "next" }] }]
+
+    const first = await fetch(server.url, streamRequest({}, undefined, firstInput, { instructions: "first" }))
+    expect(await first.text()).toContain("data: [DONE]")
+    const second = await fetch(server.url, streamRequest({}, undefined, secondInput, { instructions: "second" }))
+    expect(await second.text()).toContain("data: [DONE]")
+
+    expect(bodies[1]?.previous_response_id).toBeUndefined()
+    expect(bodies[1]?.input).toEqual(secondInput)
+    fetch.close()
+  })
+
+  test("uses HTTP for an oversized frame and reevaluates websocket transport on the next request", async () => {
+    let connections = 0
+    const bodies: Record<string, unknown>[] = []
+    const diagnostics: Array<{ message: string; extra: Record<string, unknown> }> = []
+    await using server = await createWebSocketServer((socket) => {
+      connections += 1
+      socket.on("message", (data) => {
+        bodies.push(JSON.parse(data.toString()))
+        socket.send(
+          JSON.stringify({ type: "response.completed", response: { id: `resp_${bodies.length}`, output: [] } }),
+        )
+      })
+    })
+    const fetch = OpenAIWebSocketPool.createWebSocketFetch({
+      url: server.url,
+      maxMessageBytes: 400,
+      diagnostic: (message, extra) => diagnostics.push({ message, extra }),
+    })
+    const firstInput = [{ role: "user", content: [{ type: "input_text", text: "hello" }] }]
+
+    const first = await fetch(server.url, streamRequest({}, undefined, firstInput))
+    expect(await first.text()).toContain("data: [DONE]")
+    const oversized = await fetch(
+      server.url,
+      streamRequest({}, undefined, [
+        ...firstInput,
+        { role: "user", content: [{ type: "input_text", text: "x".repeat(1_000) }] },
+      ]),
+    )
+    expect(await oversized.text()).toBe("http")
+    const smallerInput = [{ role: "user", content: [{ type: "input_text", text: "compacted" }] }]
+    const smaller = await fetch(server.url, streamRequest({}, undefined, smallerInput))
+    expect(await smaller.text()).toContain("data: [DONE]")
+
+    expect(connections).toBe(2)
+    expect(server.httpRequests).toHaveLength(1)
+    expect(bodies).toHaveLength(2)
+    expect(bodies[1]?.previous_response_id).toBeUndefined()
+    expect(bodies[1]?.input).toEqual(smallerInput)
+    expect(
+      diagnostics.some(
+        (item) =>
+          item.message === "openai responses transport" &&
+          item.extra.transport === "http" &&
+          item.extra.reason === "message-too-large" &&
+          typeof item.extra.messageBytes === "number",
+      ),
+    ).toBe(true)
+    fetch.close()
+  })
+
+  test("retries a delayed 1009 close over HTTP without making fallback sticky", async () => {
+    let connections = 0
+    const bodies: Record<string, unknown>[] = []
+    const diagnostics: Array<{ message: string; extra: Record<string, unknown> }> = []
+    await using server = await createWebSocketServer((socket) => {
+      connections += 1
+      socket.once("message", async (data) => {
+        bodies.push(JSON.parse(data.toString()))
+        if (connections === 1) {
+          await sleep(150)
+          socket.close(1009, "payload too large")
+          return
+        }
+        socket.send(JSON.stringify({ type: "response.completed", response: { id: "resp_after_1009", output: [] } }))
+      })
+    })
+    const fetch = OpenAIWebSocketPool.createWebSocketFetch({
+      url: server.url,
+      maxMessageBytes: 10_000,
+      diagnostic: (message, extra) => diagnostics.push({ message, extra }),
+    })
+    const rejectedInput = [{ role: "user", content: [{ type: "input_text", text: "x".repeat(1_000) }] }]
+
+    const rejected = await fetch(server.url, streamRequest({}, undefined, rejectedInput))
+    expect(await rejected.text()).toBe("http")
+    const nextInput = [{ role: "user", content: [{ type: "input_text", text: "small" }] }]
+    const next = await fetch(server.url, streamRequest({}, undefined, nextInput))
+    expect(await next.text()).toContain("data: [DONE]")
+
+    expect(connections).toBe(2)
+    expect(server.httpRequests).toHaveLength(1)
+    expect(bodies).toHaveLength(2)
+    expect(bodies[1]?.previous_response_id).toBeUndefined()
+    expect(bodies[1]?.input).toEqual(nextInput)
+    expect(
+      diagnostics.some(
+        (item) => item.message === "openai websocket message too large" && item.extra.closeCode === 1009,
+      ),
+    ).toBe(true)
+    expect(diagnostics.some((item) => item.extra.transport === "http" && item.extra.reason === "websocket-1009")).toBe(
+      true,
+    )
+    fetch.close()
+  })
+
+  test("preserves a non-success HTTP error after a delayed 1009 close", async () => {
+    let httpAttempts = 0
+    await using server = await createWebSocketServer((socket) => {
+      socket.once("message", async () => {
+        await sleep(150)
+        socket.close(1009, "payload too large")
+      })
+    })
+    const httpFetch = Object.assign(
+      async () => {
+        httpAttempts += 1
+        return new Response(JSON.stringify({ error: { message: "rate limited" } }), {
+          status: 429,
+          headers: { "content-type": "application/json", "retry-after": "10" },
+        })
+      },
+      { preconnect() {} },
+    )
+    const fetch = OpenAIWebSocketPool.createWebSocketFetch({
+      url: server.url,
+      maxMessageBytes: 10_000,
+      httpFetch,
+    })
+
+    const response = await fetch(server.url, streamRequest())
+    const error = await readTextError(response.text())
+
+    expect(APICallError.isInstance(error)).toBe(true)
+    if (!APICallError.isInstance(error)) throw new Error("Expected APICallError")
+    expect(error.statusCode).toBe(429)
+    expect(error.responseHeaders?.["retry-after"]).toBe("10")
+    expect(error.responseBody).toBe(JSON.stringify({ error: { message: "rate limited" } }))
+    expect(httpAttempts).toBe(1)
+    fetch.close()
+  })
+
   test("reuses a websocket negotiated for remote compaction", async () => {
     let connections = 0
     let betaFeatures: string | undefined
@@ -267,9 +519,9 @@ describe("plugin.openai.ws-pool", () => {
 
     expect(fetch.providerHeaderTimeout(server.url, streamRequest(), 10_000)).toBeGreaterThan(15_000)
     expect(fetch.providerHeaderTimeout(server.url, streamRequest({ [TITLE_HEADER]: "true" }), 10_000)).toBe(10_000)
-    expect(fetch.providerHeaderTimeout(server.url, { method: "POST", body: JSON.stringify({ stream: true }) }, 10_000)).toBe(
-      10_000,
-    )
+    expect(
+      fetch.providerHeaderTimeout(server.url, { method: "POST", body: JSON.stringify({ stream: true }) }, 10_000),
+    ).toBe(10_000)
     fetch.close()
   })
 
@@ -902,7 +1154,12 @@ describe("plugin.openai.ws-pool", () => {
   })
 })
 
-function streamRequest(headers?: Record<string, string>, signal?: AbortSignal, input: unknown = "hi"): RequestInit {
+function streamRequest(
+  headers?: Record<string, string>,
+  signal?: AbortSignal,
+  input: unknown = "hi",
+  body?: Record<string, unknown>,
+): RequestInit {
   return {
     method: "POST",
     headers: {
@@ -910,7 +1167,7 @@ function streamRequest(headers?: Record<string, string>, signal?: AbortSignal, i
       authorization: "Bearer test",
       ...headers,
     },
-    body: JSON.stringify({ stream: true, input }),
+    body: JSON.stringify({ stream: true, input, ...body }),
     signal,
   }
 }
