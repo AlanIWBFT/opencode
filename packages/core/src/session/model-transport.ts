@@ -35,6 +35,7 @@ const metric = (event: string, attributes: Record<string, string> = {}) =>
 interface Active {
   readonly queue: Queue.Queue<string, AIError>
   delivery: "send-attempted" | "provider-observed" | "terminal"
+  readonly size?: { readonly bytes: number; readonly limit: number }
 }
 
 interface Channel {
@@ -49,10 +50,12 @@ interface Channel {
 }
 
 interface State {
+  readonly sessionID: SessionSchema.ID
   readonly lock: Semaphore.Semaphore
   closed: boolean
   httpFallback: boolean
   streamFailures: number
+  maxMessageBytes?: number
   channel?: Channel
 }
 
@@ -67,6 +70,8 @@ export interface Handshake {
  * frame after the driver builds it; `receive` sees each inbound frame before the driver observes it.
  */
 export interface Interceptor {
+  /** Opt into per-request oversized fallback and a learned 1009 limit, instead of sticky HTTP. */
+  readonly maxMessageBytes?: number
   readonly handshake?: (connect: Handshake) => Effect.Effect<Handshake>
   readonly send?: (frame: string) => Effect.Effect<string>
   readonly receive?: (frame: string) => Effect.Effect<string>
@@ -133,7 +138,13 @@ export const makeLayer = (connector: WebSocketConnector) =>
       const state = (sessionID: SessionSchema.ID) => {
         const current = states.get(sessionID)
         if (current) return current
-        const created = { lock: Semaphore.makeUnsafe(1), closed: false, httpFallback: false, streamFailures: 0 }
+        const created = {
+          sessionID,
+          lock: Semaphore.makeUnsafe(1),
+          closed: false,
+          httpFallback: false,
+          streamFailures: 0,
+        }
         states.set(sessionID, created)
         return created
       }
@@ -176,8 +187,21 @@ export const makeLayer = (connector: WebSocketConnector) =>
           active: channel.active !== undefined,
         })
         if (channel.active) {
-          Queue.failCauseUnsafe(channel.active.queue, Cause.fail(error))
-          yield* streamFailure(owner)
+          const active = channel.active
+          const size = active.size
+          const tooLarge = size && error.reason._tag === "Transport" && error.reason.code === "1009"
+          if (tooLarge) {
+            owner.maxMessageBytes = Math.min(size.limit, Math.max(1, Math.floor(size.bytes * 0.9)))
+            yield* Effect.logInfo("session websocket size limit lowered", {
+              sessionID: owner.sessionID,
+              messageBytes: size.bytes,
+              previousMaxMessageBytes: size.limit,
+              maxMessageBytes: owner.maxMessageBytes,
+              delivery: error.reason._tag === "Transport" ? error.reason.delivery : undefined,
+            })
+          }
+          Queue.failCauseUnsafe(active.queue, Cause.fail(error))
+          if (!tooLarge) yield* streamFailure(owner)
         }
         yield* metric("protocol_failure")
         yield* channel.connection.close
@@ -375,14 +399,36 @@ export const makeLayer = (connector: WebSocketConnector) =>
         const message = interceptor?.send
           ? yield* interceptor.send(create.message).pipe(Effect.onInterrupt(() => closeChannel(owner, channel)))
           : create.message
-        yield* Effect.logDebug("session websocket sending", {
+        const size =
+          interceptor?.maxMessageBytes === undefined
+            ? undefined
+            : {
+                bytes: Buffer.byteLength(message),
+                limit: Math.min(interceptor.maxMessageBytes, owner.maxMessageBytes ?? interceptor.maxMessageBytes),
+              }
+        if (size && size.bytes > size.limit) {
+          yield* closeChannel(owner, channel)
+          yield* Effect.logInfo("session websocket request exceeds byte limit; using http for this request", {
+            sessionID: owner.sessionID,
+            messageBytes: size.bytes,
+            maxMessageBytes: size.limit,
+            mode: create.mode,
+          })
+          yield* metric("fallback", { reason: "message_size_preflight" })
+          return fallback(exchange)
+        }
+        yield* (size ? Effect.logInfo : Effect.logDebug)("session websocket sending", {
+          sessionID: owner.sessionID,
           sessionTransport: "websocket",
           phase: "send",
           mode: create.mode,
+          reused: channel === current,
+          ...(size ? { messageBytes: size.bytes, maxMessageBytes: size.limit } : {}),
         })
         const active: Active = {
           queue: yield* Queue.unbounded<string, AIError>(),
           delivery: "send-attempted",
+          size,
         }
         channel.active = active
         const sent = yield* channel.connection.sendText(message).pipe(
@@ -484,7 +530,7 @@ export const makeLayer = (connector: WebSocketConnector) =>
               error.reason.delivery !== "rejected"
             )
               return Stream.fail(error)
-            owner.httpFallback = true
+            if (!size) owner.httpFallback = true
             return Stream.unwrap(
               Effect.logWarning("session websocket request too large; using http", {
                 sessionTransport: "websocket",
