@@ -21,6 +21,7 @@
     "fix-node-pty": "bun run script/fix-node-pty.ts",
     "build": "bun run script/build.ts",
     "pack": "bun run script/pack.ts",
+    "build:windows-recycle": "bun run script/ensure-windows-recycle.ts",
     "update-models-snapshot": "bun run script/update-models-snapshot.ts",
     "test": "bun run script/test.ts",
     "typecheck": "bun check --no-script -b -p tsconfig.tests.json",
