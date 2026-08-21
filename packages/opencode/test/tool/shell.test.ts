@@ -3,6 +3,7 @@ import { describe, expect } from "bun:test"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Cause, Effect, Exit, Layer } from "effect"
 import type * as Scope from "effect/Scope"
+import fs from "fs/promises"
 import os from "os"
 import path from "path"
 import { Config } from "@/config/config"
@@ -87,6 +88,10 @@ const quote = (text: string) => `"${text}"`
 const squote = (text: string) => `'${text}'`
 const psquote = (text: string) => `'${text.replaceAll("'", "''")}'`
 const projectRoot = path.join(__dirname, "../..")
+const windowsRecycleHelper = path.join(
+  projectRoot,
+  "src/windows-recycle/bin/Release/netstandard2.0/OpenCode.Windows.RecycleBin.dll",
+)
 const bin = quote(process.execPath.replaceAll("\\", "/"))
 const bash = (() => {
   const shell = Shell.acceptable()
@@ -534,6 +539,29 @@ if (Test-Path -LiteralPath ${psquote(file)}) { 'exists' } else { 'missing' }`,
       ),
     )
 
+    it.live(`loads the recycle helper without locking its source DLL [${item.label}]`, () =>
+      withShell(
+        item,
+        Effect.gen(function* () {
+          const tmp = yield* tmpdirScoped()
+          yield* runIn(
+            tmp,
+            Effect.gen(function* () {
+              const file = path.join(tmp, "load-helper.txt")
+              const result = yield* run({
+                command: `Set-Content -LiteralPath ${psquote(file)} -Value x
+Remove-Item -LiteralPath ${psquote(file)}
+$stream = [System.IO.File]::Open(${psquote(windowsRecycleHelper)}, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+try { 'replaceable' } finally { $stream.Dispose() }`,
+              })
+              expect(result.metadata.exit).toBe(0)
+              expect(result.output).toContain("replaceable")
+            }),
+          )
+        }),
+      ),
+    )
+
     it.live(`blocks missing recycle targets with policy guidance [${item.label}]`, () =>
       withShell(
         item,
@@ -561,7 +589,7 @@ if (Test-Path -LiteralPath ${psquote(file)}) { 'exists' } else { 'missing' }`,
     )
 
     it.live(
-      `reports the OS cause when a recycle target is locked [${item.label}]`,
+      `reports an ordinary handle that blocks recycling [${item.label}]`,
       () =>
         withShell(
           item,
@@ -583,13 +611,152 @@ try {
                 expect(result.metadata.exit).not.toBe(0)
                 expect(result.output).toContain("Deletion could not be completed safely")
                 expect(result.output).toContain("the Recycle Bin operation failed for the file")
-                expect(result.output).toMatch(/Cause: System\.IO\.IOException:/)
+                expect(result.output).toContain("COPYENGINE_E_SHARING_VIOLATION")
+                expect(result.output).toContain(file)
+                expect(result.output).toContain("open handle denies deletion")
                 expect(result.output.replace(/\s+/g, "")).toContain(
                   "Thetargetwasnotdeleted.FilesystemdeletionisonlyperformedthroughtheRecycleBin.",
                 )
                 expect(result.output.replace(/\s+/g, "")).toContain(
                   "Donotbypassthissafeguardorretrywithpermanentdeletion;asktheuserhowtoproceed.",
                 )
+              }),
+            )
+          }),
+        ),
+      15_000,
+    )
+
+    it.live(
+      `reports a memory-mapped data file that blocks recycling [${item.label}]`,
+      () =>
+        withShell(
+          item,
+          Effect.gen(function* () {
+            const tmp = yield* Effect.acquireRelease(
+              Effect.promise(() => fs.mkdtemp(path.join(path.dirname(projectRoot), "opencode-map-test-"))),
+              (directory) => Effect.promise(() => fs.rm(directory, { recursive: true, force: true })),
+            )
+            yield* runIn(
+              tmp,
+              Effect.gen(function* () {
+                const file = path.join(tmp, "mapped.txt")
+                const result = yield* run({
+                  command: `Set-Content -LiteralPath ${psquote(file)} -Value mapped
+$stream = [System.IO.File]::Open(${psquote(file)}, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete))
+$mapping = [System.IO.MemoryMappedFiles.MemoryMappedFile]::CreateFromFile($stream, [System.Management.Automation.Language.NullString]::Value, 0, [System.IO.MemoryMappedFiles.MemoryMappedFileAccess]::ReadWrite, [System.IO.HandleInheritability]::None, $false)
+$view = $mapping.CreateViewAccessor()
+$stream.Dispose()
+try {
+  Remove-Item -LiteralPath ${psquote(file)}
+} finally {
+  $view.Dispose()
+  $mapping.Dispose()
+}`,
+                })
+                expect(result.metadata.exit).not.toBe(0)
+                expect(result.output).toContain(file)
+                expect(result.output).toContain("memory-mapped file")
+                expect(result.output).toContain("PID ")
+              }),
+            )
+          }),
+        ),
+      15_000,
+    )
+
+    it.live(
+      `reports a loaded image inside a directory that blocks recycling [${item.label}]`,
+      () =>
+        withShell(
+          item,
+          Effect.gen(function* () {
+            const tmp = yield* tmpdirScoped()
+            yield* runIn(
+              tmp,
+              Effect.gen(function* () {
+                const target = path.join(tmp, "loaded-image")
+                const image = path.join(target, "image.dll")
+                const result = yield* run({
+                  command: `New-Item -ItemType Directory -Path ${psquote(target)} | Out-Null
+Copy-Item -LiteralPath ${psquote(windowsRecycleHelper)} -Destination ${psquote(image)}
+$assembly = [System.Reflection.Assembly]::LoadFile(${psquote(image)})
+Remove-Item -LiteralPath ${psquote(target)} -Recurse`,
+                })
+                expect(result.metadata.exit).not.toBe(0)
+                expect(result.output).toContain(image)
+                expect(result.output).toContain("loaded image")
+                expect(result.output).toContain("PID ")
+              }),
+            )
+          }),
+        ),
+      15_000,
+    )
+
+    it.live(
+      `recycles an open file that allows delete sharing [${item.label}]`,
+      () =>
+        withShell(
+          item,
+          Effect.gen(function* () {
+            const tmp = yield* tmpdirScoped()
+            yield* runIn(
+              tmp,
+              Effect.gen(function* () {
+                const file = path.join(tmp, "delete-sharing.txt")
+                const result = yield* run({
+                  command: `Set-Content -LiteralPath ${psquote(file)} -Value shared
+$stream = [System.IO.File]::Open(${psquote(file)}, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete))
+try {
+  Remove-Item -LiteralPath ${psquote(file)}
+  if (Test-Path -LiteralPath ${psquote(file)}) { 'exists' } else { 'missing' }
+} finally {
+  $stream.Dispose()
+}`,
+                })
+                expect(result.metadata.exit).toBe(0)
+                expect(result.output).toContain("missing")
+                expect(result.output).not.toContain("Deletion could not be completed safely")
+              }),
+            )
+          }),
+        ),
+      15_000,
+    )
+
+    it.live(
+      `marks process attribution partial after its item limit [${item.label}]`,
+      () =>
+        withShell(
+          item,
+          Effect.gen(function* () {
+            const tmp = yield* tmpdirScoped()
+            yield* runIn(
+              tmp,
+              Effect.gen(function* () {
+                const target = path.join(tmp, "many-locks")
+                const result = yield* run({
+                  command: `$target = ${psquote(target)}
+$null = New-Item -ItemType Directory -Path $target
+$streams = [System.Collections.Generic.List[System.IDisposable]]::new()
+try {
+  foreach ($index in 1..9) {
+    $file = Join-Path $target "locked-$index.txt"
+    Set-Content -LiteralPath $file -Value locked
+    $streams.Add([System.IO.File]::Open($file, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None))
+  }
+  __opencodeEnsureRecycleApi
+  $recycle = [OpenCode.Windows.RecycleBin]::Recycle($target)
+  "complete=$($recycle.LockDiagnosis.Complete)"
+  $recycle.LockDiagnosis.Issues
+} finally {
+  foreach ($stream in $streams) { $stream.Dispose() }
+}`,
+                })
+                expect(result.metadata.exit).toBe(0)
+                expect(result.output).toContain("complete=False")
+                expect(result.output).toContain("Process attribution stopped after 8 blocking items.")
               }),
             )
           }),

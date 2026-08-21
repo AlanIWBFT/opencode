@@ -5,6 +5,7 @@ import path from "path"
 import { fileURLToPath } from "url"
 import { createSolidTransformPlugin } from "@opentui/solid/bun-plugin"
 import { selectBuildTargets, type BuildTarget } from "./target-selection"
+import { buildWindowsRecycleHelper, windowsRecycleAssembly } from "./ensure-windows-recycle"
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -111,6 +112,9 @@ const targets = selectBuildTargets(allTargets, process.argv.slice(2), {
   os: process.platform,
   arch: process.arch,
 })
+if (targets.some((item) => item.os === "win32")) {
+  await buildWindowsRecycleHelper()
+}
 
 await $`rm -rf dist`
 
@@ -133,6 +137,9 @@ for (const item of targets) {
     .join("-")
   console.log(`building ${name}`)
   await $`mkdir -p dist/${name}/bin`
+  if (item.os === "win32") {
+    await Bun.write(`dist/${name}/bin/OpenCode.Windows.RecycleBin.dll`, Bun.file(windowsRecycleAssembly))
+  }
 
   const workerPath = "./src/cli/tui/worker.ts"
   const treeSitterWorkerPath = "opentui-tree-sitter-worker.js"

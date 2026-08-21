@@ -65,7 +65,22 @@ const CMD_FILES = new Set([
 const FLAGS = new Set(["-destination", "-literalpath", "-path"])
 const SWITCHES = new Set(["-confirm", "-debug", "-force", "-nonewline", "-recurse", "-verbose", "-whatif"])
 
-const POWERSHELL_RECYCLE_PRELUDE = String.raw`
+const WINDOWS_RECYCLE_HELPER = "OpenCode.Windows.RecycleBin.dll"
+const WINDOWS_RECYCLE_PROTOCOL = 2
+
+function windowsRecycleHelperPath() {
+  const runtime = path.basename(process.execPath).toLowerCase()
+  if (!["bun", "bun.exe", "node", "node.exe"].includes(runtime)) {
+    return path.join(path.dirname(process.execPath), WINDOWS_RECYCLE_HELPER)
+  }
+  return fileURLToPath(
+    new URL(`../windows-recycle/bin/Release/netstandard2.0/${WINDOWS_RECYCLE_HELPER}`, import.meta.url),
+  )
+}
+
+function powershellRecyclePrelude() {
+  const helper = powershellQuote(windowsRecycleHelperPath())
+  return String.raw`
 function __opencodeBlockedDelete {
   param(
     [Parameter(Mandatory = $true)] [string] $Reason,
@@ -85,12 +100,72 @@ function __opencodeBlockedDelete {
 }
 
 function __opencodeEnsureRecycleApi {
-  if ($null -ne ('Microsoft.VisualBasic.FileIO.FileSystem' -as [type])) { return }
-  try {
-    Add-Type -AssemblyName Microsoft.VisualBasic -ErrorAction Stop
-  } catch {
-    __opencodeBlockedDelete -Reason 'the Recycle Bin API is unavailable.' -Exception $_.Exception
+  if ($null -eq ('OpenCode.Windows.RecycleBin' -as [type])) {
+    try {
+      $null = [System.Reflection.Assembly]::Load([System.IO.File]::ReadAllBytes(${helper}))
+    } catch {
+      __opencodeBlockedDelete -Reason 'the Recycle Bin helper is unavailable.' -Exception $_.Exception
+    }
   }
+
+  if ([OpenCode.Windows.RecycleBin]::ProtocolVersion -ne ${WINDOWS_RECYCLE_PROTOCOL}) {
+    __opencodeBlockedDelete -Reason 'the Recycle Bin helper protocol is incompatible.'
+  }
+}
+
+function __opencodeRecycleFailureReason {
+  param(
+    [Parameter(Mandatory = $true)] [string] $Target,
+    [Parameter(Mandatory = $true)] [string] $Kind,
+    [Parameter(Mandatory = $true)] [object] $Result
+  )
+
+  $code = if ([string]::IsNullOrWhiteSpace($Result.HResultName)) { $Result.HResultHex } else { $Result.HResultName }
+  $lines = [System.Collections.Generic.List[string]]::new()
+  $lines.Add("the Recycle Bin operation failed for the $($Kind): $Target. $($code): $($Result.Message)")
+  $diagnosis = $Result.LockDiagnosis
+  if ($null -eq $diagnosis) { return ($lines -join [Environment]::NewLine) }
+
+  if ($diagnosis.BlockingItems.Count -eq 0) {
+    $lines.Add('The specific blocking item could not be identified; it may have been released before diagnosis completed.')
+  } else {
+    $lines.Add('Blocking items observed at diagnosis time:')
+    foreach ($blockingItem in $diagnosis.BlockingItems) {
+      $blockingKind = if ($blockingItem.Kind -eq 'mapped-image') {
+        'loaded image'
+      } elseif ($blockingItem.Kind -eq 'mapped-file') {
+        'memory-mapped file'
+      } else {
+        'open handle denies deletion'
+      }
+      $processes = [System.Collections.Generic.List[string]]::new()
+      foreach ($process in $blockingItem.Processes) {
+        $name = if ([string]::IsNullOrWhiteSpace($process.Name)) { 'process' } else { $process.Name }
+        $processes.Add("$name (PID $($process.ProcessId))")
+      }
+      $owner = if ($processes.Count -eq 0) { '' } else { '; ' + ($processes -join ', ') }
+      $lines.Add("- $($blockingItem.Path) ($blockingKind$owner)")
+    }
+  }
+  if (-not $diagnosis.Complete) {
+    $lines.Add('Lock diagnosis was partial; additional blocking items or process details may not have been identified.')
+  }
+  return ($lines -join [Environment]::NewLine)
+}
+
+function __opencodeRecycle {
+  param(
+    [Parameter(Mandatory = $true)] [string] $Target,
+    [Parameter(Mandatory = $true)] [string] $Kind
+  )
+
+  try {
+    $result = [OpenCode.Windows.RecycleBin]::Recycle($Target)
+  } catch {
+    __opencodeBlockedDelete -Reason "the Recycle Bin helper failed for the $($Kind): $Target." -Exception $_.Exception
+  }
+  if ($result.Succeeded) { return }
+  __opencodeBlockedDelete -Reason (__opencodeRecycleFailureReason -Target $Target -Kind $Kind -Result $result)
 }
 
 function __opencodeResolveRemoveItemTargets {
@@ -157,20 +232,12 @@ function __opencodeMoveToRecycleBin {
   __opencodeEnsureRecycleApi
 
   if ([System.IO.Directory]::Exists($target)) {
-    try {
-      [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory($target, [Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs, [Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin)
-    } catch {
-      __opencodeBlockedDelete -Reason "the Recycle Bin operation failed for the directory: $target." -Exception $_.Exception
-    }
+    __opencodeRecycle -Target $target -Kind 'directory'
     return
   }
 
   if ([System.IO.File]::Exists($target)) {
-    try {
-      [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile($target, [Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs, [Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin)
-    } catch {
-      __opencodeBlockedDelete -Reason "the Recycle Bin operation failed for the file: $target." -Exception $_.Exception
-    }
+    __opencodeRecycle -Target $target -Kind 'file'
     return
   }
 
@@ -205,6 +272,7 @@ foreach ($__opencodeAlias in @('rm', 'del', 'erase', 'rmdir', 'rd')) {
   Set-Alias -Name $__opencodeAlias -Value Remove-Item -Option AllScope -Force
 }
 `
+}
 
 const POWERSHELL_UTF8_PRELUDE = String.raw`
 $__opencodeUtf8 = [System.Text.UTF8Encoding]::new($false)
@@ -491,7 +559,7 @@ export function persistentShellScript(shell: string, input: { command: string; c
   const name = Shell.name(shell)
   if (Shell.ps(shell)) {
     const cwd = input.cwd ? `Set-Location -LiteralPath ${powershellQuote(input.cwd)} -ErrorAction Stop\n` : ""
-    return `${POWERSHELL_UTF8_PRELUDE}\n${POWERSHELL_RECYCLE_PRELUDE}\n${cwd}${input.command}\n`
+    return `${POWERSHELL_UTF8_PRELUDE}\n${powershellRecyclePrelude()}\n${cwd}${input.command}\n`
   }
   if (name === "cmd") {
     const cwd = input.cwd ? `cd /d "${cmdBatchPath(input.cwd)}" || exit /b 1\r\n` : ""
@@ -760,7 +828,7 @@ function posixPath(value: string) {
 
 function cmd(shell: string, command: string, cwd: string, env: NodeJS.ProcessEnv) {
   if (process.platform === "win32" && Shell.ps(shell)) {
-    const prelude = powershellTransportLines(`${POWERSHELL_UTF8_PRELUDE}\n${POWERSHELL_RECYCLE_PRELUDE}`)
+    const prelude = powershellTransportLines(`${POWERSHELL_UTF8_PRELUDE}\n${powershellRecyclePrelude()}`)
     const script = powershellTransportLines(command)
     const runner = [
       `$__opencodePrelude = @(${prelude}) -join [Environment]::NewLine;`,
