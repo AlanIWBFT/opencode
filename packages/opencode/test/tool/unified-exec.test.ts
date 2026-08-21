@@ -12,6 +12,7 @@ import { Session } from "@/session/session"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { ExecSession } from "@/tool/exec-session"
 import {
+  persistentShellArgs,
   persistentShellBootstrapFrame,
   persistentShellBootstrapRequest,
   persistentShellRunnerScript,
@@ -19,7 +20,7 @@ import {
   persistentShellSupported,
 } from "@/tool/shell"
 import { execCommandShellDescription } from "@/tool/unified-exec"
-import { TestInstance } from "../fixture/fixture"
+import { TestInstance, tmpdirScoped } from "../fixture/fixture"
 import { pollWithTimeout, testEffect } from "../lib/effect"
 
 const sessionTimes = new Map<SessionID, { created: number; updated: number; archived?: number }>()
@@ -116,6 +117,7 @@ function lane(
     prepareError?: Error
     shell?: string
     workdir?: string
+    environment?: Record<string, string>
     commandEnv?: Record<string, string>
     onLaneReserved?: () => Effect.Effect<void>
     onExecutionStarted?: (execID: number) => Effect.Effect<void>
@@ -132,7 +134,7 @@ function lane(
       shell,
       cwd: process.cwd(),
       laneCwd: options.workdir,
-      env,
+      env: options.environment ?? env,
       laneID: options.laneID,
       resetLane: options.resetLane,
       tty: options.tty,
@@ -210,6 +212,8 @@ describe("tool.unified-exec lanes", () => {
     expect(powerShellRunner).toContain("Provider.Name -ne 'FileSystem'")
     expect(powerShellRunner).toContain("System.Management.Automation.PowerShell]::Create")
     expect(powerShellRunner).toContain("RunspaceMode]::CurrentRunspace")
+    expect(powerShellRunner).not.toContain("HistorySaveStyle SaveNothing")
+    expect(persistentShellRunnerScript("pwsh", { nonce, tty: true })).toContain("HistorySaveStyle SaveNothing")
     expect(powerShellRunner.indexOf("$__opencodeStatusError")).toBeLessThan(powerShellRunner.indexOf("$__opencodeDone"))
     expect(posixRunner).toContain("command pwd -P")
     if (process.platform === "win32") expect(posixRunner).toContain("cygpath -w")
@@ -218,16 +222,95 @@ describe("tool.unified-exec lanes", () => {
     )
   })
 
-  test("emits bootstrap acknowledgements from runners instead of echoed requests", () => {
+  test("starts interactive runners without echoed bootstrap requests", () => {
     const nonce = "0123456789abcdef"
+    const runnerFile = "/tmp/runner"
+    expect(persistentShellArgs("pwsh", true, runnerFile)).toEqual([
+      "-NoLogo",
+      "-NoProfile",
+      "-NoExit",
+      "-File",
+      runnerFile,
+    ])
+    expect(persistentShellArgs("pwsh", false, runnerFile)).toEqual([
+      "-NoLogo",
+      "-NoProfile",
+      "-NonInteractive",
+      "-Command",
+      "-",
+    ])
     for (const shell of ["pwsh", "cmd", "bash"]) {
       const marker = persistentShellBootstrapFrame(nonce, true)
-      const request = new TextDecoder().decode(persistentShellBootstrapRequest(shell, "/tmp/runner", true))
+      const request = persistentShellBootstrapRequest(shell, runnerFile, true)
       const runner = persistentShellRunnerScript(shell, { nonce, tty: true })
-      expect(request).not.toContain(marker)
+      if (shell === "bash") expect(new TextDecoder().decode(request)).not.toContain(marker)
+      else expect(request).toBeUndefined()
       expect(runner).toContain(marker)
     }
   })
+
+  for (const shell of powerShellShells) {
+    it.instance(
+      `does not persist internal TTY execution requests to PSReadLine history [${Shell.name(shell)}]`,
+      () =>
+        Effect.gen(function* () {
+          const result = yield* lane(
+            '$options = Get-PSReadLineOption; Write-Output "history-style:$($options.HistorySaveStyle)"; Write-Output "history-path:$($options.HistorySavePath)"',
+            {
+              laneID: 0,
+              tty: true,
+              shell,
+            },
+          )
+          expect(result.output).toContain("history-style:SaveNothing")
+          const historyPath = result.output.match(/history-path:(.+)/)?.[1].trim()
+          if (!historyPath) throw new Error(`PowerShell did not report its history path: ${result.output}`)
+          expect(path.basename(path.dirname(historyPath))).toMatch(/^opencode-lane-/)
+          const history = yield* Effect.promise(async () => {
+            try {
+              return await fs.readFile(historyPath, "utf8")
+            } catch (error) {
+              if ((error as NodeJS.ErrnoException).code === "ENOENT") return ""
+              throw error
+            }
+          })
+          expect(history).not.toContain("__opencode_run_")
+        }),
+      15_000,
+    )
+
+    if (shell !== windowsPowerShell) continue
+    it.instance(
+      `fails bootstrap when PSReadLine history isolation fails [${Shell.name(shell)}]`,
+      () =>
+        Effect.gen(function* () {
+          const modules = yield* tmpdirScoped()
+          const module = path.join(modules, "PSReadLine")
+          yield* Effect.promise(() => fs.mkdir(module, { recursive: true }))
+          yield* Effect.promise(() =>
+            fs.writeFile(
+              path.join(module, "PSReadLine.psm1"),
+              "function Set-PSReadLineOption { throw 'simulated PSReadLine failure' }\nExport-ModuleMember -Function Set-PSReadLineOption\n",
+            ),
+          )
+          yield* Effect.promise(() =>
+            fs.writeFile(
+              path.join(module, "PSReadLine.psd1"),
+              "@{ RootModule = 'PSReadLine.psm1'; ModuleVersion = '99.0.0'; FunctionsToExport = @('Set-PSReadLineOption') }\n",
+            ),
+          )
+          const result = yield* lane("Write-Output should-not-run", {
+            laneID: 0,
+            tty: true,
+            shell,
+            environment: { ...env, PSModulePath: modules },
+          })
+          expect(result.error).toContain("could not isolate PSReadLine history: simulated PSReadLine failure")
+          expect(result.output).not.toContain("should-not-run")
+        }),
+      15_000,
+    )
+  }
 
   test("rejects a custom configured shell without a protocol adapter", () => {
     const shell = process.platform === "win32" ? "C:\\tools\\custom-shell.exe" : "/usr/local/bin/custom-shell"
