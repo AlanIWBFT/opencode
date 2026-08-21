@@ -13,6 +13,7 @@ import { buildAppArchive } from "./app-assets"
 import { verifyArtifact, verifySimulationGraph } from "./verify-artifact"
 import { resolveOpencodePty } from "./opencode-pty"
 import { NativeArch } from "../../../script/native-arch"
+import { buildWindowsRecycleHelper, windowsRecycleAssembly } from "../../core/script/ensure-windows-recycle"
 
 const dir = path.resolve(import.meta.dirname, "..")
 const binary = "opencode"
@@ -65,6 +66,7 @@ const targets =
         })
       : allTargets
 if (!targets.length) throw new Error(`Unknown build target: ${requestedTarget}`)
+if (targets.some((item) => item.os === "win32")) await buildWindowsRecycleHelper()
 
 if (!skipInstall)
   await $`bun install --os="*" --cpu="*" @opentui/core@${pkg.dependencies["@opentui/core"]} @opencode-ai/pty@${pkg.dependencies["@opencode-ai/pty"]}`
@@ -206,6 +208,12 @@ export default { path: file, version: ${JSON.stringify(opencodePty.version)}, sh
   }
   verifySimulationGraph(simulationInputs)
   await NativeArch.verify(path.join(outdir, name, "bin", item.os === "win32" ? `${binary}.exe` : binary), item.arch)
+
+  if (item.os === "win32")
+    await Bun.write(
+      path.join(outdir, name, "bin", path.basename(windowsRecycleAssembly)),
+      Bun.file(windowsRecycleAssembly),
+    )
 
   await Bun.write(
     path.join(outdir, name, "package.json"),
