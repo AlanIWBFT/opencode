@@ -1146,7 +1146,7 @@ const layer = Layer.effect(
           const runnerFile = path.join(tempDir, `runner.${extension}`)
           const bootstrapEnv = extension === "cmd" && tty ? `OPENCODE_CMD_BOOTSTRAP_${nonce.toUpperCase()}` : undefined
           if (bootstrapEnv) environment[bootstrapEnv] = `"${runnerFile.replaceAll('"', '""')}" --bootstrap`
-          const args = persistentShellArgs(input.shell, tty, bootstrapEnv)
+          const args = persistentShellArgs(input.shell, tty, runnerFile, bootstrapEnv)
           const runner = yield* restore(
             Effect.promise((signal) =>
               writeFile(
@@ -1257,10 +1257,7 @@ const layer = Layer.effect(
           } else {
             yield* restore(attachPtyOutput(state, lane))
           }
-          const bootstrap =
-            Shell.name(input.shell) === "cmd" && tty
-              ? undefined
-              : persistentShellBootstrapRequest(input.shell, runnerFile, tty)
+          const bootstrap = persistentShellBootstrapRequest(input.shell, runnerFile, tty)
           if (bootstrap && !(yield* restore(writeLaneTransport(lane, [bootstrap], false)))) {
             lane.lostReason = "shell stdin is unavailable"
             return `could not initialize persistent shell: ${lane.lostReason}`

@@ -463,14 +463,15 @@ export const askPermissions = Effect.fn("ShellTool.askPermissions")(function* (
   )
 })
 
-export function persistentShellArgs(shell: string, tty: boolean, bootstrapEnv?: string) {
+export function persistentShellArgs(shell: string, tty: boolean, runnerFile: string, bootstrapEnv?: string) {
   const name = Shell.name(shell)
   if (Shell.posix(shell)) return ["-l"]
   if (name === "cmd") {
     const bootstrap = tty && bootstrapEnv ? ["/k", `call %${bootstrapEnv}%`] : []
     return ["/d", "/q", "/v:off", ...bootstrap]
   }
-  if (Shell.ps(shell)) return ["-NoLogo", "-NoProfile", ...(tty ? [] : ["-NonInteractive", "-Command", "-"])]
+  if (Shell.ps(shell))
+    return ["-NoLogo", "-NoProfile", ...(tty ? ["-NoExit", "-File", runnerFile] : ["-NonInteractive", "-Command", "-"])]
   return []
 }
 
@@ -527,8 +528,9 @@ export function persistentShellRequest(
 }
 
 export function persistentShellBootstrapRequest(shell: string, runnerFile: string, tty: boolean) {
-  if (Shell.name(shell) === "cmd")
-    return new TextEncoder().encode(`call "${runnerFile.replaceAll('"', '""')}" --bootstrap\r\n`)
+  const name = Shell.name(shell)
+  if (tty && (name === "cmd" || Shell.ps(shell))) return
+  if (name === "cmd") return new TextEncoder().encode(`call "${runnerFile.replaceAll('"', '""')}" --bootstrap\r\n`)
   if (Shell.ps(shell)) return new TextEncoder().encode(`. ${powershellQuote(runnerFile)}${tty ? "\r" : "\r\n"}`)
   return new TextEncoder().encode(`. ${posixQuote(posixPath(runnerFile))}\n`)
 }
@@ -585,6 +587,19 @@ export function persistentShellRunnerScript(
   if (Shell.ps(shell)) {
     const session = `__opencode_user_session_${input.nonce}`
     const errorWriter = `__opencode_error_writer_${input.nonce}`
+    const history = input.tty
+      ? String.raw`try {
+  $__opencodePSReadLine = @(Microsoft.PowerShell.Core\Get-Module -Name PSReadLine -ListAvailable -ErrorAction Stop)[0]
+  if ($null -ne $__opencodePSReadLine) {
+    $null = Microsoft.PowerShell.Core\Import-Module -Name PSReadLine -PassThru -ErrorAction Stop
+    PSReadLine\Set-PSReadLineOption -HistorySavePath ([IO.Path]::Combine($PSScriptRoot, 'PSReadLine_history.txt')) -HistorySaveStyle SaveNothing -ErrorAction Stop
+  }
+} catch {
+  [Console]::Error.WriteLine('could not isolate PSReadLine history: ' + $_.Exception.GetBaseException().Message)
+  [Console]::Error.Flush()
+  [Environment]::Exit(1)
+}`
+      : ""
     const start = powershellQuote(frame.start)
     const startEnd = powershellQuote(frame.startEnd)
     const done = powershellQuote(frame.done)
@@ -592,6 +607,7 @@ export function persistentShellRunnerScript(
     const doneEnd = powershellQuote(frame.doneEnd)
     const ready = powershellQuote(bootstrap)
     return String.raw`${POWERSHELL_UTF8_PRELUDE}
+${history}
 $global:${session} = Microsoft.PowerShell.Core\New-Module -ScriptBlock {}
 $global:${errorWriter} = [IO.StreamWriter]::new([Console]::OpenStandardOutput(), $__opencodeUtf8)
 $global:${errorWriter}.AutoFlush = $true
