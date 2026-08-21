@@ -21,4 +21,8 @@ before the CLI exits. Other invocations retain their existing stdin behavior.
 Compiled CLIs that support this protocol include the sibling
 `openchamber-shutdown-protocol.capability` marker.
 
+Windows source development and tests require the .NET SDK. The package scripts
+build the managed Recycle Bin helper automatically before starting development
+or tests.
+
 This project was created using `bun init` in bun v1.2.12. [Bun](https://bun.sh) is a fast all-in-one JavaScript runtime.

@@ -49,6 +49,10 @@ jobs:
       - name: Setup Bun
         uses: ./.github/actions/setup-bun
 
+      - name: Verify .NET SDK
+        if: runner.os == 'Windows'
+        run: dotnet --info
+
       - name: Configure git identity
         run: |
           git config --global user.email "bot@opencode.ai"
