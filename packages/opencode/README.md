@@ -12,7 +12,7 @@ To run:
 bun run index.ts
 ```
 
-Single-target builds may set `OPENCODE_COMPILE_EXECUTABLE_PATH` to use an explicit Bun executable as the compiled runtime.
+Single-target builds may set `OPENCODE_COMPILE_EXECUTABLE_PATH` to use an explicit Bun executable as the compiled runtime. Windows builds used only as non-interactive application children may pass `--windows-gui-subsystem`; this emits a GUI-subsystem executable that still supports explicitly redirected standard handles but is not suitable for normal terminal CLI or TUI use.
 
 ## Managed shutdown protocol
 
