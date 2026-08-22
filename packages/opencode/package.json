@@ -6,6 +6,7 @@
   "license": "MIT",
   "private": true,
   "scripts": {
+    "prepare:windows-process-broker": "bun run script/ensure-windows-process-broker.ts",
     "prepare:windows-recycle": "bun run script/ensure-windows-recycle.ts",
     "typecheck": "tsgo --noEmit",
     "test": "bun run prepare:windows-recycle && bun test --timeout 30000 --only-failures",

@@ -26,6 +26,7 @@ import { PassThrough } from "node:stream"
 import launch from "cross-spawn"
 import { makeGlobalNode } from "./effect/app-node"
 import { filesystem, path } from "./effect/app-node-platform"
+import { WindowsProcessBroker } from "./windows-process-broker"
 
 const toError = (err: unknown): Error => (err instanceof globalThis.Error ? err : new globalThis.Error(String(err)))
 
@@ -94,11 +95,15 @@ const toPlatformError = (
   })
 }
 
-type ExitSignal = Deferred.Deferred<readonly [code: number | null, signal: NodeJS.Signals | null]>
+type ExitResult =
+  | { readonly _tag: "Close"; readonly value: readonly [code: number | null, signal: NodeJS.Signals | null] }
+  | { readonly _tag: "Error"; readonly error: PlatformError.PlatformError }
+type ExitSignal = Deferred.Deferred<ExitResult>
 
 export const make = Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
   const path = yield* Path.Path
+  if (globalThis.process.platform === "win32") void WindowsProcessBroker.prewarm()
 
   const cwd = Effect.fnUntraced(function* (opts: ChildProcess.CommandOptions) {
     if (Predicate.isUndefined(opts.cwd)) return undefined
@@ -264,14 +269,40 @@ export const make = Effect.gen(function* () {
     return { stdout, stderr, all: Stream.merge(stdout, stderr) }
   }
 
+  const launchProcess = (command: ChildProcess.StandardCommand, opts: NodeChildProcess.SpawnOptions) => {
+    const stdio = Array.isArray(opts.stdio) ? opts.stdio : []
+    const executable = WindowsProcessBroker.resolve(command.command, opts.env ?? globalThis.process.env)
+    const managed =
+      globalThis.process.platform === "win32" &&
+      WindowsProcessBroker.available() &&
+      executable !== undefined &&
+      opts.detached !== true &&
+      !opts.shell &&
+      stdio.length === 3 &&
+      (stdio[0] === "overlapped" || stdio[0] === "ignore") &&
+      stdio[1] === "overlapped" &&
+      stdio[2] === "overlapped"
+    if (!managed) return launch(command.command, command.args, opts)
+    return WindowsProcessBroker.launch(executable, command.args, {
+      cwd: typeof opts.cwd === "string" ? opts.cwd : globalThis.process.cwd(),
+      env: opts.env ?? globalThis.process.env,
+      stdin: stdio[0] === "overlapped",
+      keepStdinOpen: stdio[0] === "overlapped",
+    }) as unknown as NodeChildProcess.ChildProcess
+  }
+
   const spawn = (command: ChildProcess.StandardCommand, opts: NodeChildProcess.SpawnOptions) =>
     Effect.callback<readonly [NodeChildProcess.ChildProcess, ExitSignal], PlatformError.PlatformError>((resume) => {
-      const signal = Deferred.makeUnsafe<readonly [code: number | null, signal: NodeJS.Signals | null]>()
-      const proc = launch(command.command, command.args, opts)
+      const signal = Deferred.makeUnsafe<ExitResult>()
+      const proc = launchProcess(command, opts)
       let end = false
       let exit: readonly [code: number | null, signal: NodeJS.Signals | null] | undefined
       proc.on("error", (err) => {
-        resume(Effect.fail(toPlatformError("spawn", err, command)))
+        const error = toPlatformError("spawn", err, command)
+        if (proc instanceof WindowsProcessBroker.ManagedProcess) {
+          Deferred.doneUnsafe(signal, Exit.succeed({ _tag: "Error", error }))
+        }
+        resume(Effect.fail(error))
       })
       proc.on("exit", (...args) => {
         exit = args
@@ -279,7 +310,7 @@ export const make = Effect.gen(function* () {
       proc.on("close", (...args) => {
         if (end) return
         end = true
-        Deferred.doneUnsafe(signal, Exit.succeed(exit ?? args))
+        Deferred.doneUnsafe(signal, Exit.succeed({ _tag: "Close", value: exit ?? args }))
       })
       proc.on("spawn", () => {
         resume(Effect.succeed([proc, signal]))
@@ -320,6 +351,15 @@ export const make = Effect.gen(function* () {
       if (proc.kill(signal)) return Effect.void
       return Effect.fail(toPlatformError("kill", new Error("Failed to kill child process"), command))
     })
+
+  const killTree = (
+    command: ChildProcess.StandardCommand,
+    proc: NodeChildProcess.ChildProcess,
+    signal: NodeJS.Signals,
+  ) => {
+    if (proc instanceof WindowsProcessBroker.ManagedProcess) return killOne(command, proc, signal)
+    return Effect.catch(killGroup(command, proc, signal), () => killOne(command, proc, signal))
+  }
 
   const timeout =
     (
@@ -383,13 +423,14 @@ export const make = Effect.gen(function* () {
               const done = yield* Deferred.isDone(signal)
               const kill = timeout(proc, command, command.options)
               if (done) {
-                const [code] = yield* Deferred.await(signal)
+                const result = yield* Deferred.await(signal)
+                if (result._tag === "Error") return yield* Effect.void
+                const [code] = result.value
                 if (process.platform === "win32") return yield* Effect.void
                 if (code !== 0 && Predicate.isNotNull(code)) return yield* Effect.ignore(kill(killGroup))
                 return yield* Effect.void
               }
-              const send = (s: NodeJS.Signals) =>
-                Effect.catch(killGroup(command, proc, s), () => killOne(command, proc, s))
+              const send = (s: NodeJS.Signals) => killTree(command, proc, s)
               const sig = command.options.killSignal ?? "SIGTERM"
               const attempt = send(sig).pipe(Effect.andThen(Deferred.await(signal)), Effect.asVoid)
               const escalated = command.options.forceKillAfter
@@ -414,7 +455,9 @@ export const make = Effect.gen(function* () {
             getInputFd: fd.getInputFd,
             getOutputFd: fd.getOutputFd,
             isRunning: Effect.map(Deferred.isDone(signal), (done) => !done),
-            exitCode: Effect.flatMap(Deferred.await(signal), ([code, signal]) => {
+            exitCode: Effect.flatMap(Deferred.await(signal), (result) => {
+              if (result._tag === "Error") return Effect.fail(result.error)
+              const [code, signal] = result.value
               if (Predicate.isNotNull(code)) return Effect.succeed(ExitCode(code))
               return Effect.fail(
                 toPlatformError(
@@ -426,8 +469,7 @@ export const make = Effect.gen(function* () {
             }),
             kill: (opts?: ChildProcess.KillOptions) => {
               const sig = opts?.killSignal ?? "SIGTERM"
-              const send = (s: NodeJS.Signals) =>
-                Effect.catch(killGroup(command, proc, s), () => killOne(command, proc, s))
+              const send = (s: NodeJS.Signals) => killTree(command, proc, s)
               const attempt = send(sig).pipe(Effect.andThen(Deferred.await(signal)), Effect.asVoid)
               if (!opts?.forceKillAfter) return attempt
               return Effect.timeoutOrElse(attempt, {

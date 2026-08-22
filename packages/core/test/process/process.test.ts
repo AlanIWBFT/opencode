@@ -1,4 +1,5 @@
 import { describe, expect } from "bun:test"
+import { execFileSync } from "node:child_process"
 import fs from "fs/promises"
 import { realpathSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -7,6 +8,7 @@ import { Effect, Exit, Fiber, Stream } from "effect"
 import { ChildProcess } from "effect/unstable/process"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { AppProcess } from "@opencode-ai/core/process"
+import { WindowsProcessBroker } from "@opencode-ai/core/windows-process-broker"
 import { testEffect } from "../lib/effect"
 
 const it = testEffect(LayerNode.compile(AppProcess.node))
@@ -151,7 +153,48 @@ describe("AppProcess", () => {
       }),
     )
 
-    if (process.platform !== "win32") {
+    if (process.platform === "win32") {
+      const git = WindowsProcessBroker.resolve("git", process.env)
+      if (git && WindowsProcessBroker.available()) {
+        const blockingGit = () =>
+          ChildProcess.make(git, ["cat-file", "--batch"], {
+            stdin: { stream: "pipe", endOnDone: false },
+          })
+        it.live(
+          "explicit kill cancels a broker-managed Git process",
+          Effect.gen(function* () {
+            const svc = yield* AppProcess.Service
+            const handle = yield* svc.spawn(blockingGit())
+            expect(yield* handle.isRunning).toBe(true)
+            yield* handle.kill()
+            expect(yield* handle.isRunning).toBe(false)
+          }),
+          5_000,
+        )
+
+        it.live(
+          "broker disconnect fails a managed Git process",
+          Effect.gen(function* () {
+            const svc = yield* AppProcess.Service
+            const handle = yield* svc.spawn(blockingGit())
+            const brokerPid = Number(
+              execFileSync(
+                "pwsh",
+                [
+                  "-Command",
+                  `(Get-CimInstance Win32_Process -Filter "ParentProcessId = ${process.pid} AND Name = 'OpenCode.ProcessBroker.exe'" | Sort-Object CreationDate -Descending | Select-Object -First 1 -ExpandProperty ProcessId)`,
+                ],
+                { encoding: "utf8" },
+              ).trim(),
+            )
+            expect(brokerPid).toBeGreaterThan(0)
+            process.kill(brokerPid, "SIGKILL")
+            expect(Exit.isFailure(yield* Effect.exit(handle.exitCode))).toBe(true)
+          }),
+          5_000,
+        )
+      }
+    } else {
       it.live(
         "timeout cleans up the scoped child process",
         Effect.acquireUseRelease(
@@ -364,5 +407,17 @@ describe("AppProcess", () => {
         }),
       ),
     )
+
+    if (process.platform === "win32") {
+      it.effect(
+        "runs Git through the Windows process backend",
+        Effect.gen(function* () {
+          const svc = yield* AppProcess.Service
+          const result = yield* svc.run(ChildProcess.make("git", ["--version"], { extendEnv: true, stdin: "ignore" }))
+          expect(result.exitCode).toBe(0)
+          expect(result.stdout.toString("utf8")).toStartWith("git version ")
+        }),
+      )
+    }
   })
 })
