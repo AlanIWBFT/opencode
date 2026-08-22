@@ -22,6 +22,7 @@ const skipInstall = process.argv.includes("--skip-install")
 const sourcemapsFlag = process.argv.includes("--sourcemaps")
 const plugin = createSolidTransformPlugin()
 const skipEmbedWebUi = process.argv.includes("--skip-embed-web-ui")
+const compileExecutablePath = process.env.OPENCODE_COMPILE_EXECUTABLE_PATH?.trim()
 
 const createEmbeddedWebUIBundle = async () => {
   console.log(`Building Web UI to embed in the binary`)
@@ -112,6 +113,12 @@ const targets = selectBuildTargets(allTargets, process.argv.slice(2), {
   os: process.platform,
   arch: process.arch,
 })
+if (compileExecutablePath) {
+  if (targets.length !== 1) throw new Error("OPENCODE_COMPILE_EXECUTABLE_PATH requires exactly one build target")
+  if (!(await Bun.file(compileExecutablePath).exists())) {
+    throw new Error(`OPENCODE_COMPILE_EXECUTABLE_PATH does not exist: ${compileExecutablePath}`)
+  }
+}
 if (targets.some((item) => item.os === "win32")) {
   await buildWindowsRecycleHelper()
 }
@@ -159,6 +166,7 @@ for (const item of targets) {
       autoloadDotenv: false,
       autoloadTsconfig: true,
       autoloadPackageJson: true,
+      ...(compileExecutablePath ? { executablePath: compileExecutablePath } : {}),
       target: name.replace(pkg.name, "bun") as any,
       outfile: `dist/${name}/bin/opencode`,
       execArgv: [`--user-agent=opencode/${Script.version}`, "--use-system-ca", "--"],
