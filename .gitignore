@@ -36,3 +36,4 @@ RELEASE_REVIEW.md
 logs/
 *.bun-build
 tsconfig.tsbuildinfo
+packages/util/src/windows-process-broker/bin/
