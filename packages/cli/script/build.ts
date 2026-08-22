@@ -31,6 +31,7 @@ const baselineFlag = process.argv.includes("--baseline")
 const requestedTarget = process.argv.find((arg) => arg.startsWith("--target="))?.slice("--target=".length)
 const skipInstall = process.argv.includes("--skip-install")
 const skipWebUi = process.argv.includes("--skip-web-ui")
+const windowsGuiSubsystem = process.argv.includes("--windows-gui-subsystem")
 const compileExecutablePath = process.env.OPENCODE_COMPILE_EXECUTABLE_PATH?.trim()
 const solidPlugin = createSolidTransformPlugin()
 const highlights = Script.preview ? undefined : embed(process.env.OPENCODE_RELEASE_NOTES)
@@ -67,6 +68,9 @@ const targets =
         })
       : allTargets
 if (!targets.length) throw new Error(`Unknown build target: ${requestedTarget}`)
+if (windowsGuiSubsystem && targets.some((item) => item.os !== "win32")) {
+  throw new Error("--windows-gui-subsystem requires Windows build targets")
+}
 if (compileExecutablePath) {
   if (targets.length !== 1) throw new Error("OPENCODE_COMPILE_EXECUTABLE_PATH requires exactly one build target")
   if (!(await Bun.file(compileExecutablePath).exists())) {
@@ -194,7 +198,7 @@ export default { path: file, version: ${JSON.stringify(opencodePty.version)}, sh
         "--no-warnings",
         "--",
       ],
-      windows: {},
+      windows: windowsGuiSubsystem ? { hideConsole: true } : {},
     },
     define: {
       OPENCODE_VERSION: `'${Script.version}'`,
