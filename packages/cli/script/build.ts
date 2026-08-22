@@ -29,6 +29,7 @@ const baselineFlag = process.argv.includes("--baseline")
 const requestedTarget = process.argv.find((arg) => arg.startsWith("--target="))?.slice("--target=".length)
 const skipInstall = process.argv.includes("--skip-install")
 const skipWebUi = process.argv.includes("--skip-web-ui")
+const compileExecutablePath = process.env.OPENCODE_COMPILE_EXECUTABLE_PATH?.trim()
 const solidPlugin = createSolidTransformPlugin()
 const releaseAssets = new Map<string, Promise<Map<string, string>>>()
 
@@ -63,6 +64,12 @@ const targets =
         })
       : allTargets
 if (!targets.length) throw new Error(`Unknown build target: ${requestedTarget}`)
+if (compileExecutablePath) {
+  if (targets.length !== 1) throw new Error("OPENCODE_COMPILE_EXECUTABLE_PATH requires exactly one build target")
+  if (!(await Bun.file(compileExecutablePath).exists())) {
+    throw new Error(`OPENCODE_COMPILE_EXECUTABLE_PATH does not exist: ${compileExecutablePath}`)
+  }
+}
 if (targets.some((item) => item.os === "win32")) await buildWindowsRecycleHelper()
 
 if (!skipInstall)
@@ -229,6 +236,7 @@ export default { path: file, version: ${JSON.stringify(opencodePty.version)}, sh
 }
 
 async function compileExecutable(item: (typeof allTargets)[number]) {
+  if (compileExecutablePath) return compileExecutablePath
   const release = process.env.BUN_COMPILE_RELEASE
   if (!release) return
 

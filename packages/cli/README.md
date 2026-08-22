@@ -10,6 +10,10 @@ Explicit `OPENCODE_DB` and `OPENCODE_DISABLE_CHANNEL_DB` settings retain their
 upstream behavior. Moving existing databases into the shared default is not part
 of this migration.
 
+## Explicit Bun compile runtime
+
+Single-target builds may set `OPENCODE_COMPILE_EXECUTABLE_PATH` to an existing Bun executable to use as the compiled runtime. This explicit local path takes precedence over `BUN_COMPILE_RELEASE`; without it, the upstream release-selection behavior is unchanged.
+
 ## Windows native sidecars
 
 Windows packaging also builds Core's `OpenCode.Windows.RecycleBin.dll` and places
