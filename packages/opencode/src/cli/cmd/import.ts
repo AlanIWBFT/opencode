@@ -4,6 +4,12 @@ import { Session } from "@/session/session"
 import { MessageV2 } from "../../session/message-v2"
 import { CliError, effectCmd } from "../effect-cmd"
 import { Database } from "@opencode-ai/core/database/database"
+import {
+  LocalMessageOrder,
+  MessageOrderTable,
+  PartOrderTable,
+  SessionOrderTable,
+} from "@opencode-ai/core/database/local-message-order"
 import { SessionTable, MessageTable, PartTable } from "@opencode-ai/core/session/sql"
 import { InstanceRef } from "@/effect/instance-ref"
 import { ShareNext } from "@/share/share-next"
@@ -11,6 +17,7 @@ import { EOL } from "os"
 import path from "path"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Effect, Schema } from "effect"
+import { eq, inArray, sql } from "drizzle-orm"
 import type { InstanceContext } from "@/project/instance-context"
 
 const decodeMessageInfo = Schema.decodeUnknownSync(SessionV1.Info)
@@ -90,6 +97,309 @@ export function transformShareData(shareData: ShareData[]): {
 }
 
 type ExportData = { info: SDKSession; messages: Array<{ info: Message; parts: Part[] }> }
+
+const batch = <T>(items: readonly T[]) => {
+  const result: T[][] = []
+  for (let index = 0; index < items.length; index += 100) result.push(items.slice(index, index + 100))
+  return result
+}
+
+export const persistImportedSession = Effect.fn("Cli.import.persist")(function* (
+  db: Database.Interface["db"],
+  row: typeof SessionTable.$inferInsert,
+  messages: ExportData["messages"],
+) {
+  const preparedMessages: Array<{
+    info: SessionV1.Info
+    row: typeof MessageTable.$inferInsert
+  }> = []
+  const preparedParts: Array<{
+    info: SessionV1.Part
+    row: typeof PartTable.$inferInsert
+  }> = []
+  const messageIDs = new Set<string>()
+  const partIDs = new Set<string>()
+
+  for (const message of messages) {
+    const info = decodeMessageInfo(message.info) as SessionV1.Info
+    if (info.sessionID !== row.id) {
+      return yield* new CliError({ message: `Message ${info.id} belongs to session ${info.sessionID}, not ${row.id}` })
+    }
+    if (messageIDs.has(info.id)) return yield* new CliError({ message: `Duplicate message ID in import: ${info.id}` })
+    messageIDs.add(info.id)
+
+    const { id, sessionID: _, ...data } = info
+    preparedMessages.push({
+      info,
+      row: {
+        id,
+        session_id: row.id,
+        time_created: info.time?.created ?? Date.now(),
+        data: data as never,
+      },
+    })
+
+    for (const part of message.parts) {
+      const partInfo = decodePart(part) as SessionV1.Part
+      if (partInfo.sessionID !== row.id || partInfo.messageID !== info.id) {
+        return yield* new CliError({ message: `Part ${partInfo.id} does not belong to message ${info.id}` })
+      }
+      if (partIDs.has(partInfo.id))
+        return yield* new CliError({ message: `Duplicate part ID in import: ${partInfo.id}` })
+      partIDs.add(partInfo.id)
+
+      const { id, sessionID: _sessionID, messageID, ...data } = partInfo
+      preparedParts.push({
+        info: partInfo,
+        row: {
+          id,
+          message_id: messageID,
+          session_id: row.id,
+          data,
+        },
+      })
+    }
+  }
+
+  return yield* db
+    .transaction(
+      () =>
+        Effect.gen(function* () {
+          yield* db
+            .insert(SessionTable)
+            .values(row)
+            .onConflictDoUpdate({
+              target: SessionTable.id,
+              set: { project_id: row.project_id, directory: row.directory, path: row.path },
+            })
+            .run()
+
+          for (const values of batch(preparedMessages.map((item) => item.row))) {
+            yield* db.insert(MessageTable).values(values).onConflictDoNothing().run()
+          }
+          for (const values of batch(preparedParts.map((item) => item.row))) {
+            yield* db.insert(PartTable).values(values).onConflictDoNothing().run()
+          }
+
+          const messageState = [] as Array<{
+            id: SessionV1.MessageID
+            sessionID: typeof MessageTable.$inferSelect.session_id
+            data: typeof MessageTable.$inferSelect.data
+            orderSessionID: typeof MessageOrderTable.$inferSelect.session_id | null
+          }>
+          for (const ids of batch(preparedMessages.map((item) => item.info.id))) {
+            messageState.push(
+              ...(yield* db
+                .select({
+                  id: MessageTable.id,
+                  sessionID: MessageTable.session_id,
+                  data: MessageTable.data,
+                  orderSessionID: MessageOrderTable.session_id,
+                })
+                .from(MessageTable)
+                .leftJoin(MessageOrderTable, eq(MessageOrderTable.message_id, MessageTable.id))
+                .where(inArray(MessageTable.id, ids))
+                .all()),
+            )
+          }
+
+          const expectedMessages = new Map(preparedMessages.map((item) => [item.info.id, item]))
+          const missingMessageOrder = new Set<string>()
+          for (const state of messageState) {
+            const expected = expectedMessages.get(state.id)
+            if (
+              !expected ||
+              state.sessionID !== row.id ||
+              state.data.role !== expected.info.role ||
+              (state.data.role === "assistant" &&
+                expected.info.role === "assistant" &&
+                (!("parentID" in state.data) || state.data.parentID !== expected.info.parentID))
+            ) {
+              return yield* Effect.die(
+                new CliError({ message: `Message ID conflicts with existing data: ${state.id}` }),
+              )
+            }
+            if (state.orderSessionID === null) missingMessageOrder.add(state.id)
+            else if (state.orderSessionID !== row.id) {
+              return yield* Effect.die(
+                new CliError({ message: `Message order conflicts with existing data: ${state.id}` }),
+              )
+            }
+          }
+          if (messageState.length !== preparedMessages.length) {
+            return yield* Effect.die(new CliError({ message: "Failed to persist all imported messages" }))
+          }
+
+          const partState = [] as Array<{
+            id: SessionV1.PartID
+            messageID: SessionV1.MessageID
+            sessionID: typeof PartTable.$inferSelect.session_id
+            orderMessageID: typeof PartOrderTable.$inferSelect.message_id | null
+            orderSessionID: typeof PartOrderTable.$inferSelect.session_id | null
+          }>
+          for (const ids of batch(preparedParts.map((item) => item.info.id))) {
+            partState.push(
+              ...(yield* db
+                .select({
+                  id: PartTable.id,
+                  messageID: PartTable.message_id,
+                  sessionID: PartTable.session_id,
+                  orderMessageID: PartOrderTable.message_id,
+                  orderSessionID: PartOrderTable.session_id,
+                })
+                .from(PartTable)
+                .leftJoin(PartOrderTable, eq(PartOrderTable.part_id, PartTable.id))
+                .where(inArray(PartTable.id, ids))
+                .all()),
+            )
+          }
+
+          const expectedParts = new Map(preparedParts.map((item) => [item.info.id, item]))
+          const missingPartOrder = new Set<string>()
+          for (const state of partState) {
+            const expected = expectedParts.get(state.id)
+            if (!expected || state.sessionID !== row.id || state.messageID !== expected.info.messageID) {
+              return yield* Effect.die(new CliError({ message: `Part ID conflicts with existing data: ${state.id}` }))
+            }
+            if (state.orderSessionID === null) missingPartOrder.add(state.id)
+            else if (state.orderSessionID !== row.id || state.orderMessageID !== state.messageID) {
+              return yield* Effect.die(
+                new CliError({ message: `Part order conflicts with existing data: ${state.id}` }),
+              )
+            }
+          }
+          if (partState.length !== preparedParts.length) {
+            return yield* Effect.die(new CliError({ message: "Failed to persist all imported parts" }))
+          }
+
+          const parentIDs = Array.from(
+            new Set(preparedMessages.flatMap((item) => (item.info.role === "assistant" ? [item.info.parentID] : []))),
+          )
+          const parentState = [] as Array<{
+            id: SessionV1.MessageID
+            sessionID: typeof MessageTable.$inferSelect.session_id
+            data: typeof MessageTable.$inferSelect.data
+            orderSessionID: typeof MessageOrderTable.$inferSelect.session_id | null
+          }>
+          for (const ids of batch(parentIDs)) {
+            parentState.push(
+              ...(yield* db
+                .select({
+                  id: MessageTable.id,
+                  sessionID: MessageTable.session_id,
+                  data: MessageTable.data,
+                  orderSessionID: MessageOrderTable.session_id,
+                })
+                .from(MessageTable)
+                .leftJoin(MessageOrderTable, eq(MessageOrderTable.message_id, MessageTable.id))
+                .where(inArray(MessageTable.id, ids))
+                .all()),
+            )
+          }
+          if (
+            parentState.length !== parentIDs.length ||
+            parentState.some(
+              (parent) =>
+                parent.sessionID !== row.id ||
+                parent.data.role !== "user" ||
+                (parent.orderSessionID !== null && parent.orderSessionID !== row.id),
+            )
+          ) {
+            return yield* Effect.die(new CliError({ message: "Imported assistant message has an invalid parent" }))
+          }
+
+          yield* db
+            .insert(SessionOrderTable)
+            .values({ session_id: row.id, message_seq: 0, part_seq: 0 })
+            .onConflictDoNothing()
+            .run()
+          yield* db
+            .update(SessionOrderTable)
+            .set({
+              message_seq: sql`max(${SessionOrderTable.message_seq}, coalesce((select max(${MessageOrderTable.seq}) + 1 from ${MessageOrderTable} where ${MessageOrderTable.session_id} = ${row.id}), 0))`,
+              part_seq: sql`max(${SessionOrderTable.part_seq}, coalesce((select max(${PartOrderTable.seq}) + 1 from ${PartOrderTable} where ${PartOrderTable.session_id} = ${row.id}), 0))`,
+            })
+            .where(eq(SessionOrderTable.session_id, row.id))
+            .run()
+
+          const reserved = yield* LocalMessageOrder.reserveSequences(db, row.id, {
+            messages: missingMessageOrder.size,
+            parts: missingPartOrder.size,
+          })
+          const availableParents = new Set(
+            parentState.filter((parent) => parent.orderSessionID === row.id).map((parent) => parent.id),
+          )
+          const pendingMessages = preparedMessages.filter((item) => missingMessageOrder.has(item.info.id))
+          const orderedMessages: typeof pendingMessages = []
+          while (pendingMessages.length > 0) {
+            const index = pendingMessages.findIndex(
+              (item) => item.info.role === "user" || availableParents.has(item.info.parentID),
+            )
+            if (index === -1) {
+              return yield* Effect.die(
+                new CliError({ message: "Imported messages cannot be ordered after their parents" }),
+              )
+            }
+            const [item] = pendingMessages.splice(index, 1)
+            orderedMessages.push(item)
+            availableParents.add(item.info.id)
+          }
+
+          for (const values of batch(
+            orderedMessages.map((item, index) => ({
+              message_id: item.info.id,
+              session_id: row.id,
+              seq: reserved.message + index,
+            })),
+          )) {
+            yield* db.insert(MessageOrderTable).values(values).run()
+          }
+
+          const assistantsToMove = yield* db.all<{ id: SessionV1.MessageID }>(sql`
+            SELECT child.id AS id
+            FROM ${MessageTable} AS child
+            JOIN ${MessageTable} AS parent
+              ON parent.id = json_extract(child.data, '$.parentID')
+            JOIN ${MessageOrderTable} AS child_order
+              ON child_order.message_id = child.id
+             AND child_order.session_id = child.session_id
+            JOIN ${MessageOrderTable} AS parent_order
+              ON parent_order.message_id = parent.id
+             AND parent_order.session_id = parent.session_id
+            WHERE child.session_id = ${row.id}
+              AND json_extract(child.data, '$.role') = 'assistant'
+              AND parent_order.seq >= child_order.seq
+            ORDER BY child.rowid, child.id
+          `)
+          const moved = yield* LocalMessageOrder.reserveSequences(db, row.id, {
+            messages: assistantsToMove.length,
+            parts: 0,
+          })
+          for (const [index, assistant] of assistantsToMove.entries()) {
+            yield* db
+              .update(MessageOrderTable)
+              .set({ seq: moved.message + index })
+              .where(eq(MessageOrderTable.message_id, assistant.id))
+              .run()
+          }
+
+          for (const values of batch(
+            preparedParts
+              .filter((item) => missingPartOrder.has(item.info.id))
+              .map((item, index) => ({
+                part_id: item.info.id,
+                message_id: item.info.messageID,
+                session_id: row.id,
+                seq: reserved.part + index,
+              })),
+          )) {
+            yield* db.insert(PartOrderTable).values(values).run()
+          }
+        }),
+      { behavior: "immediate" },
+    )
+    .pipe(Effect.orDie)
+})
 
 export const ImportCommand = effectCmd({
   command: "import <file>",
@@ -183,47 +493,7 @@ const runImport = Effect.fn("Cli.import.body")(function* (file: string, ctx: Ins
     path: path.relative(path.resolve(ctx.worktree), ctx.directory).replaceAll("\\", "/"),
   }) as Session.Info
   const row = Session.toRow(info)
-  yield* db
-    .insert(SessionTable)
-    .values(row)
-    .onConflictDoUpdate({
-      target: SessionTable.id,
-      set: { project_id: row.project_id, directory: row.directory, path: row.path },
-    })
-    .run()
-    .pipe(Effect.orDie)
-
-  for (const msg of exportData.messages) {
-    const msgInfo = decodeMessageInfo(msg.info) as SessionV1.Info
-    const { id, sessionID: _, ...msgData } = msgInfo
-    yield* db
-      .insert(MessageTable)
-      .values({
-        id,
-        session_id: row.id,
-        time_created: msgInfo.time?.created ?? Date.now(),
-        data: msgData as never,
-      })
-      .onConflictDoNothing()
-      .run()
-      .pipe(Effect.orDie)
-
-    for (const part of msg.parts) {
-      const partInfo = decodePart(part) as SessionV1.Part
-      const { id: partId, sessionID: _s, messageID, ...partData } = partInfo
-      yield* db
-        .insert(PartTable)
-        .values({
-          id: partId,
-          message_id: messageID,
-          session_id: row.id,
-          data: partData,
-        })
-        .onConflictDoNothing()
-        .run()
-        .pipe(Effect.orDie)
-    }
-  }
+  yield* persistImportedSession(db, row, exportData.messages)
 
   process.stdout.write(`Imported session: ${exportData.info.id}`)
   process.stdout.write(EOL)
