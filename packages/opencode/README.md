@@ -12,6 +12,8 @@ To run:
 bun run index.ts
 ```
 
+Single-target builds may set `OPENCODE_COMPILE_EXECUTABLE_PATH` to use an explicit Bun executable as the compiled runtime.
+
 ## Managed shutdown protocol
 
 When `OPENCHAMBER_SHUTDOWN_PROTOCOL=1` is present, `opencode serve` reads its
