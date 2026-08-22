@@ -5,6 +5,7 @@ import path from "path"
 import { fileURLToPath } from "url"
 import { createSolidTransformPlugin } from "@opentui/solid/bun-plugin"
 import { selectBuildTargets, type BuildTarget } from "./target-selection"
+import { buildWindowsProcessBroker, windowsProcessBroker } from "./ensure-windows-process-broker"
 import { buildWindowsRecycleHelper, windowsRecycleAssembly } from "./ensure-windows-recycle"
 
 const __filename = fileURLToPath(import.meta.url)
@@ -126,6 +127,9 @@ if (compileExecutablePath) {
 if (targets.some((item) => item.os === "win32")) {
   await buildWindowsRecycleHelper()
 }
+if (targets.some((item) => item.os === "win32" && item.arch === "x64")) {
+  await buildWindowsProcessBroker()
+}
 
 await $`rm -rf dist`
 
@@ -150,6 +154,9 @@ for (const item of targets) {
   await $`mkdir -p dist/${name}/bin`
   if (item.os === "win32") {
     await Bun.write(`dist/${name}/bin/OpenCode.Windows.RecycleBin.dll`, Bun.file(windowsRecycleAssembly))
+    if (item.arch === "x64") {
+      await Bun.write(`dist/${name}/bin/OpenCode.ProcessBroker.exe`, Bun.file(windowsProcessBroker))
+    }
   }
 
   const workerPath = "./src/cli/tui/worker.ts"
