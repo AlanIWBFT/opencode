@@ -14,6 +14,7 @@ import { verifyArtifact, verifySimulationGraph } from "./verify-artifact"
 import { resolveOpencodePty } from "./opencode-pty"
 import { NativeArch } from "../../../script/native-arch"
 import { buildWindowsRecycleHelper, windowsRecycleAssembly } from "../../core/script/ensure-windows-recycle"
+import { buildWindowsProcessBroker, windowsProcessBroker } from "../../util/script/ensure-windows-process-broker"
 
 const dir = path.resolve(import.meta.dirname, "..")
 const binary = "opencode"
@@ -77,7 +78,10 @@ if (compileExecutablePath) {
     throw new Error(`OPENCODE_COMPILE_EXECUTABLE_PATH does not exist: ${compileExecutablePath}`)
   }
 }
-if (targets.some((item) => item.os === "win32")) await buildWindowsRecycleHelper()
+if (targets.some((item) => item.os === "win32")) {
+  await buildWindowsRecycleHelper()
+  await buildWindowsProcessBroker()
+}
 
 if (!skipInstall)
   await $`bun install --os="*" --cpu="*" @opentui/core@${pkg.dependencies["@opentui/core"]} @opencode-ai/pty@${pkg.dependencies["@opencode-ai/pty"]}`
@@ -220,11 +224,13 @@ export default { path: file, version: ${JSON.stringify(opencodePty.version)}, sh
   verifySimulationGraph(simulationInputs)
   await NativeArch.verify(path.join(outdir, name, "bin", item.os === "win32" ? `${binary}.exe` : binary), item.arch)
 
-  if (item.os === "win32")
+  if (item.os === "win32") {
     await Bun.write(
       path.join(outdir, name, "bin", path.basename(windowsRecycleAssembly)),
       Bun.file(windowsRecycleAssembly),
     )
+    await Bun.write(path.join(outdir, name, "bin", path.basename(windowsProcessBroker)), Bun.file(windowsProcessBroker))
+  }
 
   await Bun.write(
     path.join(outdir, name, "package.json"),

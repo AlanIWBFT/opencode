@@ -18,6 +18,7 @@ import { PassThrough } from "node:stream"
 import launch from "cross-spawn"
 import { makeGlobalNode } from "./effect/app-node.js"
 import { filesystem, path } from "./effect/app-node-platform.js"
+import { WindowsProcessBroker } from "./windows-process-broker.js"
 
 const toError = (err: unknown): Error => (err instanceof globalThis.Error ? err : new globalThis.Error(String(err)))
 
@@ -94,12 +95,16 @@ export class KilledBySignal extends Error {
   }
 }
 
-type ExitSignal = Deferred.Deferred<readonly [code: number | null, signal: NodeJS.Signals | null]>
+type ExitResult =
+  | { readonly _tag: "Close"; readonly value: readonly [code: number | null, signal: NodeJS.Signals | null] }
+  | { readonly _tag: "Error"; readonly error: PlatformError.PlatformError }
+type ExitSignal = Deferred.Deferred<ExitResult>
 type Spawned = readonly [process: NodeChildProcess.ChildProcess, closed: ExitSignal, exited: ExitSignal]
 
 const makeCrossSpawnSpawner = Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
   const path = yield* Path.Path
+  if (globalThis.process.platform === "win32") void WindowsProcessBroker.prewarm()
 
   const cwd = Effect.fnUntraced(function* (opts: ChildProcess.CommandOptions) {
     if (Predicate.isUndefined(opts.cwd)) return undefined
@@ -278,23 +283,28 @@ const makeCrossSpawnSpawner = Effect.gen(function* () {
 
   const launchProcess = (command: ChildProcess.StandardCommand, opts: NodeChildProcess.SpawnOptions) =>
     Effect.callback<Spawned, PlatformError.PlatformError>((resume) => {
-      const closed = Deferred.makeUnsafe<readonly [code: number | null, signal: NodeJS.Signals | null]>()
-      const exited = Deferred.makeUnsafe<readonly [code: number | null, signal: NodeJS.Signals | null]>()
-      const proc = launch(command.command, command.args, opts)
+      const closed = Deferred.makeUnsafe<ExitResult>()
+      const exited = Deferred.makeUnsafe<ExitResult>()
+      const proc = launchChild(command, opts)
       let end = false
       let exit: readonly [code: number | null, signal: NodeJS.Signals | null] | undefined
       proc.on("error", (err) => {
-        resume(Effect.fail(toPlatformError("spawn", err, command)))
+        const error = toPlatformError("spawn", err, command)
+        if (proc instanceof WindowsProcessBroker.ManagedProcess) {
+          Deferred.doneUnsafe(exited, Exit.succeed({ _tag: "Error", error }))
+          Deferred.doneUnsafe(closed, Exit.succeed({ _tag: "Error", error }))
+        }
+        resume(Effect.fail(error))
       })
       proc.on("exit", (...args) => {
         exit = args
-        Deferred.doneUnsafe(exited, Exit.succeed(args))
+        Deferred.doneUnsafe(exited, Exit.succeed({ _tag: "Close", value: args }))
       })
       proc.on("close", (...args) => {
         if (end) return
         end = true
-        Deferred.doneUnsafe(exited, Exit.succeed(exit ?? args))
-        Deferred.doneUnsafe(closed, Exit.succeed(exit ?? args))
+        Deferred.doneUnsafe(exited, Exit.succeed({ _tag: "Close", value: exit ?? args }))
+        Deferred.doneUnsafe(closed, Exit.succeed({ _tag: "Close", value: exit ?? args }))
       })
       proc.on("spawn", () => {
         resume(Effect.succeed([proc, closed, exited]))
@@ -314,6 +324,8 @@ const makeCrossSpawnSpawner = Effect.gen(function* () {
     // Register before process release so the deadline remains active during termination.
     yield* Effect.forkScoped(
       Effect.gen(function* () {
+        // The broker already terminates job descendants; retain its backpressured output without a capture deadline.
+        if (proc instanceof WindowsProcessBroker.ManagedProcess) return
         yield* Deferred.await(exited)
         // Particularly on Windows, some shell calls will cause detached descendants. Inherited stdio can hang the call.
         // Almost every ecosystem has tried to fix this; there's no single "good" answer here.
@@ -346,6 +358,7 @@ const makeCrossSpawnSpawner = Effect.gen(function* () {
     proc: NodeChildProcess.ChildProcess,
     signal: NodeJS.Signals,
   ) => {
+    if (proc instanceof WindowsProcessBroker.ManagedProcess) return killOne(command, proc, signal)
     if (globalThis.process.platform === "win32") {
       return Effect.callback<void, PlatformError.PlatformError>((resume) => {
         NodeChildProcess.exec(`taskkill /pid ${proc.pid} /T /F`, { windowsHide: true }, (err) => {
@@ -438,7 +451,9 @@ const makeCrossSpawnSpawner = Effect.gen(function* () {
               function* ([proc, closed, exited, stopOutput]) {
                 const done = (yield* Deferred.isDone(closed)) || (yield* Deferred.isDone(stopOutput))
                 if (done) {
-                  const [code] = yield* Deferred.await(exited)
+                  const result = yield* Deferred.await(exited)
+                  if (result._tag === "Error") return
+                  const [code] = result.value
                   if (process.platform === "win32") return
                   if (code === 0 || Predicate.isNull(code)) return
                   if (command.options.forceKillAfter === undefined) {
@@ -478,7 +493,9 @@ const makeCrossSpawnSpawner = Effect.gen(function* () {
             isRunning: Effect.gen(function* () {
               return !(yield* Deferred.isDone(closed)) && !(yield* Deferred.isDone(stopOutput))
             }),
-            exitCode: Effect.flatMap(completion, ([code, signal]) => {
+            exitCode: Effect.flatMap(completion, (result) => {
+              if (result._tag === "Error") return Effect.fail(result.error)
+              const [code, signal] = result.value
               if (Predicate.isNotNull(code)) return Effect.succeed(ExitCode(code))
               // Node reports a signal whenever the exit code is null.
               return Effect.fail(toPlatformError("exitCode", new KilledBySignal(signal!), command))
@@ -554,3 +571,25 @@ const layer: Layer.Layer<ChildProcessSpawner, never, FileSystem.FileSystem | Pat
 export const node = makeGlobalNode({ service: ChildProcessSpawner, layer, deps: [filesystem, path] })
 
 export * as CrossSpawnSpawner from "./cross-spawn-spawner.js"
+
+function launchChild(command: ChildProcess.StandardCommand, opts: NodeChildProcess.SpawnOptions) {
+  const stdio = Array.isArray(opts.stdio) ? opts.stdio : []
+  const executable = WindowsProcessBroker.resolve(command.command, opts.env ?? globalThis.process.env)
+  const managed =
+    globalThis.process.platform === "win32" &&
+    WindowsProcessBroker.available() &&
+    executable !== undefined &&
+    opts.detached !== true &&
+    !opts.shell &&
+    stdio.length === 3 &&
+    (stdio[0] === "overlapped" || stdio[0] === "ignore") &&
+    stdio[1] === "overlapped" &&
+    stdio[2] === "overlapped"
+  if (!managed) return launch(command.command, command.args, opts)
+  return WindowsProcessBroker.launch(executable, command.args, {
+    cwd: typeof opts.cwd === "string" ? opts.cwd : globalThis.process.cwd(),
+    env: opts.env ?? globalThis.process.env,
+    stdin: stdio[0] === "overlapped",
+    keepStdinOpen: stdio[0] === "overlapped",
+  }) as unknown as NodeChildProcess.ChildProcess
+}
