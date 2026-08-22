@@ -15,14 +15,19 @@ export type Migration = {
   up: (tx: Transaction) => Effect.Effect<void, unknown>
 }
 
-export function apply(db: Database) {
+type Options = {
+  onStart?: Effect.Effect<void>
+}
+
+export function apply(db: Database, options: Options = {}) {
   return lock.withPermit(
     Effect.gen(function* () {
       const tables = yield* db.all<{ name: string }>(
         sql`SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'`,
       )
-      if (tables.some((table) => table.name === "session")) return yield* applyOnly(db, migrations)
+      if (tables.some((table) => table.name === "session")) return yield* applyOnly(db, migrations, options)
       if (tables.length > 0) return yield* Effect.die("Database is not empty and has no session table")
+      yield* (options.onStart ?? Effect.void)
       yield* db.transaction((tx) =>
         Effect.gen(function* () {
           yield* schema.up(tx)
@@ -40,8 +45,14 @@ export function apply(db: Database) {
   )
 }
 
-export function applyOnly(db: Database, input: Migration[]) {
+export function applyOnly(db: Database, input: Migration[], options: Options = {}) {
   return Effect.gen(function* () {
+    let started = false
+    const start = Effect.suspend(() => {
+      if (started) return Effect.void
+      started = true
+      return options.onStart ?? Effect.void
+    })
     yield* db.run(
       sql`CREATE TABLE IF NOT EXISTS ${sql.identifier("migration")} (id TEXT PRIMARY KEY, time_completed INTEGER NOT NULL)`,
     )
@@ -54,6 +65,7 @@ export function applyOnly(db: Database, input: Migration[]) {
       if (
         yield* db.get(sql`SELECT name FROM sqlite_master WHERE type = 'table' AND name = ${"__drizzle_migrations"}`)
       ) {
+        yield* start
         const named = (yield* db.all<{ name: string }>(
           sql`SELECT name FROM pragma_table_info('__drizzle_migrations')`,
         )).some((column) => column.name === "name")
@@ -93,8 +105,9 @@ export function applyOnly(db: Database, input: Migration[]) {
       }
     }
 
-    for (const migration of input) {
-      if (completed.has(migration.id)) continue
+    const pending = input.filter((migration) => !completed.has(migration.id))
+    if (pending.length > 0) yield* start
+    for (const migration of pending) {
       yield* db.transaction((tx) =>
         Effect.gen(function* () {
           yield* migration.up(tx)

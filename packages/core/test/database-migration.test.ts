@@ -164,6 +164,28 @@ describe("DatabaseMigration", () => {
     )
   })
 
+  test("reports migration start only while work is pending", async () => {
+    await run(
+      Effect.gen(function* () {
+        const db = yield* makeDb
+        let starts = 0
+        const onStart = Effect.sync(() => {
+          starts += 1
+        })
+
+        yield* DatabaseMigration.apply(db, { onStart })
+        expect(starts).toBe(1)
+        yield* DatabaseMigration.apply(db, { onStart })
+        expect(starts).toBe(1)
+
+        yield* LocalDatabaseMigration.apply(db, { onStart })
+        expect(starts).toBe(2)
+        yield* LocalDatabaseMigration.apply(db, { onStart })
+        expect(starts).toBe(2)
+      }),
+    )
+  })
+
   test("rejects a non-empty database without a session table", async () => {
     await expect(
       run(

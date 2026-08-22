@@ -27,4 +27,19 @@ Windows source development and tests require the .NET SDK. The package scripts
 build the managed Recycle Bin helper automatically before starting development
 or tests.
 
+## Managed startup protocol
+
+When `OPENCODE_STARTUP_PROTOCOL=1` is present, database initialization writes
+versioned lifecycle records to stdout before the server listening record:
+
+```text
+opencode lifecycle {"version":1,"type":"database-migration","state":"started"}
+opencode lifecycle {"version":1,"type":"database-migration","state":"completed"}
+```
+
+Failures use `state: "failed"`. The protocol is opt-in so ordinary CLI output
+is unchanged. Consumers may suspend their normal server-listening timeout after
+`started`; `completed` is emitted only after all database migration transactions
+and their journal markers have committed.
+
 This project was created using `bun init` in bun v1.2.12. [Bun](https://bun.sh) is a fast all-in-one JavaScript runtime.

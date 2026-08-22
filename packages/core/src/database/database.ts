@@ -11,6 +11,15 @@ import { DatabaseFile } from "./database-file"
 const makeDatabase = EffectDrizzleSqlite.makeWithDefaults()
 type DatabaseShape = Effect.Success<typeof makeDatabase>
 
+const reportMigrationState = (state: "started" | "completed" | "failed") =>
+  process.env.OPENCODE_STARTUP_PROTOCOL === "1"
+    ? Effect.sync(() =>
+        console.log(
+          `opencode lifecycle ${JSON.stringify({ version: 1, type: "database-migration", state })}`,
+        ),
+      )
+    : Effect.void
+
 export interface Interface {
   db: DatabaseShape
 }
@@ -27,8 +36,19 @@ const layer = Layer.effect(
     yield* db.run("PRAGMA busy_timeout = 5000")
     yield* db.run("PRAGMA cache_size = -64000")
     yield* db.run("PRAGMA foreign_keys = ON")
-    yield* DatabaseMigration.apply(db)
-    yield* LocalDatabaseMigration.apply(db)
+    let migrationStarted = false
+    const reportMigrationStarted = Effect.suspend(() => {
+      if (migrationStarted) return Effect.void
+      migrationStarted = true
+      return reportMigrationState("started")
+    })
+    yield* Effect.gen(function* () {
+      yield* DatabaseMigration.apply(db, { onStart: reportMigrationStarted })
+      yield* LocalDatabaseMigration.apply(db, { onStart: reportMigrationStarted })
+    }).pipe(
+      Effect.tap(() => (migrationStarted ? reportMigrationState("completed") : Effect.void)),
+      Effect.onError(() => reportMigrationState("failed")),
+    )
 
     return { db }
   }).pipe(Effect.orDie),
