@@ -13,6 +13,7 @@ export type Migration = {
   id: string
   up: (tx: Transaction) => Effect.Effect<void, unknown>
   legacyBackfill?: true
+  reconcile?: true
 }
 
 export function apply(db: Database) {
@@ -29,27 +30,41 @@ export function applyOnly(db: Database, input: Migration[]) {
           time_completed integer NOT NULL
         )
       `)
-      const applied = yield* Effect.forEach(input, (migration) =>
-        db.transaction(
-          (tx) =>
-            Effect.gen(function* () {
-              if (yield* tx.get(sql`SELECT id FROM local_migration WHERE id = ${migration.id}`)) return false
-              yield* migration.up(tx)
-              if (migration.legacyBackfill) {
-                yield* repair(tx)
-                yield* backfill(tx)
-              }
-              yield* reconcileTransaction(tx)
-              yield* tx.run(sql`
-                INSERT INTO local_migration (id, time_completed)
-                VALUES (${migration.id}, ${Date.now()})
-              `)
-              return true
-            }),
-          { behavior: "immediate" },
-        ),
+      const unique = input.filter((migration, index) => input.findIndex((item) => item.id === migration.id) === index)
+      const completed = new Set(
+        (yield* db.all<{ id: string }>(sql`SELECT id FROM local_migration`)).map((row) => row.id),
       )
-      if (!applied.some(Boolean)) yield* reconcile(db)
+      if (unique.every((migration) => completed.has(migration.id))) return
+
+      yield* db.transaction(
+        (tx) =>
+          Effect.gen(function* () {
+            const current = new Set(
+              (yield* tx.all<{ id: string }>(sql`SELECT id FROM local_migration`)).map((row) => row.id),
+            )
+            const pending = unique.filter((migration) => !current.has(migration.id))
+            if (pending.length === 0) return
+
+            yield* Effect.forEach(pending, (migration) => migration.up(tx), { discard: true })
+            if (pending.some((migration) => migration.legacyBackfill)) {
+              yield* repair(tx)
+              yield* backfill(tx)
+            }
+            if (pending.some((migration) => migration.legacyBackfill || migration.reconcile)) {
+              yield* reconcileTransaction(tx)
+            }
+            yield* Effect.forEach(
+              pending,
+              (migration) =>
+                tx.run(sql`
+                  INSERT INTO local_migration (id, time_completed)
+                  VALUES (${migration.id}, ${Date.now()})
+                `),
+              { discard: true },
+            )
+          }),
+        { behavior: "immediate" },
+      )
     }),
   )
 }
@@ -61,15 +76,32 @@ function assertCanonicalSchema(db: Database) {
       part: ["id", "message_id", "session_id", "time_created", "time_updated", "data"],
     }
     for (const [table, required] of Object.entries(expected)) {
-      const columns = new Set((yield* db.all<{ name: string }>(sql.raw(`PRAGMA table_info(${table})`))).map((row) => row.name))
+      const columns = new Set(
+        (yield* db.all<{ name: string }>(sql.raw(`PRAGMA table_info(${table})`))).map((row) => row.name),
+      )
       const missing = required.filter((column) => !columns.has(column))
-      if (missing.length > 0) return yield* Effect.die(`Canonical ${table} table is missing columns: ${missing.join(", ")}`)
+      if (missing.length > 0)
+        return yield* Effect.die(`Canonical ${table} table is missing columns: ${missing.join(", ")}`)
     }
   })
 }
 
-function reconcile(db: Database) {
-  return db.transaction(reconcileTransaction, { behavior: "immediate" })
+export function checkMessageOrder(db: Database) {
+  return lock.withPermit(
+    Effect.gen(function* () {
+      yield* assertCanonicalSchema(db)
+      return yield* db.transaction(validationIssues)
+    }),
+  )
+}
+
+export function repairMessageOrder(db: Database) {
+  return lock.withPermit(
+    Effect.gen(function* () {
+      yield* assertCanonicalSchema(db)
+      yield* db.transaction(reconcileTransaction, { behavior: "immediate" })
+    }),
+  )
 }
 
 function reconcileTransaction(tx: Transaction) {
@@ -94,7 +126,9 @@ function reconcileTransaction(tx: Transaction) {
                  AND part.session_id = local_part_order.session_id
              )
     `)
-    yield* tx.run(`DELETE FROM local_session_order WHERE NOT EXISTS (SELECT 1 FROM session WHERE session.id = session_id)`)
+    yield* tx.run(
+      `DELETE FROM local_session_order WHERE NOT EXISTS (SELECT 1 FROM session WHERE session.id = session_id)`,
+    )
     yield* tx.run(`
           INSERT OR IGNORE INTO local_session_order (session_id, message_seq, part_seq)
           SELECT id, 0, 0 FROM session
@@ -384,85 +418,145 @@ function reorderAssistants(tx: Transaction) {
   })
 }
 
+const validationChecks = [
+  [
+    "Message sidecar coverage is invalid",
+    `
+      SELECT 1
+      FROM message
+      LEFT JOIN local_message_order ON local_message_order.message_id = message.id
+      WHERE local_message_order.message_id IS NULL
+         OR local_message_order.session_id <> message.session_id
+      LIMIT 1
+    `,
+  ],
+  [
+    "Part sidecar coverage is invalid",
+    `
+      SELECT 1
+      FROM part
+      LEFT JOIN local_part_order ON local_part_order.part_id = part.id
+      WHERE local_part_order.part_id IS NULL
+         OR local_part_order.message_id <> part.message_id
+         OR local_part_order.session_id <> part.session_id
+      LIMIT 1
+    `,
+  ],
+  [
+    "Message sidecar contains a stale row",
+    `SELECT 1 FROM local_message_order WHERE NOT EXISTS (SELECT 1 FROM message WHERE message.id = message_id) LIMIT 1`,
+  ],
+  [
+    "Part sidecar contains a stale row",
+    `SELECT 1 FROM local_part_order WHERE NOT EXISTS (SELECT 1 FROM part WHERE part.id = part_id) LIMIT 1`,
+  ],
+  [
+    "Session order state is invalid",
+    `
+      SELECT 1
+      FROM session
+      LEFT JOIN local_session_order state ON state.session_id = session.id
+      WHERE state.session_id IS NULL
+         OR state.message_seq < coalesce((
+           SELECT max(seq) + 1 FROM local_message_order
+           WHERE session_id = session.id AND seq >= 0
+         ), 0)
+         OR state.part_seq < coalesce((
+           SELECT max(seq) + 1 FROM local_part_order
+           WHERE session_id = session.id AND seq >= 0
+         ), 0)
+      LIMIT 1
+    `,
+  ],
+  [
+    "Session order contains a stale row",
+    `SELECT 1 FROM local_session_order WHERE NOT EXISTS (SELECT 1 FROM session WHERE session.id = session_id) LIMIT 1`,
+  ],
+  [
+    "Message session is invalid",
+    `
+      SELECT 1
+      FROM message
+      LEFT JOIN session ON session.id = message.session_id
+      WHERE session.id IS NULL
+      LIMIT 1
+    `,
+  ],
+  [
+    "Message data is invalid",
+    `
+      SELECT 1
+      FROM message
+      WHERE NOT json_valid(data)
+         OR json_extract(CASE WHEN json_valid(data) THEN data ELSE '{}' END, '$.role') IS NULL
+         OR json_extract(CASE WHEN json_valid(data) THEN data ELSE '{}' END, '$.role') NOT IN ('user', 'assistant')
+      LIMIT 1
+    `,
+  ],
+  [
+    "Assistant parent relation is invalid",
+    `
+      SELECT 1
+      FROM message child
+      LEFT JOIN message parent ON parent.id = json_extract(
+        CASE WHEN json_valid(child.data) THEN child.data ELSE '{}' END,
+        '$.parentID'
+      )
+      WHERE json_extract(CASE WHEN json_valid(child.data) THEN child.data ELSE '{}' END, '$.role') = 'assistant'
+        AND (
+          parent.id IS NULL
+          OR parent.session_id <> child.session_id
+          OR NOT json_valid(parent.data)
+          OR json_extract(CASE WHEN json_valid(parent.data) THEN parent.data ELSE '{}' END, '$.role') <> 'user'
+        )
+      LIMIT 1
+    `,
+  ],
+  [
+    "Assistant does not follow its parent",
+    `
+      SELECT 1
+      FROM message child
+      JOIN message parent ON parent.id = json_extract(
+        CASE WHEN json_valid(child.data) THEN child.data ELSE '{}' END,
+        '$.parentID'
+      )
+      JOIN local_message_order child_order ON child_order.message_id = child.id
+      JOIN local_message_order parent_order ON parent_order.message_id = parent.id
+      WHERE json_extract(CASE WHEN json_valid(child.data) THEN child.data ELSE '{}' END, '$.role') = 'assistant'
+        AND parent_order.seq >= child_order.seq
+      LIMIT 1
+    `,
+  ],
+  [
+    "Part ownership is invalid",
+    `
+      SELECT 1
+      FROM part
+      LEFT JOIN message ON message.id = part.message_id
+      WHERE message.id IS NULL OR message.session_id <> part.session_id
+      LIMIT 1
+    `,
+  ],
+] as const
+
+function validationIssues(db: Pick<Database, "get">) {
+  return Effect.gen(function* () {
+    const issues: string[] = []
+    for (const [message, query] of validationChecks) {
+      if (yield* db.get<{ invalid: number }>(query)) issues.push(message)
+    }
+    if (yield* db.get(`SELECT 1 FROM pragma_foreign_key_check('message') LIMIT 1`))
+      issues.push("Message foreign key check failed")
+    if (yield* db.get(`SELECT 1 FROM pragma_foreign_key_check('part') LIMIT 1`))
+      issues.push("Part foreign key check failed")
+    return issues
+  })
+}
+
 function validate(tx: Transaction) {
   return Effect.gen(function* () {
-    const checks = [
-      [
-        "Message sidecar coverage is invalid",
-        `
-          SELECT 1
-          FROM message
-          LEFT JOIN local_message_order ON local_message_order.message_id = message.id
-          WHERE local_message_order.message_id IS NULL
-             OR local_message_order.session_id <> message.session_id
-          LIMIT 1
-        `,
-      ],
-      [
-        "Part sidecar coverage is invalid",
-        `
-          SELECT 1
-          FROM part
-          LEFT JOIN local_part_order ON local_part_order.part_id = part.id
-          WHERE local_part_order.part_id IS NULL
-             OR local_part_order.message_id <> part.message_id
-             OR local_part_order.session_id <> part.session_id
-          LIMIT 1
-        `,
-      ],
-      [
-        "Message sidecar contains a stale row",
-        `SELECT 1 FROM local_message_order WHERE NOT EXISTS (SELECT 1 FROM message WHERE message.id = message_id) LIMIT 1`,
-      ],
-      [
-        "Part sidecar contains a stale row",
-        `SELECT 1 FROM local_part_order WHERE NOT EXISTS (SELECT 1 FROM part WHERE part.id = part_id) LIMIT 1`,
-      ],
-      [
-        "Assistant parent relation is invalid",
-        `
-          SELECT 1
-          FROM message child
-          LEFT JOIN message parent ON parent.id = json_extract(child.data, '$.parentID')
-          WHERE json_extract(child.data, '$.role') = 'assistant'
-            AND (
-              parent.id IS NULL
-              OR parent.session_id <> child.session_id
-              OR json_extract(parent.data, '$.role') <> 'user'
-            )
-          LIMIT 1
-        `,
-      ],
-      [
-        "Assistant does not follow its parent",
-        `
-          SELECT 1
-          FROM message child
-          JOIN message parent ON parent.id = json_extract(child.data, '$.parentID')
-          JOIN local_message_order child_order ON child_order.message_id = child.id
-          JOIN local_message_order parent_order ON parent_order.message_id = parent.id
-          WHERE json_extract(child.data, '$.role') = 'assistant'
-            AND parent_order.seq >= child_order.seq
-          LIMIT 1
-        `,
-      ],
-      [
-        "Part ownership is invalid",
-        `
-          SELECT 1
-          FROM part
-          LEFT JOIN message ON message.id = part.message_id
-          WHERE message.id IS NULL OR message.session_id <> part.session_id
-          LIMIT 1
-        `,
-      ],
-    ] as const
-    for (const [message, query] of checks) {
-      if (yield* tx.get<{ invalid: number }>(query)) return yield* Effect.die(message)
-    }
-    if (yield* tx.get(`SELECT 1 FROM pragma_foreign_key_check('message') LIMIT 1`))
-      return yield* Effect.die("Message foreign key check failed")
-    if (yield* tx.get(`SELECT 1 FROM pragma_foreign_key_check('part') LIMIT 1`))
-      return yield* Effect.die("Part foreign key check failed")
+    const issues = yield* validationIssues(tx)
+    if (issues[0]) return yield* Effect.die(issues[0])
   })
 }
