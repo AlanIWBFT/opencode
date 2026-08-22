@@ -22,6 +22,7 @@ const skipInstall = process.argv.includes("--skip-install")
 const sourcemapsFlag = process.argv.includes("--sourcemaps")
 const plugin = createSolidTransformPlugin()
 const skipEmbedWebUi = process.argv.includes("--skip-embed-web-ui")
+const windowsGuiSubsystem = process.argv.includes("--windows-gui-subsystem")
 const compileExecutablePath = process.env.OPENCODE_COMPILE_EXECUTABLE_PATH?.trim()
 
 const createEmbeddedWebUIBundle = async () => {
@@ -113,6 +114,9 @@ const targets = selectBuildTargets(allTargets, process.argv.slice(2), {
   os: process.platform,
   arch: process.arch,
 })
+if (windowsGuiSubsystem && targets.some((item) => item.os !== "win32")) {
+  throw new Error("--windows-gui-subsystem requires Windows build targets")
+}
 if (compileExecutablePath) {
   if (targets.length !== 1) throw new Error("OPENCODE_COMPILE_EXECUTABLE_PATH requires exactly one build target")
   if (!(await Bun.file(compileExecutablePath).exists())) {
@@ -170,7 +174,7 @@ for (const item of targets) {
       target: name.replace(pkg.name, "bun") as any,
       outfile: `dist/${name}/bin/opencode`,
       execArgv: [`--user-agent=opencode/${Script.version}`, "--use-system-ca", "--"],
-      windows: {},
+      windows: windowsGuiSubsystem ? { hideConsole: true } : {},
     },
     files: {
       [treeSitterWorkerPath]: treeSitterWorker,
