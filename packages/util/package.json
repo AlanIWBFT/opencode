@@ -34,6 +34,7 @@
   "scripts": {
     "build": "bun run script/build.ts",
     "pack": "bun run script/pack.ts",
+    "build:windows-process-broker": "bun run script/ensure-windows-process-broker.ts",
     "test": "bun test --only-failures",
     "typecheck": "bun check --no-script",
     "typecheck:tsc": "tsc --noEmit",
