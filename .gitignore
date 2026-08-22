@@ -37,3 +37,4 @@ logs/
 *.bun-build
 tsconfig.tsbuildinfo
 /artifacts/
+packages/util/src/windows-process-broker/bin/

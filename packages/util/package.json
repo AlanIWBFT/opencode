@@ -33,6 +33,7 @@
   },
   "scripts": {
     "build": "bun run script/build.ts",
+    "build:windows-process-broker": "bun run script/ensure-windows-process-broker.ts",
     "test": "bun test --only-failures",
     "typecheck": "tsgo --noEmit",
     "typecheck:dist": "bun run build && bun typecheck --project tsconfig.dist.json"
