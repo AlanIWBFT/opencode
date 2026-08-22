@@ -39,3 +39,4 @@ tsconfig.tsbuildinfo
 
 # Legal drafts pending review are kept outside the repository; never copy them in.
 legal-drafts-private/
+packages/util/src/windows-process-broker/bin/
