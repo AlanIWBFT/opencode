@@ -16,11 +16,15 @@ export type Migration = {
   reconcile?: true
 }
 
-export function apply(db: Database) {
-  return applyOnly(db, migrations)
+type Options = {
+  onStart?: Effect.Effect<void>
 }
 
-export function applyOnly(db: Database, input: Migration[]) {
+export function apply(db: Database, options: Options = {}) {
+  return applyOnly(db, migrations, options)
+}
+
+export function applyOnly(db: Database, input: Migration[], options: Options = {}) {
   return lock.withPermit(
     Effect.gen(function* () {
       yield* assertCanonicalSchema(db)
@@ -35,6 +39,7 @@ export function applyOnly(db: Database, input: Migration[]) {
         (yield* db.all<{ id: string }>(sql`SELECT id FROM local_migration`)).map((row) => row.id),
       )
       if (unique.every((migration) => completed.has(migration.id))) return
+      yield* (options.onStart ?? Effect.void)
 
       yield* db.transaction(
         (tx) =>
