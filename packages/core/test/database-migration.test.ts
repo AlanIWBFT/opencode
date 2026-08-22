@@ -17,6 +17,7 @@ import contextEpochAgentMigration from "@opencode-ai/core/database/migration/202
 import simplifyIntegrationCredentialsMigration from "@opencode-ai/core/database/migration/20260611192811_lush_chimera"
 import simplifySessionInputMigration from "@opencode-ai/core/database/migration/20260622202450_simplify_session_input"
 import { LocalDatabaseMigration } from "@opencode-ai/core/database/local-migration"
+import messageOrderMigration from "@opencode-ai/core/database/local-migration/0001_message_order"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { EventV2 } from "@opencode-ai/core/event"
@@ -113,7 +114,6 @@ describe("DatabaseMigration", () => {
         { concurrency: "unbounded" },
       ),
     )
-
   })
   if (process.platform === "linux") {
     test("declared schema has no ungenerated migrations", async () => {
@@ -201,7 +201,9 @@ describe("DatabaseMigration", () => {
 
         yield* LocalDatabaseMigration.apply(db)
 
-        expect(yield* db.all(sql`SELECT message_id AS id, seq FROM local_message_order ORDER BY session_id, seq`)).toEqual([
+        expect(
+          yield* db.all(sql`SELECT message_id AS id, seq FROM local_message_order ORDER BY session_id, seq`),
+        ).toEqual([
           { id: "msg_a2", seq: -2 },
           { id: "msg_a1", seq: -1 },
           { id: "msg_b1", seq: -1 },
@@ -235,20 +237,47 @@ describe("DatabaseMigration", () => {
           sql`INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES ('part_a3', 'msg_a3', 'ses_a', 4, 4, '{}')`,
         )
         yield* LocalDatabaseMigration.apply(db)
-        expect(yield* db.all(sql`SELECT message_id AS id, seq FROM local_message_order WHERE session_id = 'ses_a' ORDER BY seq`)).toEqual([
+        expect(
+          yield* db.get(sql`SELECT message_id FROM local_message_order WHERE message_id = 'msg_a3'`),
+        ).toBeUndefined()
+        expect(yield* db.get(sql`SELECT part_id FROM local_part_order WHERE part_id = 'part_a3'`)).toBeUndefined()
+        expect(yield* LocalDatabaseMigration.checkMessageOrder(db)).toEqual([
+          "Message sidecar coverage is invalid",
+          "Part sidecar coverage is invalid",
+        ])
+
+        yield* LocalDatabaseMigration.repairMessageOrder(db)
+        expect(
+          yield* db.all(
+            sql`SELECT message_id AS id, seq FROM local_message_order WHERE session_id = 'ses_a' ORDER BY seq`,
+          ),
+        ).toEqual([
           { id: "msg_a2", seq: -2 },
           { id: "msg_a1", seq: -1 },
           { id: "msg_a3", seq: 0 },
         ])
         expect(yield* db.get(sql`SELECT seq FROM local_part_order WHERE part_id = 'part_a3'`)).toEqual({ seq: 0 })
-        expect(yield* db.get(sql`SELECT count(*) AS count FROM local_migration`)).toEqual({ count: 1 })
-        expect(yield* db.get(sql`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'migration'`)).toBeUndefined()
+        expect(yield* LocalDatabaseMigration.checkMessageOrder(db)).toEqual([])
+        expect(yield* db.get(sql`SELECT count(*) AS count FROM local_migration`)).toEqual({ count: 2 })
+        expect(
+          yield* db.get(sql`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'migration'`),
+        ).toBeUndefined()
 
         yield* db.run(sql`DELETE FROM part WHERE id = 'part_a3'`)
         yield* db.run(sql`DELETE FROM message WHERE id = 'msg_a3'`)
         yield* LocalDatabaseMigration.apply(db)
+        expect(yield* db.get(sql`SELECT part_id FROM local_part_order WHERE part_id = 'part_a3'`)).toEqual({
+          part_id: "part_a3",
+        })
+        expect(yield* db.get(sql`SELECT message_id FROM local_message_order WHERE message_id = 'msg_a3'`)).toEqual({
+          message_id: "msg_a3",
+        })
+
+        yield* LocalDatabaseMigration.repairMessageOrder(db)
         expect(yield* db.get(sql`SELECT part_id FROM local_part_order WHERE part_id = 'part_a3'`)).toBeUndefined()
-        expect(yield* db.get(sql`SELECT message_id FROM local_message_order WHERE message_id = 'msg_a3'`)).toBeUndefined()
+        expect(
+          yield* db.get(sql`SELECT message_id FROM local_message_order WHERE message_id = 'msg_a3'`),
+        ).toBeUndefined()
       }),
     )
   })
@@ -286,6 +315,45 @@ describe("DatabaseMigration", () => {
           { id: "part_a", seq: -1 },
         ])
         expect(yield* db.get(sql`SELECT id FROM message WHERE id = 'msg_orphan'`)).toBeUndefined()
+      }),
+    )
+  })
+
+  test("checks message order corruption without modifying it", async () => {
+    await run(
+      Effect.gen(function* () {
+        const db = yield* makeDb
+        yield* db.run(sql`CREATE TABLE session (id text PRIMARY KEY)`)
+        yield* db.run(
+          sql`CREATE TABLE message (id text PRIMARY KEY, session_id text NOT NULL, time_created integer NOT NULL, time_updated integer NOT NULL, data text NOT NULL)`,
+        )
+        yield* db.run(
+          sql`CREATE TABLE part (id text PRIMARY KEY, message_id text NOT NULL, session_id text NOT NULL, time_created integer NOT NULL, time_updated integer NOT NULL, data text NOT NULL)`,
+        )
+        yield* db.run(sql`INSERT INTO session (id) VALUES ('session')`)
+        yield* LocalDatabaseMigration.apply(db)
+        yield* db.run(
+          sql`INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES ('invalid', 'session', 1, 1, '{')`,
+        )
+        yield* db.run(sql`DELETE FROM local_session_order WHERE session_id = 'session'`)
+
+        expect(yield* LocalDatabaseMigration.checkMessageOrder(db)).toEqual([
+          "Message sidecar coverage is invalid",
+          "Session order state is invalid",
+          "Message data is invalid",
+        ])
+        expect(yield* db.get(sql`SELECT id FROM message WHERE id = 'invalid'`)).toEqual({ id: "invalid" })
+        expect(
+          yield* db.get(sql`SELECT session_id FROM local_session_order WHERE session_id = 'session'`),
+        ).toBeUndefined()
+
+        yield* LocalDatabaseMigration.repairMessageOrder(db)
+
+        expect(yield* LocalDatabaseMigration.checkMessageOrder(db)).toEqual([])
+        expect(yield* db.get(sql`SELECT id FROM message WHERE id = 'invalid'`)).toBeUndefined()
+        expect(yield* db.get(sql`SELECT reason FROM local_message_repair_log ORDER BY id DESC LIMIT 1`)).toEqual({
+          reason: "invalid_message_json",
+        })
       }),
     )
   })
@@ -350,7 +418,7 @@ describe("DatabaseMigration", () => {
     )
   })
 
-  test("reconciles a parent sidecar restored after its assistant", async () => {
+  test("runs the 0002 message order reconcile only once", async () => {
     await run(
       Effect.gen(function* () {
         const db = yield* makeDb
@@ -365,7 +433,7 @@ describe("DatabaseMigration", () => {
         yield* db.run(
           sql`INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES ('parent', 'session', 1, 1, '{"role":"user"}'), ('child', 'session', 2, 2, '{"role":"assistant","parentID":"parent"}')`,
         )
-        yield* LocalDatabaseMigration.apply(db)
+        yield* LocalDatabaseMigration.applyOnly(db, [messageOrderMigration])
         yield* db.run(sql`DELETE FROM local_message_order WHERE message_id = 'parent'`)
 
         yield* LocalDatabaseMigration.apply(db)
@@ -373,6 +441,57 @@ describe("DatabaseMigration", () => {
         expect(yield* db.all(sql`SELECT message_id AS id, seq FROM local_message_order ORDER BY seq`)).toEqual([
           { id: "parent", seq: 0 },
           { id: "child", seq: 1 },
+        ])
+
+        yield* db.run(sql`DELETE FROM local_message_order WHERE message_id = 'parent'`)
+        yield* LocalDatabaseMigration.apply(db)
+        expect(yield* db.all(sql`SELECT message_id AS id, seq FROM local_message_order ORDER BY seq`)).toEqual([
+          { id: "child", seq: 1 },
+        ])
+      }),
+    )
+  })
+
+  test("reconciles a fresh local migration batch only once", async () => {
+    await run(
+      Effect.gen(function* () {
+        const db = yield* makeDb
+        yield* db.run(sql`CREATE TABLE session (id text PRIMARY KEY)`)
+        yield* db.run(
+          sql`CREATE TABLE message (id text PRIMARY KEY, session_id text NOT NULL, time_created integer NOT NULL, time_updated integer NOT NULL, data text NOT NULL)`,
+        )
+        yield* db.run(
+          sql`CREATE TABLE part (id text PRIMARY KEY, message_id text NOT NULL, session_id text NOT NULL, time_created integer NOT NULL, time_updated integer NOT NULL, data text NOT NULL)`,
+        )
+        yield* db.run(sql`INSERT INTO session (id) VALUES ('session')`)
+
+        const first = {
+          ...messageOrderMigration,
+          up: (tx: Parameters<LocalDatabaseMigration.Migration["up"]>[0]) =>
+            Effect.gen(function* () {
+              yield* messageOrderMigration.up(tx)
+              yield* tx.run(`CREATE TABLE local_reconcile_probe (id integer PRIMARY KEY AUTOINCREMENT)`)
+              yield* tx.run(`
+                CREATE TRIGGER local_reconcile_probe_update
+                AFTER UPDATE ON local_session_order
+                BEGIN
+                  INSERT INTO local_reconcile_probe (id) VALUES (NULL);
+                END
+              `)
+            }),
+        } satisfies LocalDatabaseMigration.Migration
+        const second = {
+          id: "0002_reconcile_probe",
+          reconcile: true,
+          up: () => Effect.void,
+        } satisfies LocalDatabaseMigration.Migration
+
+        yield* LocalDatabaseMigration.applyOnly(db, [first, second])
+
+        expect(yield* db.get(sql`SELECT count(*) AS count FROM local_reconcile_probe`)).toEqual({ count: 4 })
+        expect(yield* db.all(sql`SELECT id FROM local_migration ORDER BY id`)).toEqual([
+          { id: "0001_message_order" },
+          { id: "0002_reconcile_probe" },
         ])
       }),
     )
@@ -403,7 +522,7 @@ describe("DatabaseMigration", () => {
         expect(
           yield* db.get(sql`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'local_message_order'`),
         ).toBeUndefined()
-        expect(yield* db.get(sql`SELECT id FROM local_migration WHERE id = '0001_message_order'`)).toBeUndefined()
+        expect(yield* db.all(sql`SELECT id FROM local_migration`)).toEqual([])
       }),
     )
   })
@@ -469,13 +588,15 @@ describe("DatabaseMigration", () => {
 
         const next = {
           id: "0002_test",
+          reconcile: true,
           up: (tx: Parameters<LocalDatabaseMigration.Migration["up"]>[0]) =>
             tx.run(`CREATE TABLE local_test (id text PRIMARY KEY)`).pipe(Effect.asVoid),
-        }
+        } satisfies LocalDatabaseMigration.Migration
         yield* LocalDatabaseMigration.applyOnly(db, [next, next])
 
         expect(yield* db.all(sql`SELECT id FROM local_migration ORDER BY id`)).toEqual([
           { id: "0001_message_order" },
+          { id: "0002_message_order_reconcile_once" },
           { id: "0002_test" },
         ])
         expect(yield* db.all(sql`SELECT message_id, seq FROM local_message_order ORDER BY seq`)).toEqual([

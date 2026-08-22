@@ -1,9 +1,10 @@
 import type { Argv } from "yargs"
 import { spawn } from "child_process"
 import { Database } from "@opencode-ai/core/database/database"
+import { LocalDatabaseMigration } from "@opencode-ai/core/database/local-migration"
 import { Effect } from "effect"
 import { sql } from "drizzle-orm"
-import { effectCmd } from "../effect-cmd"
+import { effectCmd, fail } from "../effect-cmd"
 
 const QueryCommand = effectCmd({
   command: "$0 [query]",
@@ -51,12 +52,40 @@ const PathCommand = effectCmd({
   }),
 })
 
+const CheckMessageOrderCommand = effectCmd({
+  command: "check-message-order",
+  describe: "check message and part order consistency",
+  instance: false,
+  handler: Effect.fn("Cli.db.checkMessageOrder")(function* () {
+    const { db } = yield* Database.Service
+    const issues = yield* LocalDatabaseMigration.checkMessageOrder(db).pipe(Effect.orDie)
+    if (issues.length > 0) return yield* fail(`Message order check failed:\n- ${issues.join("\n- ")}`)
+    console.log("Message order is consistent")
+  }),
+})
+
+const RepairMessageOrderCommand = effectCmd({
+  command: "repair-message-order",
+  describe: "repair message and part order consistency",
+  instance: false,
+  handler: Effect.fn("Cli.db.repairMessageOrder")(function* () {
+    const { db } = yield* Database.Service
+    yield* LocalDatabaseMigration.repairMessageOrder(db).pipe(Effect.orDie)
+    console.log("Message order repaired")
+  }),
+})
+
 export const DbCommand = effectCmd({
   command: "db",
   describe: "database tools",
   instance: false,
   builder: (yargs: Argv) => {
-    return yargs.command(QueryCommand).command(PathCommand).demandCommand()
+    return yargs
+      .command(PathCommand)
+      .command(CheckMessageOrderCommand)
+      .command(RepairMessageOrderCommand)
+      .command(QueryCommand)
+      .demandCommand()
   },
   handler: Effect.fn("Cli.db")(function* () {}),
 })
