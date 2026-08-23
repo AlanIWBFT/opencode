@@ -320,6 +320,44 @@ export type ApiError = {
     message: string
     statusCode?: number
     isRetryable: boolean
+    resolution?:
+      | {
+          kind:
+            | "rate_limited"
+            | "usage_limited"
+            | "plan_not_included"
+            | "quota_exceeded"
+            | "policy_blocked"
+            | "authentication"
+            | "invalid_input"
+            | "network"
+            | "server"
+          retry: "automatic" | "never"
+          action:
+            | "switch_model"
+            | "wait"
+            | "manage_billing"
+            | "reauthenticate"
+            | "fix_input"
+            | "check_network"
+            | "retry"
+          retryAfterMs?: number
+          providerCode?: string
+        }
+      | {
+          kind: "model_capacity"
+          retry: "automatic" | "never"
+          action:
+            | "switch_model"
+            | "wait"
+            | "manage_billing"
+            | "reauthenticate"
+            | "fix_input"
+            | "check_network"
+            | "retry"
+          retryAfterMs?: number
+          providerCode?: string
+        }
     responseHeaders?: {
       [key: string]: string
     }
@@ -686,6 +724,44 @@ export type SessionStatus =
         label: string
         link?: string
       }
+      resolution?:
+        | {
+            kind:
+              | "rate_limited"
+              | "usage_limited"
+              | "plan_not_included"
+              | "quota_exceeded"
+              | "policy_blocked"
+              | "authentication"
+              | "invalid_input"
+              | "network"
+              | "server"
+            retry: "automatic" | "never"
+            action:
+              | "switch_model"
+              | "wait"
+              | "manage_billing"
+              | "reauthenticate"
+              | "fix_input"
+              | "check_network"
+              | "retry"
+            retryAfterMs?: number
+            providerCode?: string
+          }
+        | {
+            kind: "model_capacity"
+            retry: "automatic" | "never"
+            action:
+              | "switch_model"
+              | "wait"
+              | "manage_billing"
+              | "reauthenticate"
+              | "fix_input"
+              | "check_network"
+              | "retry"
+            retryAfterMs?: number
+            providerCode?: string
+          }
       next: number
     }
   | {
@@ -786,6 +862,7 @@ export type GlobalEvent = {
       }
     | {
         id: string
+        seq: number
         type: "message.updated"
         properties: {
           sessionID: string
@@ -802,6 +879,7 @@ export type GlobalEvent = {
       }
     | {
         id: string
+        seq: number
         type: "message.part.updated"
         properties: {
           sessionID: string
@@ -2548,6 +2626,260 @@ export type NotFoundError = {
   data: {
     message: string
   }
+}
+
+export type StoredUserMessage = {
+  id: string
+  sessionID: string
+  role: "user"
+  time: {
+    created: number
+  }
+  format?: OutputFormat
+  summary?: {
+    title?: string
+    body?: string
+    diffs: Array<SnapshotFileDiff>
+  }
+  agent: string
+  model: {
+    providerID: string
+    modelID: string
+    variant?: string
+  }
+  system?: string
+  tools?: {
+    [key: string]: boolean
+  }
+  seq: number
+}
+
+export type StoredAssistantMessage = {
+  id: string
+  sessionID: string
+  role: "assistant"
+  time: {
+    created: number
+    completed?: number
+  }
+  error?:
+    | ProviderAuthError
+    | UnknownError
+    | MessageOutputLengthError
+    | MessageAbortedError
+    | StructuredOutputError
+    | ContextOverflowError
+    | ContentFilterError
+    | ApiError
+  parentID: string
+  modelID: string
+  providerID: string
+  mode: string
+  agent: string
+  path: {
+    cwd: string
+    root: string
+  }
+  summary?: boolean
+  cost: number
+  tokens: {
+    total?: number
+    input: number
+    output: number
+    reasoning: number
+    cache: {
+      read: number
+      write: number
+    }
+  }
+  structured?: unknown
+  variant?: string
+  finish?: string
+  seq: number
+}
+
+export type StoredMessage = StoredUserMessage | StoredAssistantMessage
+
+export type StoredTextPart = {
+  id: string
+  sessionID: string
+  messageID: string
+  type: "text"
+  text: string
+  synthetic?: boolean
+  ignored?: boolean
+  time?: {
+    start: number
+    end?: number
+  }
+  metadata?: {
+    [key: string]: unknown
+  }
+  seq: number
+}
+
+export type StoredSubtaskPart = {
+  id: string
+  sessionID: string
+  messageID: string
+  type: "subtask"
+  prompt: string
+  description: string
+  agent: string
+  model?: {
+    providerID: string
+    modelID: string
+  }
+  command?: string
+  seq: number
+}
+
+export type StoredReasoningPart = {
+  id: string
+  sessionID: string
+  messageID: string
+  type: "reasoning"
+  text: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  time: {
+    start: number
+    end?: number
+  }
+  seq: number
+}
+
+export type StoredFilePart = {
+  id: string
+  sessionID: string
+  messageID: string
+  type: "file"
+  mime: string
+  filename?: string
+  url: string
+  source?: FilePartSource
+  seq: number
+}
+
+export type StoredToolPart = {
+  id: string
+  sessionID: string
+  messageID: string
+  type: "tool"
+  callID: string
+  tool: string
+  state: ToolState
+  metadata?: {
+    [key: string]: unknown
+  }
+  seq: number
+}
+
+export type StoredStepStartPart = {
+  id: string
+  sessionID: string
+  messageID: string
+  type: "step-start"
+  snapshot?: string
+  seq: number
+}
+
+export type StoredStepFinishPart = {
+  id: string
+  sessionID: string
+  messageID: string
+  type: "step-finish"
+  reason: string
+  snapshot?: string
+  cost: number
+  tokens: {
+    total?: number
+    input: number
+    output: number
+    reasoning: number
+    cache: {
+      read: number
+      write: number
+    }
+  }
+  seq: number
+}
+
+export type StoredSnapshotPart = {
+  id: string
+  sessionID: string
+  messageID: string
+  type: "snapshot"
+  snapshot: string
+  seq: number
+}
+
+export type StoredPatchPart = {
+  id: string
+  sessionID: string
+  messageID: string
+  type: "patch"
+  hash: string
+  files: Array<string>
+  seq: number
+}
+
+export type StoredAgentPart = {
+  id: string
+  sessionID: string
+  messageID: string
+  type: "agent"
+  name: string
+  source?: {
+    value: string
+    start: number
+    end: number
+  }
+  seq: number
+}
+
+export type StoredRetryPart = {
+  id: string
+  sessionID: string
+  messageID: string
+  type: "retry"
+  attempt: number
+  error: ApiError
+  time: {
+    created: number
+  }
+  seq: number
+}
+
+export type StoredCompactionPart = {
+  id: string
+  sessionID: string
+  messageID: string
+  type: "compaction"
+  auto: boolean
+  overflow?: boolean
+  tail_start_id?: string
+  seq: number
+}
+
+export type StoredPart =
+  | StoredTextPart
+  | StoredSubtaskPart
+  | StoredReasoningPart
+  | StoredFilePart
+  | StoredToolPart
+  | StoredStepStartPart
+  | StoredStepFinishPart
+  | StoredSnapshotPart
+  | StoredPatchPart
+  | StoredAgentPart
+  | StoredRetryPart
+  | StoredCompactionPart
+
+export type StoredMessageWithParts = {
+  info: StoredMessage
+  parts: Array<StoredPart>
 }
 
 export type TextPartInput = {
@@ -6215,6 +6547,7 @@ export type EventSessionDeleted = {
 
 export type EventMessageUpdated = {
   id: string
+  seq: number
   type: "message.updated"
   properties: {
     sessionID: string
@@ -6233,6 +6566,7 @@ export type EventMessageRemoved = {
 
 export type EventMessagePartUpdated = {
   id: string
+  seq: number
   type: "message.part.updated"
   properties: {
     sessionID: string
@@ -9786,10 +10120,7 @@ export type SessionMessagesResponses = {
   /**
    * List of messages
    */
-  200: Array<{
-    info: Message
-    parts: Array<Part>
-  }>
+  200: Array<StoredMessageWithParts>
 }
 
 export type SessionMessagesResponse2 = SessionMessagesResponses[keyof SessionMessagesResponses]
@@ -9915,10 +10246,7 @@ export type SessionMessageResponses = {
   /**
    * Message
    */
-  200: {
-    info: Message
-    parts: Array<Part>
-  }
+  200: StoredMessageWithParts
 }
 
 export type SessionMessageResponse = SessionMessageResponses[keyof SessionMessageResponses]
@@ -9988,6 +10316,52 @@ export type SessionAbortResponses = {
 }
 
 export type SessionAbortResponse = SessionAbortResponses[keyof SessionAbortResponses]
+
+export type SessionStopData = {
+  body?:
+    | {
+        scope: "session-tree"
+      }
+    | {
+        scope: "reverted-branch"
+        messageID: string
+      }
+  path: {
+    sessionID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/session/{sessionID}/stop"
+}
+
+export type SessionStopErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+}
+
+export type SessionStopError = SessionStopErrors[keyof SessionStopErrors]
+
+export type SessionStopResponses = {
+  /**
+   * Stopped session execution
+   */
+  200: {
+    sessions: number
+    matched: number
+    terminated: number
+    failed: number
+  }
+}
+
+export type SessionStopResponse = SessionStopResponses[keyof SessionStopResponses]
 
 export type SessionInitData = {
   body?: {
@@ -10430,6 +10804,10 @@ export type PartDeleteErrors = {
    * NotFoundError
    */
   404: NotFoundError
+  /**
+   * SessionBusyError
+   */
+  409: SessionBusyError
 }
 
 export type PartDeleteError = PartDeleteErrors[keyof PartDeleteErrors]
@@ -10466,6 +10844,10 @@ export type PartUpdateErrors = {
    * NotFoundError
    */
   404: NotFoundError
+  /**
+   * SessionBusyError
+   */
+  409: SessionBusyError
 }
 
 export type PartUpdateError = PartUpdateErrors[keyof PartUpdateErrors]

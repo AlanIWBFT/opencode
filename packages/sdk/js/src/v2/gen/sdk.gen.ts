@@ -213,6 +213,8 @@ import type {
   SessionShellResponses,
   SessionStatusErrors,
   SessionStatusResponses,
+  SessionStopErrors,
+  SessionStopResponses,
   SessionSummarizeErrors,
   SessionSummarizeResponses,
   SessionTodoErrors,
@@ -3908,7 +3910,7 @@ export class Session2 extends HeyApiClient {
   /**
    * Abort session
    *
-   * Abort an active session and stop any ongoing AI processing or command execution.
+   * Abort active AI processing and tool calls without terminating detached exec command processes.
    */
   public abort<ThrowOnError extends boolean = false>(
     parameters: {
@@ -3934,6 +3936,52 @@ export class Session2 extends HeyApiClient {
       url: "/session/{sessionID}/abort",
       ...options,
       ...params,
+    })
+  }
+
+  /**
+   * Stop session
+   *
+   * Stop a user-selected session scope and explicitly terminate matching exec command processes.
+   */
+  public stop<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      directory?: string
+      workspace?: string
+      body?:
+        | {
+            scope: "session-tree"
+          }
+        | {
+            scope: "reverted-branch"
+            messageID: string
+          }
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { key: "body", map: "body" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<SessionStopResponses, SessionStopErrors, ThrowOnError>({
+      url: "/session/{sessionID}/stop",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
     })
   }
 
