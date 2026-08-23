@@ -66,6 +66,50 @@ const request = Effect.fn(function* (
 })
 
 describe("OpenAIPlugin", () => {
+  for (const [name, claims, expected] of [
+    ["top-level", { chatgpt_compute_residency: "us" }, "us"],
+    [
+      "nested priority",
+      { chatgpt_compute_residency: "us", "https://api.openai.com/auth": { chatgpt_compute_residency: "eu" } },
+      "eu",
+    ],
+    [
+      "unconstrained",
+      {
+        chatgpt_compute_residency: "us",
+        "https://api.openai.com/auth": { chatgpt_compute_residency: "no_constraint" },
+      },
+      undefined,
+    ],
+    ["missing", {}, undefined],
+  ] as const) {
+    it.effect(`preserves ChatGPT compute residency: ${name}`, () =>
+      Effect.gen(function* () {
+        const credentials = yield* Credential.Service
+        const catalog = yield* Provider.Service
+        const models = yield* Model.Service
+        yield* catalog.transform((catalog) => {
+          catalog.models.update(Provider.ID.openai, Model.ID.make("gpt-5.5"), () => {})
+        })
+        yield* credentials.create({
+          integrationID: Integration.ID.make("openai"),
+          value: Credential.OAuth.make({
+            type: "oauth",
+            methodID: Integration.MethodID.make("chatgpt-browser"),
+            access: `header.${Buffer.from(JSON.stringify(claims)).toString("base64url")}.signature`,
+            refresh: "refresh",
+            expires: Date.now() + 60_000,
+          }),
+        })
+        yield* addPlugin()
+        const provider = required(yield* catalog.get(Provider.ID.openai))
+        const model = required(yield* models.get(Provider.ID.openai, Model.ID.make("gpt-5.5")))
+        expect(provider.headers?.["x-openai-internal-codex-residency"]).toBe(expected)
+        expect(model.headers?.["x-openai-internal-codex-residency"]).toBe(expected)
+      }),
+    )
+  }
+
   it.effect("registers browser and headless ChatGPT OAuth methods", () =>
     Effect.gen(function* () {
       yield* addPlugin()
@@ -223,6 +267,7 @@ describe("OpenAIPlugin", () => {
       expect(direct.headers).not.toHaveProperty("originator")
       expect(direct.baseURL).toBe("https://api.openai.com/v1")
       expect(provider.headers).not.toHaveProperty("x-codex-beta-features")
+      expect(provider.headers).not.toHaveProperty("x-openai-internal-codex-residency")
       expect(direct.hasHttpHooks).toBe(false)
       expect(provider.headers).not.toHaveProperty("originator")
       expect(required(yield* models.get(Provider.ID.openai, Model.ID.make("gpt-4.1"))).enabled).toBe(true)
