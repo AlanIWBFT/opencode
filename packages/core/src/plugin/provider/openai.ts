@@ -42,9 +42,13 @@ type TokenResponse = {
 const Claims = Schema.fromJsonString(
   Schema.Struct({
     chatgpt_account_id: Schema.optional(Schema.String),
+    chatgpt_compute_residency: Schema.optional(Schema.String),
     organizations: Schema.optional(Schema.Array(Schema.Struct({ id: Schema.String }))),
     "https://api.openai.com/auth": Schema.optional(
-      Schema.Struct({ chatgpt_account_id: Schema.optional(Schema.String) }),
+      Schema.Struct({
+        chatgpt_account_id: Schema.optional(Schema.String),
+        chatgpt_compute_residency: Schema.optional(Schema.String),
+      }),
     ),
   }),
 )
@@ -260,6 +264,9 @@ export const OpenAIPlugin = define({
       const item = providers.get(Provider.ID.openai)
       if (!item) return
       const account = chatgpt?.metadata?.accountID
+      const claims = chatgpt ? parseClaims(chatgpt.access) : undefined
+      const residency =
+        claims?.["https://api.openai.com/auth"]?.chatgpt_compute_residency ?? claims?.chatgpt_compute_residency
       providers.update(item.provider.id, (provider) => {
         provider.settings = Provider.mergeOverlay(provider.settings, {
           transport: provider.settings?.transport ?? "websocket",
@@ -272,6 +279,7 @@ export const OpenAIPlugin = define({
           originator: "opencode",
           "x-codex-beta-features": "remote_compaction_v2",
           ...(typeof account === "string" ? { "chatgpt-account-id": account } : {}),
+          ...(residency && residency !== "no_constraint" ? { "x-openai-internal-codex-residency": residency } : {}),
         })
       })
     })
@@ -430,13 +438,17 @@ function extractAccountID(tokens: TokenResponse) {
 }
 
 function claim(token: string) {
-  const part = token.split(".")[1]
-  if (!part) return
-  const claims = Option.getOrUndefined(decodeClaims(Buffer.from(part, "base64url").toString()))
+  const claims = parseClaims(token)
   if (!claims) return
   return (
     claims.chatgpt_account_id ??
     claims["https://api.openai.com/auth"]?.chatgpt_account_id ??
     claims.organizations?.[0]?.id
   )
+}
+
+function parseClaims(token: string) {
+  const part = token.split(".")[1]
+  if (!part) return
+  return Option.getOrUndefined(decodeClaims(Buffer.from(part, "base64url").toString()))
 }
