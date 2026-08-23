@@ -134,7 +134,7 @@ function header(headers: Record<string, string> | undefined, name: string) {
 export type APIErrorResolution = SessionV1.APIErrorResolution
 
 export function resolve(input: {
-  providerID: ProviderV2.ID
+  providerID?: ProviderV2.ID
   message: string
   isRetryable: boolean
   providerCode?: string
@@ -245,7 +245,7 @@ export type ParsedStreamError =
       resolution?: APIErrorResolution
     }
 
-export function parseStreamError(input: unknown, providerID: ProviderV2.ID): ParsedStreamError | undefined {
+export function parseStreamError(input: unknown, providerID?: ProviderV2.ID): ParsedStreamError | undefined {
   const raw = json(input)
   const body = isRecord(raw) && typeof raw.message === "string" ? (json(raw.message) ?? raw) : raw
   if (!isRecord(body) || (body.type !== "error" && body.type !== "response.failed")) return
@@ -271,7 +271,13 @@ export function parseStreamError(input: unknown, providerID: ProviderV2.ID): Par
     providerCode: code,
     responseBody,
   })
-  if (!resolved.resolution) return
+  if (!resolved.resolution)
+    return {
+      type: "api_error",
+      message: message ?? "Server error.",
+      isRetryable: true,
+      responseBody,
+    }
   return {
     type: "api_error",
     message:
@@ -290,12 +296,6 @@ export function parseStreamError(input: unknown, providerID: ProviderV2.ID): Par
     resolution: resolved.resolution,
   }
 
-  return {
-    type: "api_error",
-    message: typeof body?.error?.message === "string" ? body.error.message : "Server error.",
-    isRetryable: true,
-    responseBody,
-  }
 }
 
 export type ParsedAPICallError =

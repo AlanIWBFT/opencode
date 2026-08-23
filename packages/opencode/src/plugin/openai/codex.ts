@@ -431,13 +431,16 @@ export async function CodexAuthPlugin(input: PluginInput, options: CodexAuthPlug
             requestInput instanceof URL
               ? requestInput
               : new URL(typeof requestInput === "string" ? requestInput : requestInput.url)
-          const url =
-            parsed.pathname.includes("/v1/responses") || parsed.pathname.includes("/chat/completions")
-              ? new URL(codexApiEndpoint)
-              : parsed
+          const rewrite = parsed.pathname.includes("/v1/responses") || parsed.pathname.includes("/chat/completions")
+          const url = rewrite ? new URL(codexApiEndpoint) : parsed
+          if (rewrite) {
+            const residency = extractResidency(currentAuth.access)
+            if (residency) headers.set("x-openai-internal-codex-residency", residency)
+          }
 
           const requestInit = {
             ...init,
+            body: init?.body,
             headers,
           }
           if (websocketFetch && parsed.pathname.endsWith("/responses")) return websocketFetch(url, requestInit)
