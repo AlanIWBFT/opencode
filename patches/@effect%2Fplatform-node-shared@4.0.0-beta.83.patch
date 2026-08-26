@@ -1,0 +1,72 @@
+diff --git a/dist/NodeStream.js b/dist/NodeStream.js
+index b920001c484580902656bb9b796379576ca37c01..17b0f93aa33e8e22172579de3f6368a54b65a0ca 100644
+--- a/dist/NodeStream.js
++++ b/dist/NodeStream.js
+@@ -211,6 +211,8 @@ export const toUint8Array = (readable, options) => Effect.map(toArrayBuffer(read
+ const readableToPullUnsafe = options => {
+   const readable = options.readable;
++  const exit = options.exit ?? MutableRef.make(undefined);
+   if (readable.readableEnded) return Effect.succeed(Cause.done());
++  const prematureClose = () => options.onError(new Error("Readable closed before emitting 'end'"));
++  if (readable.closed) return exit.current ?? Effect.fail(prematureClose());
+   const closeOnDone = options.closeOnDone ?? true;
+-  const exit = options.exit ?? MutableRef.make(undefined);
+   const latch = Latch.makeUnsafe(false);
+@@ -225,9 +227,14 @@ const readableToPullUnsafe = options => {
+     exit.current = Exit.fail(Cause.Done());
+     latch.openUnsafe();
+   }
++  function onClose() {
++    if (!exit.current) exit.current = Exit.fail(prematureClose());
++    latch.openUnsafe();
++  }
+   readable.on("readable", onReadable);
+   readable.once("error", onError);
+   readable.once("end", onEnd);
++  readable.once("close", onClose);
+   const pull = Effect.suspend(function loop() {
+     let item = options.readable.read(options.chunkSize);
+     if (item === null) {
+@@ -249,6 +256,7 @@ const readableToPullUnsafe = options => {
+     readable.off("readable", onReadable);
+     readable.off("error", onError);
+     readable.off("end", onEnd);
++    readable.off("close", onClose);
+     if (closeOnDone && "closed" in options.readable && !options.readable.closed) {
+       options.readable.destroy();
+     }
+diff --git a/src/NodeStream.ts b/src/NodeStream.ts
+index 0d86163cd9a7bce448357d34d82d35ed5fa2bc2e..4bb640a129305c2c9ff0fb0ac7770a071b3075a0 100644
+--- a/src/NodeStream.ts
++++ b/src/NodeStream.ts
+@@ -362,3 +362,6 @@ const readableToPullUnsafe = <A, E>(options: {
+ }) => {
+   const readable = options.readable as Readable
++  const exit = options.exit ?? MutableRef.make(undefined)
+   if (readable.readableEnded) return Effect.succeed(Cause.done())
++  const prematureClose = () => options.onError(new Error("Readable closed before emitting 'end'"))
++  if (readable.closed) return exit.current ?? Effect.fail(prematureClose())
+@@ -366,3 +369,2 @@ const readableToPullUnsafe = <A, E>(options: {
+   const closeOnDone = options.closeOnDone ?? true
+-  const exit = options.exit ?? MutableRef.make(undefined)
+   const latch = Latch.makeUnsafe(false)
+@@ -377,6 +379,11 @@ const readableToPullUnsafe = <A, E>(options: {
+     exit.current = Exit.fail(Cause.Done())
+     latch.openUnsafe()
+   }
++  function onClose() {
++    if (!exit.current) exit.current = Exit.fail(prematureClose())
++    latch.openUnsafe()
++  }
+   readable.on("readable", onReadable)
+   readable.once("error", onError)
+   readable.once("end", onEnd)
++  readable.once("close", onClose)
+@@ -406,6 +413,7 @@ const readableToPullUnsafe = <A, E>(options: {
+         readable.off("readable", onReadable)
+         readable.off("error", onError)
+         readable.off("end", onEnd)
++        readable.off("close", onClose)
+         if (closeOnDone && "closed" in options.readable && !options.readable.closed) {
+           options.readable.destroy()
+         }
