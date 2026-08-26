@@ -1,4 +1,6 @@
+import { NodeStream } from "@effect/platform-node"
 import { describe, expect, test } from "bun:test"
+import { Cause, Effect, Exit, Stream } from "effect"
 import fs from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
@@ -49,6 +51,28 @@ describe.skipIf(process.platform !== "win32")("WindowsProcessBroker", () => {
 
     expect(child.exitCode).toBe(-1)
     expect(events).toEqual(["error", "close:-1"])
+  })
+
+  test("settles an active output reader after a broker failure", async () => {
+    const child = new WindowsProcessBroker.ManagedProcess(false)
+    child.on("error", () => {})
+    const result = Effect.runPromiseExit(
+      Stream.runCollect(
+        NodeStream.fromReadable({
+          evaluate: () => child.stdout,
+          onError: (error) => (error instanceof Error ? error : new Error(String(error))),
+        }),
+      ).pipe(Effect.timeout("1 second")),
+    )
+
+    expect(child.stdout.listenerCount("close")).toBeGreaterThan(1)
+    child.fail(new Error("broker disconnected"))
+
+    const exit = await result
+    expect(Exit.isFailure(exit)).toBe(true)
+    if (Exit.isSuccess(exit)) throw new Error("Expected output reader to fail")
+    const error = Cause.squash(exit.cause)
+    expect(error instanceof Error ? error.message : String(error)).toBe("Readable closed before emitting 'end'")
   })
 
   test("limits central process routing to Git and ripgrep", () => {
