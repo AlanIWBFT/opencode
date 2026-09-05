@@ -61,6 +61,19 @@ const fakeTruncate = Truncate.Service.of({
   limits: () => Effect.succeed({ maxLines: 2000, maxBytes: 50 * 1024 }),
 } satisfies Truncate.Interface)
 
+const timingTool = {
+  id: "timing",
+  description: "updates metadata more than once",
+  parameters: Schema.Struct({}),
+  jsonSchema: { type: "object", properties: {} },
+  execute: (_args, ctx) =>
+    Effect.gen(function* () {
+      yield* ctx.metadata({ metadata: { output: "first" } })
+      yield* ctx.metadata({ metadata: { output: "second" } })
+      return { title: "timing", metadata: {}, output: "done" }
+    }),
+} satisfies Tool.Def
+
 const layer = Layer.mergeAll(
   Layer.succeed(Plugin.Service, fakePlugin),
   Layer.succeed(Permission.Service, fakePermission),
@@ -73,21 +86,8 @@ const layer = Layer.mergeAll(
       ids: () => Effect.succeed(["timing"]),
       all: () => Effect.succeed([]),
       named: () => Effect.die("unused"),
-      tools: () =>
-        Effect.succeed([
-          {
-            id: "timing",
-            description: "updates metadata more than once",
-            parameters: Schema.Struct({}),
-            jsonSchema: { type: "object", properties: {} },
-            execute: (_args, ctx) =>
-              Effect.gen(function* () {
-                yield* ctx.metadata({ metadata: { output: "first" } })
-                yield* ctx.metadata({ metadata: { output: "second" } })
-                return { title: "timing", metadata: {}, output: "done" }
-              }),
-          } satisfies Tool.Def,
-        ]),
+      resolve: () => Effect.succeed({ direct: [timingTool], nested: [] }),
+      tools: () => Effect.succeed([timingTool]),
     }),
   ),
 )
