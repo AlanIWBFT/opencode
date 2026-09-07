@@ -9,7 +9,6 @@ import { Pty } from "@opencode-ai/core/pty"
 import type { PtyID } from "@opencode-ai/core/pty/schema"
 import { AbsolutePath } from "@opencode-ai/core/schema"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
-import { Shell } from "@opencode-ai/core/shell"
 import { Cause, Context, Deferred, Effect, Exit, Layer, Option, Queue, Scope, Semaphore, Stream } from "effect"
 import { ChildProcess } from "effect/unstable/process"
 import { ChildProcessSpawner, type ChildProcessHandle } from "effect/unstable/process/ChildProcessSpawner"
@@ -1116,10 +1115,24 @@ const layer = Layer.effect(
       pluginEnv: Record<string, string>,
     ) {
       if (!persistentShellSupported(input.shell)) return "unsupported persistent shell protocol"
+      if (
+        process.platform === "linux" &&
+        (process.getuid?.() !== process.geteuid?.() || process.getgid?.() !== process.getegid?.())
+      ) {
+        return "Linux unified exec requires matching real and effective user/group IDs for Bash -p startup"
+      }
       const nonce = crypto.randomUUID().replaceAll("-", "")
       const tty = input.tty ?? false
       const extension = persistentShellExtension(input.shell)
       const environment = mergeEnvironment(input.env, pluginEnv)
+      if (process.platform === "linux") {
+        // -p blocks Bash's option/function inheritance. These overrides also keep
+        // nested shells/history quiet and reset the separate compatibility selector.
+        environment.BASH_ENV = ""
+        environment.ENV = ""
+        environment.HISTFILE = ""
+        environment.BASH_COMPAT = ""
+      }
       let tempDir: string | undefined
       let lane: Lane | undefined
       return yield* Effect.uninterruptibleMask((restore) =>

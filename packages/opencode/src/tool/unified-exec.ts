@@ -3,7 +3,7 @@ import { InstanceState } from "@/effect/instance-state"
 import { Plugin } from "@/plugin"
 import * as Tool from "./tool"
 import { ExecSession } from "./exec-session"
-import { askPermissions, persistentShellScript, persistentShellSupported } from "./shell"
+import { askPermissions, persistentShellExecutable, persistentShellScript, persistentShellSupported } from "./shell"
 import { recycleBinSafetyNotes } from "./shell/prompt"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { AbsolutePath, NonNegativeInt } from "@opencode-ai/core/schema"
@@ -107,7 +107,7 @@ export const ExecCommandTool = Tool.define(
 
     return () =>
       Effect.gen(function* () {
-        const shell = Shell.acceptable((yield* config.get()).shell)
+        const shell = persistentShellExecutable((yield* config.get()).shell)
         return {
           description: [
             "Execute a shell command and return early with partial output while the process may continue running.",
@@ -199,6 +199,15 @@ export const ExecCommandTool = Tool.define(
 )
 
 export function execCommandShellDescription(shell: string, platform: NodeJS.Platform) {
+  if (platform === "linux") {
+    return [
+      "Commands run in Bash on `linux`, independently of config.shell and $SHELL. Bash must be installed on PATH; there is no fallback to sh.",
+      "Pass only the Bash command body. The tool uses non-interactive `bash --noprofile --norc -p`, with -s for pipes and /dev/stdin as the script for PTYs. It inherits OpenCode's prepared environment without importing shell options/functions or running login profiles, bashrc, or prompt hooks; BASH_ENV and ENV are empty at lane creation.",
+      "Each lane starts in normal Bash mode with the installed version's default compatibility behavior. tty=true gives child programs a terminal, not an interactive parent shell. Ctrl+C can end the lane generation; the next command rebuilds it if needed.",
+      "Bash arrays, [[ ... ]], process substitution and pipefail are available. Explicitly source any additional environment setup; cwd, variables and functions persist in the lane.",
+      "Invoke zsh, fish, sh or another interpreter explicitly when needed. Changes to a nested shell's cwd, variables or functions do not propagate back to the Bash lane.",
+    ].join("\n")
+  }
   const name = Shell.name(shell)
   const display =
     name === "pwsh"
@@ -235,7 +244,7 @@ export function execCommandShellDescription(shell: string, platform: NodeJS.Plat
     : []
   return [
     `Commands run in ${display} on \`${platform}\`.`,
-    ...(persistentShellSupported(shell)
+    ...(persistentShellSupported(shell, platform)
       ? []
       : ["The configured shell is unsupported; choose PowerShell, cmd, bash, dash, ksh, sh, or zsh."]),
     `Pass only the command body; the tool starts ${launch}. Do not prefix it with another shell launcher unless a nested shell is intentional.`,
