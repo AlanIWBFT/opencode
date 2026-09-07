@@ -15,6 +15,7 @@ import {
   persistentShellArgs,
   persistentShellBootstrapFrame,
   persistentShellBootstrapRequest,
+  persistentShellExecutable,
   persistentShellRunnerScript,
   persistentShellScript,
   persistentShellSupported,
@@ -63,9 +64,10 @@ const invocation = (display: ExecSession.Display) => ({
 const env = Object.fromEntries(
   Object.entries(process.env).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
 )
+const defaultShell = persistentShellExecutable()
 const windowsPowerShell = process.platform === "win32" ? Bun.which("powershell.exe") : undefined
 const powerShellShells = Array.from(
-  new Set([Shell.ps(Shell.acceptable()) ? Shell.acceptable() : undefined, windowsPowerShell]),
+  new Set([Shell.ps(defaultShell) ? defaultShell : undefined, windowsPowerShell]),
 ).filter((shell): shell is string => Boolean(shell))
 
 describe("exec command shell description", () => {
@@ -93,11 +95,14 @@ describe("exec command shell description", () => {
     expect(cmd).toContain("`cmd.exe /d /q /v:off`")
     expect(cmd).toContain("temporary batch file")
     expect(cmd).toContain("`%%A` for FOR variables")
-    expect(execCommandShellDescription("bash", "linux")).toContain("`bash -l` as a persistent stdin-driven POSIX shell")
+    const bash = execCommandShellDescription("bash", "linux")
+    expect(bash).toContain("bash --noprofile --norc -p")
+    expect(bash).toContain("independently of config.shell and $SHELL")
+    expect(bash).toContain("BASH_ENV and ENV are empty")
   })
 
   test("rejects custom shells without a persistent protocol adapter", () => {
-    const description = execCommandShellDescription("custom-shell", "linux")
+    const description = execCommandShellDescription("custom-shell", "win32")
     expect(description).toContain("`custom-shell` as a persistent stdin-driven POSIX-compatible shell")
     expect(description).toContain("configured shell is unsupported")
     expect(description).toContain("choose PowerShell, cmd, bash, dash, ksh, sh, or zsh")
@@ -128,7 +133,7 @@ function lane(
 ) {
   return Effect.gen(function* () {
     const sessions = yield* ExecSession.Service
-    const shell = options.shell ?? Shell.acceptable()
+    const shell = options.shell ?? defaultShell
     return yield* sessions.launch({
       command,
       shell,
@@ -160,14 +165,14 @@ function lane(
 }
 
 function shellCommand(input: { ps: string; cmd: string; posix: string }) {
-  const shell = Shell.acceptable()
+  const shell = defaultShell
   if (Shell.ps(shell)) return input.ps
   if (Shell.name(shell) === "cmd") return input.cmd
   return input.posix
 }
 
 function missingShell() {
-  const name = Shell.name(Shell.acceptable()) + (process.platform === "win32" ? ".exe" : "")
+  const name = Shell.name(defaultShell) + (process.platform === "win32" ? ".exe" : "")
   return path.join(os.tmpdir(), `opencode-missing-shell-${crypto.randomUUID()}`, name)
 }
 
@@ -202,6 +207,193 @@ function finish(
 }
 
 describe("tool.unified-exec lanes", () => {
+  test("Linux exec requires Bash instead of the configured or login shell", () => {
+    if (process.platform !== "linux") return
+    for (const configured of [undefined, "/bin/zsh", "/bin/fish", "/bin/sh", "/missing/shell"]) {
+      expect(persistentShellExecutable(configured, "linux", { ...env, SHELL: "/bin/zsh" })).toBe(defaultShell)
+    }
+    expect(() => persistentShellExecutable("/bin/sh", "linux", { PATH: "/opencode-no-executables" })).toThrow(
+      "Linux unified exec requires Bash on PATH",
+    )
+    expect(persistentShellSupported("bash", "linux")).toBe(true)
+    for (const shell of ["sh", "zsh", "fish", "pwsh"]) expect(persistentShellSupported(shell, "linux")).toBe(false)
+    expect(persistentShellExecutable("pwsh", "win32")).toBe(Shell.acceptable("pwsh"))
+    expect(persistentShellSupported("pwsh", "win32")).toBe(true)
+    expect(persistentShellArgs(defaultShell, false, "/tmp/runner")).toEqual(["--noprofile", "--norc", "-p", "-s"])
+    expect(persistentShellArgs(defaultShell, true, "/tmp/runner")).toEqual([
+      "--noprofile",
+      "--norc",
+      "-p",
+      "/dev/stdin",
+    ])
+  })
+
+  for (const tty of [false, true]) {
+    it.instance(
+      `Linux Bash starts predictably despite inherited shell controls (tty=${tty})`,
+      () =>
+        Effect.gen(function* () {
+          if (process.platform !== "linux") return
+          const test = yield* TestInstance
+          const options = {
+            tty,
+            workdir: test.directory,
+            environment: {
+              ...env,
+              HOME: test.directory,
+              SHELLOPTS: "noclobber:nounset:noexec:xtrace",
+              BASHOPTS: "failglob:extdebug:expand_aliases",
+              POSIXLY_CORRECT: "1",
+              BASH_COMPAT: "4.2",
+              PROMPT_COMMAND: "export OPENCODE_PROMPT_HOOK=ran",
+              PS1: "$(export OPENCODE_PROMPT_HOOK=ran; printf prompt-hook)",
+              CDPATH: "/nonexistent",
+              GLOBIGNORE: "*",
+              "BASH_FUNC_opencode_inherited%%": "() { printf inherited-function; }",
+            },
+          }
+          const result = yield* lane(
+            [
+              "[[ $- != *i* && $- == *p* && $UID == $EUID ]] || return 91",
+              "[[ ! -o posix && ! -o noclobber && ! -o nounset && ! -o noexec && ! -o xtrace ]] || return 92",
+              "if shopt -q failglob || shopt -q extdebug || shopt -q compat42; then return 93; fi",
+              "if declare -F opencode_inherited; then return 94; fi",
+              "[[ ${OPENCODE_PROMPT_HOOK-unset} == unset && -z $BASH_COMPAT ]] || return 95",
+              "printf predictable",
+            ].join("\n"),
+            options,
+          )
+          expect(result.exitCode).toBe(0)
+          expect(result.output).toContain("predictable")
+          expect(result.output).not.toContain("prompt-hook")
+          expect(result.metadata.outputError).toBeUndefined()
+          const reused = yield* lane("printf reused", options)
+          expect(reused.exitCode).toBe(0)
+          expect(reused.metadata.shellGeneration).toBe(result.metadata.shellGeneration)
+        }),
+      15_000,
+    )
+
+    it.instance(
+      `Linux Bash preserves user noclobber without breaking protocol writes (tty=${tty})`,
+      () =>
+        Effect.gen(function* () {
+          if (process.platform !== "linux") return
+          const test = yield* TestInstance
+          const target = path.join(test.directory, "existing.txt")
+          yield* Effect.promise(() => fs.writeFile(target, "original"))
+          const options = { tty, workdir: test.directory }
+          const first = yield* lane("set -o noclobber; printf seeded", options)
+          expect(first.exitCode).toBe(0)
+          expect(first.metadata.outputError).toBeUndefined()
+          const failed = yield* lane("printf changed > existing.txt", options)
+          expect(failed.exitCode).not.toBe(0)
+          expect(failed.metadata.outputError).toBeUndefined()
+          expect(yield* Effect.promise(() => fs.readFile(target, "utf8"))).toBe("original")
+          const reused = yield* lane("[[ -o noclobber ]] && printf retained", options)
+          expect(reused.exitCode).toBe(0)
+          expect(reused.output).toContain("retained")
+          expect(reused.metadata.shellGeneration).toBe(first.metadata.shellGeneration)
+        }),
+      15_000,
+    )
+
+    it.instance(
+      `Linux Bash skips startup scripts and retains explicit setup (tty=${tty})`,
+      () =>
+        Effect.gen(function* () {
+          if (process.platform !== "linux") return
+          const test = yield* TestInstance
+          const startup = path.join(test.directory, "startup.sh")
+          const activation = path.join(test.directory, "activation.sh")
+          yield* Effect.promise(() =>
+            Promise.all(
+              [startup, path.join(test.directory, ".bash_profile"), path.join(test.directory, ".bashrc")].map((file) =>
+                fs.writeFile(file, "export OPENCODE_UNWANTED_STARTUP=loaded\n"),
+              ),
+            ),
+          )
+          yield* Effect.promise(() =>
+            fs.writeFile(
+              activation,
+              "export OPENCODE_ACTIVATED=yes\nvalues=(bash array)\nlane_value() { printf function; }\n",
+            ),
+          )
+          const options = {
+            tty,
+            environment: {
+              ...env,
+              HOME: test.directory,
+              BASH_ENV: startup,
+              ENV: startup,
+              HISTFILE: path.join(test.directory, "history"),
+              OPENCODE_INHERITED: "inherited",
+            },
+            commandEnv: { BASH_ENV: startup, ENV: startup },
+          }
+          const first = yield* lane(
+            'printf "startup=%s,env=%s/%s,inherited=%s,history=%s" "${OPENCODE_UNWANTED_STARTUP-unset}" "$BASH_ENV" "$ENV" "$OPENCODE_INHERITED" "$HISTFILE"',
+            options,
+          )
+          expect(first.exitCode).toBe(0)
+          expect(first.output).toContain("startup=unset,env=/,inherited=inherited,history=")
+          expect(first.output).not.toContain(path.join(test.directory, "history"))
+          const activated = yield* lane(`source '${activation.replaceAll("'", `'\\''`)}'; printf ready`, options)
+          expect(activated.exitCode).toBe(0)
+          const reused = yield* lane(
+            '[[ "$OPENCODE_ACTIVATED" == yes ]] && printf "%s:%s:%s" "${values[0]}" "${values[1]}" "$(lane_value)"',
+            options,
+          )
+          expect(reused.exitCode).toBe(0)
+          expect(reused.output).toContain("bash:array:function")
+          expect(reused.metadata.shellReused).toBe(true)
+          expect(reused.metadata.shellGeneration).toBe(first.metadata.shellGeneration)
+        }),
+      15_000,
+    )
+  }
+
+  for (const name of process.platform === "linux" ? ["bash"] : []) {
+    const shell = Bun.which(name)
+    if (!shell) continue
+    it.instance(`keeps ${name} cwd and protocol working without external commands`, () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const directory = path.join(test.directory, "work ' directory")
+        yield* Effect.promise(() => fs.mkdir(directory))
+        const first = yield* lane(
+          "export PATH=/opencode-no-executables; export OPENCODE_LANE_TEST=retained; printf first",
+          {
+            shell,
+            workdir: directory,
+          },
+        )
+        expect(first.error).toBeUndefined()
+        expect(first.running).toBe(false)
+        expect(first.exitCode).toBe(0)
+        expect(first.output).toBe("first")
+        expect(first.metadata.cwd).toBe(directory)
+
+        const second = yield* lane('printf "%s" "$OPENCODE_LANE_TEST"', { shell, workdir: test.directory })
+        expect(second.exitCode).toBe(0)
+        expect(second.output).toBe("retained")
+        expect(second.metadata.cwd).toBe(test.directory)
+        expect(second.metadata.shellGeneration).toBe(first.metadata.shellGeneration)
+        expect(second.metadata.shellReused).toBe(true)
+
+        const failed = yield* lane("printf should-not-run", { shell, workdir: path.join(directory, "missing") })
+        expect(failed.running).toBe(false)
+        expect(failed.exitCode).not.toBe(0)
+        expect(failed.output).not.toContain("should-not-run")
+        const recovered = yield* lane('printf "%s" "$OPENCODE_LANE_TEST"', { shell })
+        expect(recovered.exitCode).toBe(0)
+        expect(recovered.output).toBe("retained")
+        expect(recovered.metadata.cwd).toBe(test.directory)
+        expect(recovered.metadata.shellGeneration).toBe(first.metadata.shellGeneration)
+      }),
+    )
+  }
+
   test("uses shell-reported cwd and escapes injected cmd batch paths", () => {
     const nonce = "0123456789abcdef"
     const cmdRunner = persistentShellRunnerScript("cmd", { nonce, tty: false })
@@ -378,7 +570,7 @@ describe("tool.unified-exec lanes", () => {
       expect(second.metadata.shellReused).toBe(true)
       expect(second.metadata.shellGeneration).toBe(first.metadata.shellGeneration)
       expect(second.output).toContain("yes")
-      if (Shell.ps(Shell.acceptable())) expect(second.output).toContain("scalar:function")
+      if (Shell.ps(defaultShell)) expect(second.output).toContain("scalar:function")
       expect(second.metadata.cwd).toBe(preparedCwd)
     }),
   )
@@ -439,7 +631,7 @@ describe("tool.unified-exec lanes", () => {
     "reports a missing POSIX workdir without losing the lane",
     () =>
       Effect.gen(function* () {
-        const shell = process.platform === "win32" ? Shell.gitbash() : Shell.acceptable()
+        const shell = process.platform === "win32" ? Shell.gitbash() : defaultShell
         if (!shell || !Shell.posix(shell)) return
         const workdir = path.join(os.tmpdir(), `opencode-missing-workdir-${crypto.randomUUID()}`)
         const seeded = yield* lane("printf seeded", { laneID: 0, shell })
@@ -474,7 +666,7 @@ describe("tool.unified-exec lanes", () => {
   it.instance("loses a POSIX lane when its physical cwd can no longer be reported", () =>
     Effect.gen(function* () {
       if (process.platform === "win32") return
-      const shell = Shell.acceptable()
+      const shell = defaultShell
       if (!Shell.posix(shell)) return
       const directory = path.join(os.tmpdir(), `opencode-deleted-cwd-${crypto.randomUUID()}`)
       const quoted = `'${directory.replaceAll("'", `'\\''`)}'`
@@ -492,7 +684,7 @@ describe("tool.unified-exec lanes", () => {
 
   it.instance("loses a PowerShell lane after changing to a non-filesystem provider", () =>
     Effect.gen(function* () {
-      const shell = Shell.acceptable()
+      const shell = defaultShell
       if (!Shell.ps(shell)) return
       const result = yield* lane("Set-Location Env:", { laneID: 0, shell })
       expect(result.metadata.outputError).toContain("invalid completion frame")
@@ -522,7 +714,7 @@ describe("tool.unified-exec lanes", () => {
 
   it.instance("does not expose runner arguments to POSIX commands", () =>
     Effect.gen(function* () {
-      const shell = process.platform === "win32" ? Shell.gitbash() : Shell.acceptable()
+      const shell = process.platform === "win32" ? Shell.gitbash() : defaultShell
       if (!shell || !Shell.posix(shell)) return
       const result = yield* lane('printf \'%s:%s:%s:%s\' "$#" "${1-}" "${2-}" "${3-}"', {
         laneID: 0,
@@ -700,7 +892,7 @@ describe("tool.unified-exec lanes", () => {
 
   it.instance("preserves native exit codes and keeps the lane reusable", () =>
     Effect.gen(function* () {
-      if (!Shell.ps(Shell.acceptable())) return
+      if (!Shell.ps(defaultShell)) return
       const failed = yield* lane("cmd.exe /d /c exit 23", { laneID: 0 })
       expect(failed.exitCode).toBe(23)
       const recovered = yield* lane("Write-Output recovered", { laneID: 0 })
@@ -804,7 +996,7 @@ describe("tool.unified-exec lanes", () => {
 
   it.instance("does not reuse a previous PowerShell native exit code", () =>
     Effect.gen(function* () {
-      if (!Shell.ps(Shell.acceptable())) return
+      if (!Shell.ps(defaultShell)) return
       const native = yield* lane("cmd.exe /d /c exit 23", { laneID: 0 })
       expect(native.exitCode).toBe(23)
       const cmdlet = yield* lane("Write-Error boom", { laneID: 0 })
@@ -844,7 +1036,7 @@ describe("tool.unified-exec lanes", () => {
 
   it.instance("runs PowerShell command files with UTF-8 cwd and output", () =>
     Effect.gen(function* () {
-      if (!Shell.ps(Shell.acceptable())) return
+      if (!Shell.ps(defaultShell)) return
       const unicode = String.fromCodePoint(0x5de5, 0x4f5c)
       const directory = path.join(os.tmpdir(), `opencode-${unicode}-${crypto.randomUUID()}`)
       yield* Effect.promise(() => fs.mkdir(directory))
@@ -1495,7 +1687,7 @@ describe("tool.unified-exec lanes", () => {
 
   it.instance("writes stdin to a pipe lane command", () =>
     Effect.gen(function* () {
-      if (!Shell.ps(Shell.acceptable())) return
+      if (!Shell.ps(defaultShell)) return
       const sessions = yield* ExecSession.Service
       const started = yield* lane(
         'Write-Output ready; $value = [Console]::In.ReadLine(); Write-Output "received:$value"',
@@ -1518,16 +1710,16 @@ describe("tool.unified-exec lanes", () => {
   )
 
   const pipeShells = [
-    Shell.ps(Shell.acceptable())
+    Shell.ps(defaultShell)
       ? {
           label: "powershell",
-          shell: Shell.acceptable(),
+          shell: defaultShell,
           command:
             '$buffer = New-Object byte[] 5; $count = [Console]::OpenStandardInput().Read($buffer, 0, 5); Write-Output "received:$([Text.Encoding]::UTF8.GetString($buffer, 0, $count))"',
           input: "hello",
         }
       : undefined,
-    windowsPowerShell && path.resolve(windowsPowerShell) !== path.resolve(Shell.acceptable())
+    windowsPowerShell && path.resolve(windowsPowerShell) !== path.resolve(defaultShell)
       ? {
           label: "windows-powershell",
           shell: windowsPowerShell,
@@ -1552,10 +1744,10 @@ describe("tool.unified-exec lanes", () => {
           input: "hello\n",
         }
       : undefined,
-    process.platform !== "win32" && !Shell.ps(Shell.acceptable())
+    process.platform !== "win32" && !Shell.ps(defaultShell)
       ? {
           label: "posix",
-          shell: Shell.acceptable(),
+          shell: defaultShell,
           command: "IFS= read -r OPENCODE_PIPE_INPUT; printf 'received:%s\\n' \"$OPENCODE_PIPE_INPUT\"",
           input: "hello\n",
         }
@@ -1586,7 +1778,7 @@ describe("tool.unified-exec lanes", () => {
 
   it.instance("ends a pipe lane generation after sending EOF", () =>
     Effect.gen(function* () {
-      if (!Shell.ps(Shell.acceptable())) return
+      if (!Shell.ps(defaultShell)) return
       const sessions = yield* ExecSession.Service
       const started = yield* lane('$value = [Console]::In.ReadToEnd(); Write-Output "received:$value"', {
         laneID: 0,
@@ -1612,7 +1804,7 @@ describe("tool.unified-exec lanes", () => {
     "supports stdin and lane reuse in a TTY lane",
     () =>
       Effect.gen(function* () {
-        if (!Shell.ps(Shell.acceptable())) return
+        if (!Shell.ps(defaultShell)) return
         const sessions = yield* ExecSession.Service
         const started = yield* lane(
           '$value = Read-Host; $env:OPENCODE_TTY_VALUE = $value; Write-Output "received:$value"',
@@ -1642,6 +1834,83 @@ describe("tool.unified-exec lanes", () => {
     15_000,
   )
 
+  it.instance(
+    "Linux non-interactive Bash still provides a PTY to a child REPL",
+    () =>
+      Effect.gen(function* () {
+        if (process.platform !== "linux") return
+        const node = Bun.which("node")
+        if (!node) return
+        const sessions = yield* ExecSession.Service
+        const test = yield* TestInstance
+        const started = yield* lane(`'${node.replaceAll("'", `'\\''`)}' --interactive`, {
+          tty: true,
+          yieldTimeMs: 0,
+          environment: { ...env, HOME: test.directory, NODE_REPL_HISTORY: "" },
+        })
+        expect(started.running).toBe(true)
+        if (!started.metadata.output.includes("Welcome to Node.js")) {
+          yield* pollWithTimeout(
+            sessions
+              .write({ execID: started.execID!, yieldTimeMs: 100, invocation: invocation("poll") })
+              .pipe(Effect.map((chunk) => (chunk.metadata.output.includes("Welcome to Node.js") ? true : undefined))),
+            "Node REPL did not become ready",
+            "5 seconds",
+          )
+        }
+        const written = yield* sessions.write({
+          execID: started.execID!,
+          chars: 'console.log("result=" + (6 * 7) + ",tty=" + process.stdin.isTTY)\n.exit\n',
+          yieldTimeMs: 1000,
+          invocation: invocation("stdin"),
+        })
+        const completed = written.running ? yield* finish(started.execID!) : written
+        expect(written.output + completed.output).toContain("result=42,tty=true")
+        expect(completed.exitCode).toBe(0)
+        const reused = yield* lane("printf repl-finished")
+        expect(reused.output).toContain("repl-finished")
+        expect(reused.metadata.shellGeneration).toBe(started.metadata.shellGeneration)
+      }),
+    15000,
+  )
+
+  it.instance(
+    "Linux PTY Ctrl+C ends foreground work and permits a fresh lane",
+    () =>
+      Effect.gen(function* () {
+        if (process.platform !== "linux") return
+        const sessions = yield* ExecSession.Service
+        const command = 'process.stdout.write("interrupt-ready\\n"); setInterval(() => {}, 1000)'
+        const started = yield* lane(`'${process.execPath.replaceAll("'", `'\\''`)}' -e '${command}'`, {
+          tty: true,
+          yieldTimeMs: 0,
+        })
+        expect(started.running).toBe(true)
+        if (!started.metadata.output.includes("interrupt-ready")) {
+          yield* pollWithTimeout(
+            sessions
+              .write({ execID: started.execID!, yieldTimeMs: 100, invocation: invocation("poll") })
+              .pipe(Effect.map((chunk) => (chunk.metadata.output.includes("interrupt-ready") ? true : undefined))),
+            "Foreground process did not become ready",
+            "5 seconds",
+          )
+        }
+        const interrupted = yield* sessions.write({
+          execID: started.execID!,
+          chars: "\u0003",
+          yieldTimeMs: 500,
+          invocation: invocation("stdin"),
+        })
+        const completed = interrupted.running ? yield* finish(started.execID!) : interrupted
+        expect(completed.running).toBe(false)
+        const rebuilt = yield* lane("printf interrupt-recovered", { tty: true, resetLane: true })
+        expect(rebuilt.exitCode).toBe(0)
+        expect(rebuilt.output).toContain("interrupt-recovered")
+        expect(rebuilt.metadata.shellGeneration).toBeGreaterThan(started.metadata.shellGeneration ?? 0)
+      }),
+    15000,
+  )
+
   const terminalShells = [
     process.platform === "win32" && (process.env.COMSPEC || Bun.which("cmd.exe"))
       ? {
@@ -1660,10 +1929,10 @@ describe("tool.unified-exec lanes", () => {
           reuse: "printf 'reused:%s\\n' \"$OPENCODE_TTY_INPUT\"",
         }
       : undefined,
-    process.platform !== "win32" && !Shell.ps(Shell.acceptable())
+    process.platform !== "win32" && !Shell.ps(defaultShell)
       ? {
           label: "posix",
-          shell: Shell.acceptable(),
+          shell: defaultShell,
           command:
             "IFS= read -r OPENCODE_TTY_INPUT; export OPENCODE_TTY_INPUT; printf 'received:%s\\n' \"$OPENCODE_TTY_INPUT\"",
           reuse: "printf 'reused:%s\\n' \"$OPENCODE_TTY_INPUT\"",
@@ -1708,7 +1977,7 @@ describe("tool.unified-exec lanes", () => {
 
   it.instance("rejects a TTY mode change without discarding the lane", () =>
     Effect.gen(function* () {
-      if (!Shell.ps(Shell.acceptable())) return
+      if (!Shell.ps(defaultShell)) return
       const first = yield* lane("Write-Output pipe", { laneID: 0 })
       const changed = yield* lane("Write-Output tty", { laneID: 0, tty: true })
       expect(changed.error).toContain("tty mode changed")
@@ -1724,7 +1993,7 @@ describe("tool.unified-exec lanes", () => {
 
   it.instance("sanitizes controls and truncates visible lane output", () =>
     Effect.gen(function* () {
-      if (!Shell.ps(Shell.acceptable())) return
+      if (!Shell.ps(defaultShell)) return
       const command =
         "$text = 'prefix' + [char]27 + '[31m' + ('a' * 40000) + [char]27 + '[0m' + 'suffix'; [Console]::Out.Write($text)"
       const result = yield* lane(command, { laneID: 0 })
@@ -1737,7 +2006,7 @@ describe("tool.unified-exec lanes", () => {
 
   it.instance("bounds model output while retaining its head and tail", () =>
     Effect.gen(function* () {
-      if (!Shell.ps(Shell.acceptable())) return
+      if (!Shell.ps(defaultShell)) return
       const result = yield* lane("[Console]::Out.Write('HEAD' + ('x' * 300000) + 'TAIL')", {
         laneID: 0,
         maxOutputTokens: 100,

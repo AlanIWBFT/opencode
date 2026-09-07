@@ -13,6 +13,7 @@ import { fileURLToPath } from "url"
 import { Config } from "@/config/config"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Shell } from "@opencode-ai/core/shell"
+import { which } from "@opencode-ai/core/util/which"
 import { ShellID } from "./shell/id"
 
 import * as Truncate from "./truncate"
@@ -531,8 +532,25 @@ export const askPermissions = Effect.fn("ShellTool.askPermissions")(function* (
   )
 })
 
+export function persistentShellExecutable(
+  configShell?: string,
+  platform: NodeJS.Platform = process.platform,
+  environment: NodeJS.ProcessEnv = process.env,
+) {
+  if (platform !== "linux") return Shell.acceptable(configShell)
+  const bash = which("bash", environment)
+  if (!bash)
+    throw new Error(
+      "Linux unified exec requires Bash on PATH. Install Bash and restart OpenCode; no fallback to sh is used.",
+    )
+  return bash
+}
+
 export function persistentShellArgs(shell: string, tty: boolean, runnerFile: string, bootstrapEnv?: string) {
   const name = Shell.name(shell)
+  // A script operand keeps Bash non-interactive on a PTY. Pipe stdin can be a socket,
+  // which cannot be reopened through /dev/stdin, so use -s for the pipe transport.
+  if (process.platform === "linux" && name === "bash") return ["--noprofile", "--norc", "-p", tty ? "/dev/stdin" : "-s"]
   if (Shell.posix(shell)) return ["-l"]
   if (name === "cmd") {
     const bootstrap = tty && bootstrapEnv ? ["/k", `call %${bootstrapEnv}%`] : []
@@ -543,8 +561,9 @@ export function persistentShellArgs(shell: string, tty: boolean, runnerFile: str
   return []
 }
 
-export function persistentShellSupported(shell: string) {
+export function persistentShellSupported(shell: string, platform: NodeJS.Platform = process.platform) {
   const name = Shell.name(shell)
+  if (platform === "linux") return name === "bash"
   return Shell.ps(shell) || name === "cmd" || ["bash", "dash", "ksh", "sh", "zsh"].includes(name)
 }
 
@@ -597,9 +616,10 @@ export function persistentShellRequest(
 
 export function persistentShellBootstrapRequest(shell: string, runnerFile: string, tty: boolean) {
   const name = Shell.name(shell)
-  if (tty && (name === "cmd" || Shell.ps(shell))) return
+  if (tty && (name === "cmd" || Shell.ps(shell))) return undefined
   if (name === "cmd") return new TextEncoder().encode(`call "${runnerFile.replaceAll('"', '""')}" --bootstrap\r\n`)
   if (Shell.ps(shell)) return new TextEncoder().encode(`. ${powershellQuote(runnerFile)}${tty ? "\r" : "\r\n"}`)
+  if (process.platform === "linux") return new TextEncoder().encode(`set +o posix\n. ${posixQuote(runnerFile)}\n`)
   return new TextEncoder().encode(`. ${posixQuote(posixPath(runnerFile))}\n`)
 }
 
@@ -756,7 +776,7 @@ $__opencodeBootstrapOutput.Flush()
   const writeCwd =
     process.platform === "win32"
       ? `${variable}_exec_cwd=$(command pwd -P) && command cygpath -w -- "$${variable}_exec_cwd" > "$${variable}_status_file"`
-      : `command pwd -P > "$${variable}_status_file"`
+      : `command pwd -P >| "$${variable}_status_file"`
   return (
     [
       `${runner}() {`,
