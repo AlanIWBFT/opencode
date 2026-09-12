@@ -182,8 +182,9 @@ sealed class ClientSession
                         if (frame.Payload.Length != 0 || !_commands.TryGetValue(frame.Id, out var close) || !close.TryWriteStdin(frame.Payload, close: true)) return;
                         break;
                     case Protocol.FrameType.Cancel:
-                        if (frame.Payload.Length != 0 || !_commands.TryGetValue(frame.Id, out var cancel)) return;
-                        cancel.Cancel();
+                        if (frame.Payload.Length != 0) return;
+                        // Completion can overtake cancellation while output is buffered in the client.
+                        if (_commands.TryGetValue(frame.Id, out var cancel)) cancel.Cancel();
                         break;
                     case Protocol.FrameType.Credit:
                         if (_commands.TryGetValue(frame.Id, out var credit) && !credit.GrantOutputCredit(frame.Payload)) return;
