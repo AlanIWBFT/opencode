@@ -33,6 +33,8 @@ import { Plugin } from "../../plugin.js"
 import { MAX_STEPS_PROMPT } from "./max-steps.js"
 import { ExecSessionControl } from "../../tool/exec-session/control.js"
 import { OpenAITurnState } from "../openai-turn-state.js"
+import { SessionQuestionContext } from "../question-context.js"
+import { Token } from "../../util/token.js"
 
 const CONTINUE_AFTER_INCOMPLETE_STREAM =
   "The previous response was interrupted. Continue from where you left off without repeating completed content."
@@ -60,6 +62,7 @@ const layer = Layer.effect(
     const drain = Effect.fn("SessionRunner.drain")(function* (input: Parameters<Interface["drain"]>[0]) {
       const turnState = yield* OpenAITurnState.Current
       const sessionID = input.sessionID
+      const questionContext: { current?: SessionQuestionContext.Cache } = {}
       let force = input.force
       let continuing = input.continuation !== undefined
       let step = input.continuation?.step ?? 1
@@ -193,7 +196,7 @@ const layer = Layer.effect(
       while (true) {
         const next = yield* advanceToStep()
         if (next._tag !== "Ready") return next
-        continuing = yield* runStep(next.context, step)
+        continuing = yield* runStep(next.context, step, questionContext)
         step++
         force = false
         entering = false
@@ -210,7 +213,11 @@ const layer = Layer.effect(
     })
 
     /** Owns logical Step policy; each attempt owns its streaming, tools, and durable settlement. */
-    const runStep = Effect.fn("SessionRunner.runStep")(function* (first: SessionContext.Loaded, step: number) {
+    const runStep = Effect.fn("SessionRunner.runStep")(function* (
+      first: SessionContext.Loaded,
+      step: number,
+      questionContext: { current?: SessionQuestionContext.Cache },
+    ) {
       const sessionID = first.session.id
       let assistantMessageID = SessionMessage.ID.create()
       const retry = yield* SessionRunnerRetry.make(bus, sessionID)
@@ -237,6 +244,21 @@ const layer = Layer.effect(
           initial: loaded.initial,
           messages: loaded.messages,
         })
+        questionContext.current = yield* SessionQuestionContext.load(
+          db,
+          sessionID,
+          loaded.messages,
+          questionContext.current,
+        )
+        const restored = SessionQuestionContext.messages(questionContext.current, transcript.messages)
+        const messages = [...restored, ...transcript.messages]
+        const inputTokens = { ...estimate }
+        // Later provider measurements already include the restored context; the first request must budget it.
+        if (inputTokens.measured === 0)
+          inputTokens.estimated += restored.reduce(
+            (sum, message) => sum + message.content.reduce((total, part) => total + (part.type === "text" ? Token.estimate(part.text) : 0), 0),
+            0,
+          )
         const prepared = yield* context.request
           .primary({
             session: loaded.session,
@@ -244,13 +266,11 @@ const layer = Layer.effect(
             model: loaded.model,
             tools: loaded.tools,
             system: transcript.system,
-            messages: stepLimitReached
-              ? [...transcript.messages, Message.assistant(MAX_STEPS_PROMPT)]
-              : transcript.messages,
+            messages: stepLimitReached ? [...messages, Message.assistant(MAX_STEPS_PROMPT)] : messages,
             // Keep tool definitions on the final Step to preserve the provider's cached prefix.
             toolChoice: stepLimitReached ? "none" : undefined,
             webSocket: "session",
-            inputTokens: estimate,
+            inputTokens,
           })
           .pipe(
             // The hook event holds every message from before images are bounded, screenshots included, and is a separate
