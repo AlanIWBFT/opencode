@@ -43,6 +43,7 @@ import { SessionInbox } from "@opencode/core/session/inbox"
 import { SessionMessage } from "@opencode/core/session/message"
 import { SessionModelTransport } from "@opencode/core/session/model-transport"
 import { SessionProviderContext } from "@opencode/core/session/provider-context"
+import { SessionQuestionContext } from "@opencode/core/session/question-context"
 import { Money } from "@opencode/schema/money"
 import { SessionProjector } from "@opencode/core/session/projector"
 import { SessionExecution } from "@opencode/core/session/execution"
@@ -5014,6 +5015,102 @@ describe("SessionRunnerLLM", () => {
     ])
     expect(yield* recordedEventTypes(sessionID)).not.toContain("session.step.failed.1")
   })
+
+  for (const native of [false, true]) {
+    scenario(
+      `restores verbatim question replies after repeated ${native ? "native" : "summary"} compaction`,
+      function* (s) {
+        if (native) {
+          s.currentModel = LanguageModel.make({
+            id: "question-native",
+            provider: "openai",
+            route: OpenAIResponses.route,
+          })
+          modelLimits.set("question-native", defaultModelLimit)
+          s.compaction = { type: "native" }
+        }
+        const registry = yield* Tool.Service
+        const input = {
+          questions: [
+            {
+              header: "Choice",
+              question: "Which behavior should remain?",
+              options: [
+                { label: "Keep", description: "Keep the original behavior" },
+                { label: "Replace", description: "Use the alternative behavior" },
+              ],
+            },
+          ],
+        }
+        const reply = `Explain the compatibility rules first.\n${"Verbatim context, not approval.\n".repeat(120)}Do not infer agreement.`
+        const answers = [[reply]]
+        yield* transformTools(
+          registry,
+          {
+            question: {
+              name: "question",
+              description: "Ask the user",
+              input: QuestionTool.Input,
+              output: QuestionTool.Output,
+              execute: () =>
+                Effect.succeed({
+                  output: { answers },
+                  content: QuestionTool.toModelContent(input.questions, answers),
+                  metadata: { answers },
+                }),
+            },
+          },
+          { codemode: false },
+        )
+        yield* s.llm.push(
+          TestLLM.tool("historical-question", "question", input),
+          TestLLM.text("Recorded", "question-recorded"),
+        )
+        const first = yield* s.runPrompt("Ask for the migration decision")
+        expect(userTexts(s.requests[1]).some((text) => text.startsWith("<restored-question-context>"))).toBe(false)
+
+        for (const cycle of [1, 2]) {
+          s.requests.length = 0
+          yield* s.llm.push(
+            native
+              ? CompactionCheckpointResponse.make({
+                  responseID: `question-checkpoint-${cycle}`,
+                  checkpoint: { type: "compaction", provider: s.currentModel.provider, encrypted: `question-${cycle}` },
+                })
+              : TestLLM.text("## Objective\n- Continue the migration", `question-summary-${cycle}`),
+            TestLLM.text("Continuing", `question-continued-${cycle}`),
+          )
+          yield* s.session.compact({ sessionID })
+          yield* s.admit(`Continue ${cycle}; later corrections take precedence`)
+          yield* s.resume
+          expect(s.requests).toHaveLength(2)
+          expect(JSON.stringify(s.requests[0].messages)).not.toContain("<restored-question-context>")
+          const restored = userTexts(s.requests[1]).filter((text) => text.startsWith("<restored-question-context>"))
+          expect(restored).toHaveLength(1)
+          expect(restored[0]).toContain(`A: ${reply}`)
+          expect(restored[0]).toContain("Keep the original behavior")
+          expect(restored[0]).toContain("not necessarily a decision")
+          expect(JSON.stringify(yield* s.messages)).not.toContain("<restored-question-context>")
+        }
+
+        yield* replaySessionProjection(sessionID)
+        s.requests.length = 0
+        yield* s.llm.push(TestLLM.text("After replay", "question-after-replay"))
+        yield* s.runPrompt("Continue after rebuilding the projection")
+        expect(userTexts(s.requests[0]).join("\n")).toContain(`A: ${reply}`)
+        const fork = yield* s.session.fork({ sessionID })
+        const forkHistory = yield* s.session.context(fork.id)
+        const forkCache = yield* SessionQuestionContext.load(s.db, fork.id, forkHistory)
+        expect(forkCache?.entries.flatMap((entry) => entry.answers)).toContainEqual([reply])
+        yield* s.session.revert.stage({ sessionID, messageID: first.id, files: false })
+        yield* s.session.revert.commit(sessionID)
+        expect(yield* SessionQuestionContext.load(s.db, sessionID, yield* s.context)).toBeUndefined()
+        expect(
+          (yield* SessionQuestionContext.load(s.db, fork.id, yield* s.session.context(fork.id)))?.entries,
+        ).toHaveLength(1)
+      },
+    )
+  }
 
   scenario("interrupts runner continuation when a question is cancelled", function* (s) {
     const registry = yield* Tool.Service
