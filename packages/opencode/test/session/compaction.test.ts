@@ -876,7 +876,7 @@ describe("session.compaction.create", () => {
 
 describe("session.compaction.prune", () => {
   it.live(
-    "compacts old completed tool output",
+    "compacts old completed tool output while preserving question answers",
     provideTmpdirInstance(
       (dir) =>
         Effect.gen(function* () {
@@ -925,6 +925,22 @@ describe("session.compaction.prune", () => {
             sessionID: info.id,
             type: "tool",
             callID: crypto.randomUUID(),
+            tool: "question",
+            state: {
+              status: "completed",
+              input: { questions: [{ header: "Scope", question: "Which scope?", options: [] }] },
+              output: "User answer: " + "q".repeat(200_000),
+              title: "Asked 1 question",
+              metadata: { answers: [["q".repeat(200_000)]] },
+              time: { start: Date.now(), end: Date.now() },
+            },
+          })
+          yield* ssn.updatePart({
+            id: PartID.ascending(),
+            messageID: b.id,
+            sessionID: info.id,
+            type: "tool",
+            callID: crypto.randomUUID(),
             tool: "bash",
             state: {
               status: "completed",
@@ -956,12 +972,15 @@ describe("session.compaction.prune", () => {
           yield* compact.prune({ sessionID: info.id })
 
           const msgs = yield* ssn.messages({ sessionID: info.id })
-          const part = msgs.flatMap((msg) => msg.parts).find((part) => part.type === "tool")
+          const part = msgs.flatMap((msg) => msg.parts).find((part): part is SessionV1.ToolPart => part.type === "tool" && part.tool === "bash")
           expect(part?.type).toBe("tool")
           expect(part?.state.status).toBe("completed")
           if (part?.type === "tool" && part.state.status === "completed") {
             expect(part.state.time.compacted).toBeNumber()
           }
+          const question = msgs.flatMap((msg) => msg.parts).find((part): part is SessionV1.ToolPart => part.type === "tool" && part.tool === "question")
+          expect(question?.state.status).toBe("completed")
+          if (question?.state.status === "completed") expect(question.state.time.compacted).toBeUndefined()
         }),
 
       {

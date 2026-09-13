@@ -58,6 +58,7 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { LocationServiceMap, locationServiceMapLayer } from "@opencode-ai/core/location-services"
 import { OpenAINativeCompaction } from "@/session/openai-native-compaction"
+import { SessionQuestionContext } from "@/session/question-context"
 import { ExecSession } from "@/tool/exec-session"
 import { persistentShellScript } from "@/tool/shell"
 
@@ -1205,6 +1206,178 @@ noLLMServer.instance(
   { config: cfg, git: true },
 )
 
+const questionExchange = Effect.fn("test.questionExchange")(function* (sessionID: SessionID, answer: string) {
+  const sessions = yield* Session.Service
+  const turn = yield* seed(sessionID, { finish: "stop" })
+  const part = yield* sessions.updatePart({
+    id: PartID.ascending(),
+    messageID: turn.assistant.id,
+    sessionID,
+    type: "tool",
+    tool: "question",
+    callID: `call_${turn.assistant.id}`,
+    state: {
+      status: "completed",
+      input: {
+        questions: [
+          { header: "Scope", question: "Which scope should be retained?", options: [{ label: "All", description: "Keep every original answer" }] },
+          { header: "Targets", question: "Which targets?", options: [{ label: "A", description: "First target" }, { label: "B", description: "Second target" }], multiple: true },
+          { header: "Optional", question: "Any additional notes?", options: [] },
+        ],
+      },
+      title: "Asked 3 questions",
+      output: `User has answered: ${answer}`,
+      metadata: { answers: [[answer], ["A", "B"], []] },
+      time: { start: 1000, end: 2000 },
+    },
+  } satisfies SessionV1.ToolPart)
+  return { ...turn, part }
+})
+
+for (const strategy of ["summary", "native"] as const) {
+  it.instance(`restores full question answers in user input after repeated ${strategy} compaction`, () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(openAIProviderCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Question restoration" })
+      const answer = `CUSTOM_START_${"完整保留问答。".repeat(500)}_CUSTOM_END`
+      const old = yield* questionExchange(chat.id, answer)
+      if (old.part.type !== "tool" || old.part.state.status !== "completed") throw new Error("Missing question result")
+      // Existing sessions may already have a pruned tool result. Metadata is intact.
+      yield* sessions.updatePart({ ...old.part, state: { ...old.part.state, time: { ...old.part.state.time, compacted: 3000 } } })
+
+      for (let round = 0; round < 2; round++) {
+        const checkpoint = yield* nativeCheckpoint(chat.id)
+        if (strategy === "summary") {
+          const stored = yield* sessions.messages({ sessionID: chat.id })
+          const part = stored.find((message) => message.info.id === checkpoint.summary.id)?.parts[0]
+          if (part?.type !== "text") throw new Error("Missing summary text")
+          yield* sessions.updatePart({ ...part, text: "Work is still in progress.", metadata: {} })
+        }
+        yield* prompt.prompt({
+          sessionID: chat.id,
+          agent: "build",
+          model: checkpoint.model,
+          noReply: true,
+          parts: [{ type: "text", text: `Latest user correction ${round}` }],
+        })
+        yield* llm.text(`Continued ${round}`)
+        yield* prompt.loop({ sessionID: chat.id })
+        const requests = yield* llm.inputs
+        const input = requests.at(-1)?.input
+        if (!Array.isArray(input)) throw new Error("Missing Responses input")
+        const restored = input.find((item) => JSON.stringify(item).includes("CUSTOM_START_"))
+        expect(restored?.role).toBe("user")
+        const text = JSON.stringify(restored)
+        expect(text).toContain(answer)
+        expect(text).toContain("Keep every original answer")
+        expect(text).toContain("Second target")
+        expect(text).toContain("A (multiple):\\n- A\\n- B")
+        expect(text).toContain("A: [Unanswered]")
+        expect(text).toContain("1970-01-01T00:00:02.000Z")
+        expect(text).toContain("later user corrections take precedence")
+        expect(JSON.stringify(input).match(/CUSTOM_START_/g)).toHaveLength(1)
+        expect(input.indexOf(restored!)).toBeLessThan(input.findIndex((item) => JSON.stringify(item).includes(`Latest user correction ${round}`)))
+        expect(input.some((item) => item.type === "compaction")).toBe(strategy === "native")
+      }
+      const stored = yield* sessions.messages({ sessionID: chat.id })
+      expect(JSON.stringify(stored)).not.toContain("<restored-question-context>")
+    }),
+  )
+}
+
+it.instance("restores tool-limiter-truncated question answers even in a retained native tail", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(openAIProviderCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const truncate = yield* Truncate.Service
+    const chat = yield* sessions.create({ title: "Truncated question tail" })
+    const answer = `${"x".repeat(60_000)}_FULL_ANSWER_END`
+    const turn = yield* questionExchange(chat.id, answer)
+    if (turn.part.type !== "tool" || turn.part.state.status !== "completed") throw new Error("Missing question result")
+    const output = yield* truncate.output(turn.part.state.output)
+    expect(output.truncated).toBe(true)
+    expect(output.content).not.toContain("_FULL_ANSWER_END")
+    yield* sessions.updatePart({
+      ...turn.part,
+      state: {
+        ...turn.part.state,
+        output: output.content,
+        metadata: { ...turn.part.state.metadata, truncated: output.truncated },
+      },
+    })
+    const checkpoint = yield* nativeCheckpoint(chat.id, { tailStartID: turn.user.id })
+    yield* prompt.prompt({ sessionID: chat.id, model: checkpoint.model, noReply: true, parts: [{ type: "text", text: "Continue with my answer" }] })
+    yield* llm.text("Continued")
+    yield* prompt.loop({ sessionID: chat.id })
+    const input = (yield* llm.inputs).at(-1)?.input
+    if (!Array.isArray(input)) throw new Error("Missing Responses input")
+    const restored = input.find((item) => JSON.stringify(item).includes("_FULL_ANSWER_END"))
+    expect(restored?.role).toBe("user")
+    expect(JSON.stringify(restored)).toContain(answer)
+    expect(JSON.stringify(input).match(/_FULL_ANSWER_END/g)).toHaveLength(1)
+  }),
+)
+
+noLLMServer.instance("question restoration respects retained tails, fork and revert boundaries", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const database = yield* Database.Service
+    const prompt = yield* SessionPrompt.Service
+    const chat = yield* sessions.create({ title: "Question boundaries" })
+    const old = yield* questionExchange(chat.id, "old decision")
+    expect(yield* SessionQuestionContext.load(yield* sessions.messages({ sessionID: chat.id }))).toBeUndefined()
+    for (const state of [
+      { status: "error", input: {}, error: "The user dismissed this question", time: { start: 1000, end: 2000 } },
+      { status: "running", input: {}, time: { start: 1000 } },
+      { status: "pending", input: {}, raw: "" },
+    ] satisfies SessionV1.ToolPart["state"][]) {
+      yield* sessions.updatePart({
+        id: PartID.ascending(),
+        messageID: old.assistant.id,
+        sessionID: chat.id,
+        type: "tool",
+        tool: "question",
+        callID: `call_${state.status}`,
+        state,
+      })
+    }
+    const recent = yield* questionExchange(chat.id, "recent decision")
+    const checkpoint = yield* nativeCheckpoint(chat.id, { tailStartID: recent.user.id })
+    const compacted = yield* MessageV2.filterCompactedEffect(chat.id).pipe(Effect.provideService(Database.Service, database))
+    const context = yield* SessionQuestionContext.load(compacted)
+    expect(yield* SessionQuestionContext.load(compacted, context)).toBe(context)
+    const restored = JSON.stringify(SessionQuestionContext.messages(context, OpenAINativeCompaction.replayMessages(compacted).messages))
+    expect(restored).toContain("old decision")
+    expect(restored).not.toContain("recent decision")
+    const failedTail = OpenAINativeCompaction.replayMessages(compacted).messages.map((message) =>
+      message.info.role === "assistant" && message.info.id === recent.assistant.id
+        ? { ...message, info: { ...message.info, error: new SessionV1.ContextOverflowError({ message: "Stream failed after the user answered" }).toObject() } }
+        : message,
+    )
+    expect(JSON.stringify(SessionQuestionContext.messages(context, failedTail))).toContain("recent decision")
+
+    const fork = yield* sessions.fork({ sessionID: chat.id })
+    const forked = yield* MessageV2.filterCompactedEffect(fork.id).pipe(Effect.provideService(Database.Service, database))
+    const forkContext = yield* SessionQuestionContext.load(forked)
+    expect(forkContext?.entries).toHaveLength(2)
+    expect(forkContext?.entries[0].partID).not.toBe(old.part.id)
+    expect(JSON.stringify(SessionQuestionContext.messages(forkContext, OpenAINativeCompaction.replayMessages(forked).messages))).not.toContain("recent decision")
+
+    yield* sessions.setRevert({ sessionID: chat.id, revert: { messageID: recent.user.id }, summary: undefined })
+    yield* prompt.prompt({ sessionID: chat.id, model: checkpoint.model, noReply: true, parts: [{ type: "text", text: "Revised branch" }] })
+    yield* nativeCheckpoint(chat.id)
+    const reverted = yield* MessageV2.filterCompactedEffect(chat.id).pipe(Effect.provideService(Database.Service, database))
+    const revertedContext = yield* SessionQuestionContext.load(reverted, context)
+    expect(revertedContext?.entries).toHaveLength(1)
+    expect(JSON.stringify(SessionQuestionContext.messages(revertedContext, OpenAINativeCompaction.replayMessages(reverted).messages))).toContain("old decision")
+    expect(JSON.stringify(revertedContext)).not.toContain("recent decision")
+  }),
+  { config: cfg },
+)
+
 it.instance("loop replays legacy native checkpoint window before a follow-up user", () =>
   Effect.gen(function* () {
     const { llm } = yield* useServerConfig(openAIProviderCfg)
@@ -1247,6 +1420,7 @@ noLLMServer.instance(
       const prompt = yield* SessionPrompt.Service
       const sessions = yield* Session.Service
       const chat = yield* sessions.create({ title: "Pinned" })
+      yield* questionExchange(chat.id, "manual compaction answer")
       const checkpoint = yield* nativeCheckpoint(chat.id)
 
       const result = yield* prompt.loop({ sessionID: chat.id })
@@ -1304,6 +1478,7 @@ it.instance("loop resumes a native checkpoint without retained tail or synthetic
     const prompt = yield* SessionPrompt.Service
     const sessions = yield* Session.Service
     const chat = yield* sessions.create({ title: "Pinned" })
+    yield* questionExchange(chat.id, "automatic compaction answer")
     const checkpoint = yield* nativeCheckpoint(chat.id, { auto: true })
     yield* llm.text("resumed from native checkpoint")
 
@@ -1315,8 +1490,9 @@ it.instance("loop resumes a native checkpoint without retained tail or synthetic
     expect(result.info.role).toBe("assistant")
     if (result.info.role === "assistant") expect(result.info.parentID).toBe(checkpoint.marker.id)
     expect(body).toContain("opaque")
+    expect(body.match(/automatic compaction answer/g)).toHaveLength(1)
     expect(body).toContain("before compact")
-    expect(body.match(/before compact/g)?.length ?? 0).toBe(1)
+    expect(body.match(/"text":"before compact"/g)?.length ?? 0).toBe(1)
     expect(body).not.toContain("Continue if you have next steps")
     expect(body).not.toContain("如果你有下一步")
     expect(

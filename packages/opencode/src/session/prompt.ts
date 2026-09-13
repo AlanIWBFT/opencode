@@ -60,6 +60,7 @@ import { Todo } from "./todo"
 import { ExecSession } from "@/tool/exec-session"
 import { BackgroundJob } from "@/background/job"
 import { OpenAINativeCompaction } from "./openai-native-compaction"
+import { SessionQuestionContext } from "./question-context"
 
 // @ts-ignore
 globalThis.AI_SDK_LOG_WARNINGS = false
@@ -1385,6 +1386,7 @@ const layer = Layer.effect(
         let step = 0
         const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
         const openAITurnState = {}
+        let questionContext: SessionQuestionContext.Cache | undefined
 
         while (true) {
           yield* status.set(sessionID, { type: "busy" })
@@ -1611,6 +1613,9 @@ const layer = Layer.effect(
 
             yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
 
+            questionContext = yield* SessionQuestionContext.load(compacted, questionContext).pipe(
+              Effect.provideService(Session.Service, sessions),
+            )
             const [skills, env, instructions, mcpInstructions, modelMsgs] = yield* Effect.all([
               sys.skills(agent),
               sys.environment(model),
@@ -1634,6 +1639,7 @@ const layer = Layer.effect(
               parentSessionID: session.parentID,
               system,
               messages: [
+                ...SessionQuestionContext.messages(questionContext, msgs),
                 ...modelMsgs,
                 ...(isLastStep ? [{ role: "assistant" as const, content: MAX_STEPS_PROMPT }] : []),
               ],

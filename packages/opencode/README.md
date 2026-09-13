@@ -31,6 +31,38 @@ Another interpreter can be invoked explicitly, but changes to its shell state do
 
 This contract is specific to Linux unified exec. The integrated terminal and other shell consumers retain their existing configuration, as do Windows and macOS execution paths.
 
+## Question answers after compaction
+
+The consumed session prompt runner restores completed `question` exchanges from
+the original session transcript after both summary and OpenAI native compaction.
+The model receives a compact Markdown user-context block pairing each original
+question with its verbatim reply, with one timestamp per tool exchange. Later
+user corrections take precedence. Replies may be decisions, follow-up questions,
+or observations. Unanswered questions remain explicitly unanswered; dismissed or
+unfinished calls are not restored as user replies.
+
+Exact, unambiguous option selections retain only the selected labels and their
+descriptions. Custom, mixed, empty, or ambiguous answers retain all options.
+Small Chinese/English reference heuristics and mentions of unselected labels
+also retain all options for cumulative/comparative choices. This is best-effort
+context reduction, not an LLM classifier or a guarantee of detecting every
+natural-language dependency. Question and answer text is never summarized or
+truncated; redundant headers and tool flags are omitted.
+
+Restoration covers all exchanges before the current compaction marker, excludes
+intact exchanges still present in the retained tail, and is not truncated.
+Results marked truncated by the tool-output limiter are restored even when their
+tool calls remain in the tail. Its
+context cost therefore grows with the session's question history. Original tool
+records remain the source of truth; the runner caches their decoded contents only
+for the current drain/checkpoint and rebuilds them after restart or a new
+compaction. Forks and reverts use their own remaining transcript. Restoration is
+model-input-only: it does not create a user turn or wake an idle session, and is
+available to the first model request after compaction. Ordinary output pruning
+also protects `question` results. OpenAI native replacement windows exclude the
+restoration block from retained user input, so subsequent compactions cannot
+accumulate copies of this derived context.
+
 ## Managed startup protocol
 
 When `OPENCODE_STARTUP_PROTOCOL=1` is present, database initialization writes

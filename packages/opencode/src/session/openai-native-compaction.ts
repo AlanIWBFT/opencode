@@ -58,6 +58,7 @@ const CONTEXTUAL_USER_PREFIXES = [
   "<system-update>",
   "<environment_context>",
   "<system-reminder>",
+  "<restored-question-context>",
   "<permissions instructions>",
   "<model_switch>",
   "<token_budget>",
