@@ -1064,7 +1064,9 @@ function migrateTool(part: typeof SessionV1.ToolPart.Type, fallback: number) {
           processRunning: false,
           execError: "Live execution state is unavailable after V2 migration. The last saved output is preserved.",
         }
-      : previous
+      : part.tool === "question" && part.state.status === "completed" && part.state.time.compacted !== undefined
+        ? { ...previous, truncated: true }
+        : previous
   const base = {
     type: "tool" as const,
     id: part.callID,

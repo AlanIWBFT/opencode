@@ -128,6 +128,44 @@ const transform = (messages: V1Migration.SourceMessage[], parts: V1Migration.Sou
 }
 
 describe("V1Migration.transformSession", () => {
+  test("retains question answers while marking previously cleared output incomplete", () => {
+    const questions = [
+      { header: "Migration", question: "Keep the original?", options: [{ label: "Yes", description: "Preserve it" }] },
+    ]
+    const answers = [["Please clarify before proceeding"]]
+    const result = transform(
+      [assistant("msg_question", "msg_user")],
+      [
+        part("prt_question", "msg_question", {
+          type: "tool",
+          tool: "question",
+          callID: "question_old",
+          state: {
+            status: "completed",
+            input: { questions },
+            title: "Question",
+            output: "The old output was pruned",
+            metadata: { answers },
+            time: { start: 20, end: 21, compacted: 30 },
+          },
+        }),
+      ],
+    )
+    expect(result.messages[0].data).toMatchObject({
+      content: [
+        {
+          type: "tool",
+          name: "question",
+          state: {
+            input: { questions },
+            content: [{ type: "text", text: "[Old tool result content cleared]" }],
+            metadata: { answers, truncated: true },
+          },
+        },
+      ],
+    })
+  })
+
   test.each(
     [1, 2].flatMap((version) =>
       ["read", "bash", "grep"].flatMap((tool) => [false, true].map((after) => ({ version, tool, after }))),
