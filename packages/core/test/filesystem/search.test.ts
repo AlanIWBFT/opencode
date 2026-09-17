@@ -1,4 +1,4 @@
-import { describe, expect } from "bun:test"
+import { describe, expect, test } from "bun:test"
 import fs from "fs/promises"
 import path from "path"
 import { Effect } from "effect"
@@ -9,6 +9,24 @@ import { tmpdir } from "../fixture/tmpdir"
 import { testEffect } from "../lib/effect"
 
 const it = testEffect(LayerNode.compile(Ripgrep.node))
+
+test.each(["./src/filesystem/search.ts", "./src/filesystem.ts", "./src/location-services.ts"])(
+  "constructs the location dependency graph after importing %s first",
+  async (entry) => {
+    // A fresh process prevents another test's module cache from hiding an initialization cycle.
+    const child = Bun.spawn([
+      process.execPath,
+      "--eval",
+      `await import(${JSON.stringify(entry)});
+       const { locationServices } = await import("./src/location-services.ts");
+       const { LayerNode } = await import("./src/effect/layer-node.ts");
+       const { Node } = await import("./src/effect/app-node.ts");
+       LayerNode.hoist(locationServices, Node.tags.values.global);`,
+    ], { cwd: path.resolve(import.meta.dir, "../.."), stdout: "ignore", stderr: "pipe" })
+    const stderr = await new Response(child.stderr).text()
+    expect(await child.exited, stderr).toBe(0)
+  },
+)
 
 const withTmp = <A, E, R>(f: (directory: AbsolutePath) => Effect.Effect<A, E, R>) =>
   Effect.acquireRelease(
