@@ -19,6 +19,11 @@ process broker also requires the Visual Studio 2022 C++ toolchain and an x64
 Developer Shell. The package scripts build the managed Recycle Bin helper
 automatically before starting development or tests.
 
+The Windows process broker keeps stdin failures command-local. A stdin write or
+close arriving after spawn failure or command completion receives a broken-pipe
+acknowledgement; it does not disconnect other commands on the shared connection.
+Malformed protocol frames still close the connection.
+
 ## Linux unified exec
 
 On Linux, `exec_command` always uses Bash resolved from OpenCode's PATH, independently of `config.shell` and `$SHELL`. Bash is required; missing Bash produces an explicit error rather than falling back to `/bin/sh`. Commands use Bash syntax, including arrays, `[[ ... ]]`, process substitution, and `pipefail`.

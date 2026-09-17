@@ -176,10 +176,16 @@ sealed class ClientSession
                         Spawn(frame.Id, SpawnRequest.Parse(frame.Payload));
                         break;
                     case Protocol.FrameType.Stdin:
-                        if (!_commands.TryGetValue(frame.Id, out var stdin) || !stdin.TryWriteStdin(frame.Payload, close: false)) return;
-                        break;
                     case Protocol.FrameType.StdinClose:
-                        if (frame.Payload.Length != 0 || !_commands.TryGetValue(frame.Id, out var close) || !close.TryWriteStdin(frame.Payload, close: true)) return;
+                        var close = frame.Type == Protocol.FrameType.StdinClose;
+                        if (close && frame.Payload.Length != 0) return;
+                        // Spawn failure or completion can overtake already-sent stdin frames.
+                        if (!_commands.TryGetValue(frame.Id, out var stdin))
+                        {
+                            await SendUInt32Async(Protocol.FrameType.StdinAck, frame.Id, NativeMethods.ErrorBrokenPipe);
+                            break;
+                        }
+                        if (!stdin.TryWriteStdin(frame.Payload, close)) return;
                         break;
                     case Protocol.FrameType.Cancel:
                         if (frame.Payload.Length != 0) return;
@@ -376,7 +382,7 @@ sealed class ManagedCommand : IDisposable
     private NamedPipeServerStream? _stdin;
     private NamedPipeServerStream? _stdout;
     private NamedPipeServerStream? _stderr;
-    private bool _closed;
+    private volatile bool _closed;
 
     public ManagedCommand(ClientSession client, SemaphoreSlim launchSlots, ulong id, SpawnRequest request)
     {
@@ -436,13 +442,20 @@ sealed class ManagedCommand : IDisposable
 
     public bool TryWriteStdin(byte[] payload, bool close)
     {
-        if (_closed || !_request.KeepStdinOpen) return false;
-        if (!close && payload.Length == 0)
+        if (!_closed)
         {
-            _ = AcknowledgeEmptyStdinAsync();
-            return true;
+            if (!_request.KeepStdinOpen) return false;
+            if (!close && payload.Length == 0)
+            {
+                _ = AcknowledgeEmptyStdinAsync();
+                return true;
+            }
+            if (_stdinRequests.Writer.TryWrite(new StdinRequest(payload, close))) return true;
+            // Distinguish overlapping writes from disposal racing the enqueue.
+            if (!_closed) return false;
         }
-        return _stdinRequests.Writer.TryWrite(new StdinRequest(payload, close));
+        _ = TrySendStdinErrorAsync(new Win32Exception((int)NativeMethods.ErrorBrokenPipe));
+        return true;
     }
 
     public bool GrantOutputCredit(byte[] payload)
