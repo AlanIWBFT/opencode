@@ -11,6 +11,7 @@ import { Project } from "../src/project.js"
 import { SkillAttachment } from "../src/prompt.js"
 import { Provider } from "../src/provider.js"
 import { Pty } from "../src/pty.js"
+import { Question } from "../src/question.js"
 import { Session } from "../src/session.js"
 import { SessionMessage } from "../src/session-message.js"
 import { SessionInbox } from "../src/session-inbox.js"
@@ -24,6 +25,14 @@ import { PersistedRevert } from "../src/session-revert.js"
 import { AbsolutePath, optional } from "../src/schema.js"
 
 describe("contract hygiene", () => {
+  test("question custom-answer policy preserves false and omits an unspecified policy", () => {
+    const question = { question: "Continue?", header: "Continue", options: [{ label: "Yes", description: "Proceed" }] }
+    const decode = Schema.decodeUnknownSync(Question.Prompt)
+    expect(decode({ ...question, custom: false })).toEqual({ ...question, custom: false })
+    expect(Schema.encodeSync(Question.Prompt)({ ...question, custom: undefined })).toEqual(question)
+    expect(() => decode({ ...question, custom: "false" })).toThrow()
+  })
+
   test("restricts agent colors to six-digit hex values", () => {
     const decode = Schema.decodeUnknownSync(ConfigAgent.Color)
     expect(decode("#ff6b6b")).toBe("#ff6b6b")
