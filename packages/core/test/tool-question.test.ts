@@ -1,5 +1,5 @@
 import { describe, expect } from "bun:test"
-import { Cause, Effect, Exit, Fiber, Layer } from "effect"
+import { Cause, ConfigProvider, Effect, Exit, Fiber, Layer } from "effect"
 import { AppNodeBuilder } from "@opencode/core/effect/app-node-builder"
 import { LayerNode } from "@opencode/util/effect/layer-node"
 import { Form } from "@opencode/core/form"
@@ -69,10 +69,58 @@ const it = testEffect(
     Permission.node.replace(permission),
     Form.node.replace(form),
     Image.node.replace(imagePassthrough),
-  ]),
+  ]).pipe(
+    Layer.provide(
+      Layer.succeed(
+        ConfigProvider.ConfigProvider,
+        ConfigProvider.fromUnknown({ OPENCODE_EXPERIMENTAL_CODE_MODE: true }),
+      ),
+    ),
+  ),
 )
 
 describe("QuestionTool", () => {
+  it.effect("preserves custom-answer policy for single and multiple choice forms", () =>
+    Effect.gen(function* () {
+      captured = undefined
+      reject = false
+      deny = false
+      const registry = yield* Tool.Service
+      const questions = [undefined, true, false].flatMap((custom) =>
+        [false, true].map((multiple) => ({
+          ...questionInput.questions[0],
+          multiple,
+          ...(custom === undefined ? {} : { custom }),
+        })),
+      )
+      yield* executeTool(registry, {
+        sessionID,
+        ...toolIdentity,
+        call: { type: "tool-call", id: "call-question-custom", name: "question", input: { questions } },
+      })
+      const fields = capturedInput()!.fields
+      expect(fields).toMatchObject([
+        { type: "string", custom: true },
+        { type: "multiselect", custom: true },
+        { type: "string", custom: true },
+        { type: "multiselect", custom: true },
+        { type: "string", custom: false },
+        { type: "multiselect", custom: false },
+      ])
+      expect(
+        Form.validateAnswer(fields, {
+          q0: "Custom reply",
+          q1: ["Custom reply"],
+          q2: "Custom reply",
+          q3: ["Custom reply"],
+        }),
+      ).toBeUndefined()
+      expect(Form.validateAnswer(fields, { q4: "Custom reply" })).toContain("Invalid option")
+      expect(Form.validateAnswer(fields, { q5: ["Custom reply"] })).toContain("Invalid option")
+      expect(Form.validateAnswer(fields, { q4: "Yes", q5: ["Yes"] })).toBeUndefined()
+    }),
+  )
+
   it.effect("emits one item schema for the nonempty questions array", () =>
     Effect.gen(function* () {
       captured = undefined
