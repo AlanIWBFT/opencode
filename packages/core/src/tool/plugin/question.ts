@@ -16,7 +16,7 @@ export const description = `Use this tool when you need to ask the user question
 4. Offer choices to the user about what direction to take.
 
 Usage notes:
-- A "Type your own answer" option is added automatically; don't include a separate option for free form answers
+- When \`custom\` is enabled (default), a "Type your own answer" option is added automatically; don't include a separate option for free form answers
 - Set \`multiple: true\` to allow selecting more than one option
 - If you recommend a specific option, make that the first option in the list and add "(Recommended)" at the end of the label`
 
@@ -127,6 +127,6 @@ function toField(question: Question.Prompt, index: number): Form.Field {
       label: option.label,
       description: option.description,
     })),
-    custom: true,
+    custom: question.custom ?? true,
   }
 }
