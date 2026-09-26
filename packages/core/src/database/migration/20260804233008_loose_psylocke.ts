@@ -163,7 +163,7 @@ const migration: DatabaseMigration.Migration = {
       yield* tx.run(
         `CREATE INDEX \`session_v2_time_suspended_idx\` ON \`session_v2\` (\`time_suspended\`) WHERE "session_v2"."time_suspended" is not null;`,
       )
-      yield* tx.run(`DROP TABLE \`data_migration\`;`)
+      yield* tx.run(`DROP TABLE IF EXISTS \`data_migration\`;`)
       yield* tx.run(`DROP TABLE \`session_context_epoch\`;`)
       yield* tx.run(`DROP TABLE \`session_input\`;`)
     })
