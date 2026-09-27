@@ -12,6 +12,7 @@ export const register = Effect.fn("WebSearchProvider.register")(function* (
     readonly id: string
     readonly name: string
     readonly env: string
+    readonly options?: readonly WebSearch.OptionName[]
     readonly execute: (
       input: WebSearch.ProviderInput,
       credential: Credential.Value | undefined,
@@ -33,6 +34,7 @@ export const register = Effect.fn("WebSearchProvider.register")(function* (
     editor.add({
       id: provider.id,
       name: provider.name,
+      ...(provider.options ? { options: provider.options } : {}),
       execute: (input) =>
         Effect.gen(function* () {
           const connection = yield* ctx.integration.connection.active(provider.id)

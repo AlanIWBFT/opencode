@@ -32,6 +32,7 @@ export const call = <F extends Schema.Struct.Fields, R extends Schema.Struct.Fie
   schema: { readonly input: Schema.Struct<F>; readonly output: Schema.Struct<R> },
   value: Schema.Struct.Type<F>,
   headers: Record<string, string> = {},
+  maxResponseBytes = MAX_RESPONSE_BYTES,
 ) =>
   Effect.gen(function* () {
     const request = yield* HttpClientRequest.post(url).pipe(
@@ -55,8 +56,8 @@ export const call = <F extends Schema.Struct.Fields, R extends Schema.Struct.Fie
       const response = yield* HttpClient.withScope(HttpClient.filterStatusOk(http)).execute(request)
       const body = yield* collectBoundedResponseBody(
         response,
-        MAX_RESPONSE_BYTES,
-        () => new Error(`${tool} response exceeded ${MAX_RESPONSE_BYTES} bytes`),
+        maxResponseBytes,
+        () => new Error(`${tool} response exceeded ${maxResponseBytes} bytes`),
       )
       return yield* parseResponse(body.toString("utf8"), schema.output)
     }).pipe(
