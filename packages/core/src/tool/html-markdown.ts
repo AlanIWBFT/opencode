@@ -1,6 +1,7 @@
 import { Parser } from "htmlparser2"
 
-const omitted = new Set(["script", "style", "noscript", "iframe", "object", "embed", "meta", "link", "template"])
+// HTTP extraction does not execute JavaScript; noscript may contain the entire readable page.
+const omitted = new Set(["script", "style", "iframe", "object", "embed", "meta", "link", "template"])
 const blocks = new Set([
   "address",
   "article",

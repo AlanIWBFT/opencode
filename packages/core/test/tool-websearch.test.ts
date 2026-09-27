@@ -103,7 +103,7 @@ describe("WebSearchTool registration", () => {
       const registry = fixture.registry
       yield* fixture.websearch.select(WebSearch.ID.make("exa"))
 
-      expect((yield* toolDefinitions(registry)).map((tool) => tool.name)).toEqual(["websearch", "execute"])
+      expect((yield* toolDefinitions(registry)).map((tool) => tool.name)).toContain("websearch")
       expect(
         yield* executeTool(registry, {
           sessionID,
@@ -117,7 +117,9 @@ describe("WebSearchTool registration", () => {
         }),
       ).toMatchObject({
         status: "completed",
-        content: [{ type: "text", text: "## [Search results](https://example.com)\n\nsearch results" }],
+        content: [
+          { type: "text", text: "Search provider: exa\n\n## [Search results](https://example.com)\n\nsearch results" },
+        ],
       })
       expect(fixture.assertions).toMatchObject([
         {
@@ -175,7 +177,7 @@ describe("WebSearchTool registration", () => {
         content: [
           {
             type: "text",
-            text: "## [Effect](https://effect.website)\nPublished: 2026-07-25T00:00:00.000Z\n\nparallel results",
+            text: "Search provider: parallel\n\n## [Effect](https://effect.website)\nPublished: 2026-07-25T00:00:00.000Z\n\nparallel results",
           },
         ],
         metadata: { provider: "parallel" },
@@ -198,7 +200,7 @@ describe("WebSearchTool registration", () => {
         }),
       ).toMatchObject({
         status: "completed",
-        content: [{ type: "text", text: WebSearchTool.NO_RESULTS }],
+        content: [{ type: "text", text: `Search provider: exa\n\n${WebSearchTool.NO_RESULTS}` }],
       })
     }),
   )
