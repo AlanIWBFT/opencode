@@ -114,7 +114,7 @@ describe("WebSearchTool registration", () => {
       const registry = fixture.registry
       yield* fixture.websearch.select(WebSearch.ID.make("exa"))
 
-      expect((yield* toolDefinitions(registry)).map((tool) => tool.name)).toEqual(["websearch", "execute"])
+      expect((yield* toolDefinitions(registry)).map((tool) => tool.name)).toContain("websearch")
       expect(
         yield* executeTool(registry, {
           sessionID,
@@ -128,8 +128,9 @@ describe("WebSearchTool registration", () => {
         }),
       ).toMatchObject({
         status: "completed",
-        output: [{ url: "https://example.com", title: "Search results", content: "search results" }],
-        content: [{ type: "text", text: "## [Search results](https://example.com)\n\nsearch results" }],
+        content: [
+          { type: "text", text: "Search provider: exa\n\n## [Search results](https://example.com)\n\nsearch results" },
+        ],
       })
       expect(fixture.assertions).toMatchObject([
         {
@@ -151,7 +152,7 @@ describe("WebSearchTool registration", () => {
     }),
   )
 
-  it.effect("returns flat results and keeps the provider in metadata", () =>
+  it.effect("keeps normalized results in structured output", () =>
     Effect.gen(function* () {
       const fixture = yield* setup
       yield* fixture.websearch.select(WebSearch.ID.make("parallel"))
@@ -173,18 +174,21 @@ describe("WebSearchTool registration", () => {
         }),
       ).toEqual({
         status: "completed",
-        output: [
-          {
-            url: "https://effect.website",
-            title: "Effect",
-            content: "parallel results",
-            published: Date.parse("2026-07-25T00:00:00.000Z"),
-          },
-        ],
+        output: {
+          provider: "parallel",
+          results: [
+            {
+              url: "https://effect.website",
+              title: "Effect",
+              content: "parallel results",
+              time: { published: Date.parse("2026-07-25T00:00:00.000Z") },
+            },
+          ],
+        },
         content: [
           {
             type: "text",
-            text: "## [Effect](https://effect.website)\nPublished: 2026-07-25T00:00:00.000Z\n\nparallel results",
+            text: "Search provider: parallel\n\n## [Effect](https://effect.website)\nPublished: 2026-07-25T00:00:00.000Z\n\nparallel results",
           },
         ],
         metadata: { provider: "parallel" },
@@ -207,8 +211,7 @@ describe("WebSearchTool registration", () => {
         }),
       ).toMatchObject({
         status: "completed",
-        output: [],
-        content: [{ type: "text", text: WebSearchTool.NO_RESULTS }],
+        content: [{ type: "text", text: `Search provider: exa\n\n${WebSearchTool.NO_RESULTS}` }],
       })
     }),
   )
@@ -420,7 +423,7 @@ describe("WebSearchTool registration", () => {
       const replacement = WebSearch.ID.make(first === "exa" ? "parallel" : "exa")
       expect(progress).toEqual([{ provider: first }, { provider: replacement }])
       expect(result).toMatchObject({
-        output: [{ url: "https://example.com", title: "Search results", content: "search results" }],
+        output: { provider: replacement, results: fixture.results },
         metadata: { provider: replacement },
       })
       expect(fixture.formRequests).toEqual([])

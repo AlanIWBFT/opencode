@@ -22,20 +22,19 @@ const httpErrors = new Map([
 
 export const description = `Search the web using the user's selected search integration. Use this for current information beyond knowledge cutoff.
 
+Describe the pages and evidence you want in natural language, especially with Exa. Optional search controls are currently supported by Exa; unsupported controls return an error rather than being ignored. Results are candidate sources, not verified claims. Open promising URLs with webfetch and verify context; refine the query when results do not answer the question.
+
 The current year is ${new Date().getFullYear()}. Use this year when searching for recent information or current events.`
 
 export const Input = Schema.Struct({
   query: Schema.String.annotate({ description: "Websearch query" }),
+  ...WebSearch.Options.fields,
 })
 
-const Output = Schema.Array(
-  Schema.Struct({
-    url: WebSearch.Result.fields.url,
-    title: WebSearch.Result.fields.title,
-    content: WebSearch.Result.fields.content,
-    published: WebSearch.Result.fields.time.fields.published,
-  }),
-)
+const Output = Schema.Struct({
+  provider: WebSearch.ID,
+  results: Schema.Array(WebSearch.Result),
+})
 export const Plugin = {
   id: "opencode.tool.websearch",
   effect: Effect.fn("WebSearchTool.Plugin")(function* (ctx: Context) {
@@ -154,27 +153,36 @@ export const Plugin = {
                     )
                 }),
               )
-              const output = result.results.map((hit) => ({
-                url: hit.url,
-                ...(hit.title === undefined ? {} : { title: hit.title }),
-                ...(hit.content === undefined ? {} : { content: hit.content }),
-                ...(hit.time.published === undefined ? {} : { published: hit.time.published }),
-              }))
-              const content = result.results.length
-                ? result.results
+              const output = {
+                provider: result.providerID,
+                results: result.results,
+              }
+              const content = output.results.length
+                ? output.results
                     .map((result) => {
                       const title = result.title ?? result.url
                       const published = result.time.published
                         ? `\nPublished: ${new Date(result.time.published).toISOString()}`
                         : ""
-                      return `## [${title}](${result.url})${published}${result.content ? `\n\n${result.content}` : ""}`
+                      const kind = result.contentKind
+                        ? `\nContent: ${result.contentKind} (excerpt, not the complete page)`
+                        : ""
+                      return `## [${title}](${result.url})${published}${kind}${result.content ? `\n\n${result.content}` : ""}`
                     })
                     .join("\n\n")
                 : NO_RESULTS
-              return { output, content, metadata: { provider: result.providerID } }
+              return {
+                output,
+                content: `Search provider: ${output.provider}\n\n${content}`,
+                metadata: { provider: output.provider },
+              }
             }).pipe(
               Effect.mapError((error) => {
                 const fallback = `Unable to search the web for ${input.query}`
+                if (Schema.is(WebSearch.UnsupportedOptionsError)(error))
+                  return new ToolFailure({
+                    message: `${error.providerID} does not support: ${error.options.join(", ")}. Remove those options or select Exa.`,
+                  })
                 if (!Schema.is(WebSearch.RequestError)(error)) return new ToolFailure({ message: fallback, error })
                 const status = HttpClientError.isHttpClientError(error.cause) ? error.cause.response?.status : undefined
                 return new ToolFailure({
