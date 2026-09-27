@@ -21,6 +21,7 @@ export { Event } from "@opencode/schema/websearch"
 export const Input = WebSearch.Input
 export type Input = WebSearch.Input
 export type ProviderInput = WebSearch.ProviderInput
+export const Options = WebSearch.Options
 
 export const Result = WebSearch.Result
 export type Result = WebSearch.Result
@@ -52,7 +53,20 @@ export class RequestError extends Schema.TaggedError<RequestError>()("WebSearch.
   cause: Schema.Defect(),
 }) {}
 
-export type Error = ProviderRequiredError | ProviderNotFoundError | DisabledError | RequestError
+export class UnsupportedOptionsError extends Schema.TaggedError<UnsupportedOptionsError>()(
+  "WebSearch.UnsupportedOptions",
+  {
+    providerID: ID,
+    options: Schema.Array(Schema.String),
+  },
+) {}
+
+export type Error =
+  | ProviderRequiredError
+  | ProviderNotFoundError
+  | DisabledError
+  | RequestError
+  | UnsupportedOptionsError
 
 export interface Interface extends State.Transformable<Editor> {
   readonly providers: () => Effect.Effect<readonly Provider[]>
@@ -165,6 +179,7 @@ const layer = Layer.effect(
         return Array.from(state.get().providers.values(), (provider) => ({
           id: provider.id,
           name: provider.name,
+          ...(provider.options && { options: provider.options }),
         })).toSorted((a, b) => a.name.localeCompare(b.name))
       }),
       default: Effect.fn("WebSearch.defaultInfo")(function* () {
@@ -175,9 +190,10 @@ const layer = Layer.effect(
         yield* kv.set(ProviderKey, selection)
       }),
       query: Effect.fn("WebSearch.query")(function* (input, options) {
-        const choice = input.providerID ? undefined : yield* selection()
-        let provider = input.providerID
-          ? yield* requireProvider(state.get().providers, input.providerID)
+        const { providerID, ...query } = input
+        const choice = providerID ? undefined : yield* selection()
+        let provider = providerID
+          ? yield* requireProvider(state.get().providers, providerID)
           : yield* defaultProvider(choice)
         if (!provider) return yield* new ProviderRequiredError()
         // Keep the cell for this query so deletion/movement cannot reinsert an in-flight session's entry.
@@ -188,13 +204,19 @@ const layer = Layer.effect(
         }
         const attempted = new Set<ID>()
         while (true) {
+          const supported = provider.options ?? []
+          const unsupported = Object.entries(query)
+            .filter(
+              ([key, value]) => key !== "query" && value !== undefined && !supported.some((option) => option === key),
+            )
+            .map(([key]) => key)
+          if (unsupported.length)
+            return yield* new UnsupportedOptionsError({ providerID: provider.id, options: unsupported })
           if (options?.onProvider) yield* options.onProvider({ id: provider.id, name: provider.name })
           let cooldown = choice === "random" ? cooldowns.get(provider.id) : undefined
           if (!cooldown || cooldown.until <= (yield* Clock.currentTimeMillis)) {
             attempted.add(provider.id)
-            const result = yield* provider
-              .execute({ query: input.query })
-              .pipe(Effect.flatMap(decodeResults), Effect.result)
+            const result = yield* provider.execute(query).pipe(Effect.flatMap(decodeResults), Effect.result)
             if (result._tag === "Success") return new Response({ providerID: provider.id, results: result.success })
             const cause = result.failure
             const error = new RequestError({ providerID: provider.id, cause })

@@ -487,10 +487,7 @@ export const make = Effect.fn("PluginHost.make")(function* (
       providers: () => response(websearch.providers()),
       query: (input) =>
         response(
-          websearch.query({
-            query: input.query,
-            providerID: input.providerID === undefined ? undefined : WebSearch.ID.make(input.providerID),
-          }),
+          Schema.decodeUnknownEffect(WebSearch.Input)(input).pipe(Effect.flatMap((query) => websearch.query(query))),
         ),
       reload: websearch.reload,
       transform: (callback) =>
@@ -500,6 +497,7 @@ export const make = Effect.fn("PluginHost.make")(function* (
               editor.add({
                 id: WebSearch.ID.make(definition.id),
                 name: definition.name,
+                options: definition.options,
                 execute: definition.execute,
               }),
             default: {

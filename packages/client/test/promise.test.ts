@@ -264,7 +264,9 @@ test("websearch.query uses the public HTTP contract", async () => {
         location: { directory: "/tmp/project", project: { id: "proj_test", directory: "/tmp/project" } },
         data: {
           providerID: "exa",
-          results: [{ url: "https://example.com", title: "Result", content: "result", time: {} }],
+          results: [
+            { url: "https://example.com", title: "Result", content: "result", contentKind: "highlights", time: {} },
+          ],
         },
       })
     },
@@ -273,16 +275,29 @@ test("websearch.query uses the public HTTP contract", async () => {
   const result = await client.websearch.query({
     query: "opencode",
     providerID: "exa",
+    numResults: 3,
+    includeDomains: ["example.com/docs"],
+    excludeDomains: ["example.com/old"],
+    highlightsQuery: "API compatibility",
+    maxCharacters: 800,
     location: { directory: "/tmp/project" },
   })
 
   expect(result.data).toEqual({
     providerID: "exa",
-    results: [{ url: "https://example.com", title: "Result", content: "result", time: {} }],
+    results: [{ url: "https://example.com", title: "Result", content: "result", contentKind: "highlights", time: {} }],
   })
   expect(request?.method).toBe("POST")
   expect(request?.url).toBe("http://localhost:3000/api/websearch?location%5Bdirectory%5D=%2Ftmp%2Fproject")
-  expect(await request?.json()).toEqual({ query: "opencode", providerID: "exa" })
+  expect(await request?.json()).toEqual({
+    query: "opencode",
+    providerID: "exa",
+    numResults: 3,
+    includeDomains: ["example.com/docs"],
+    excludeDomains: ["example.com/old"],
+    highlightsQuery: "API compatibility",
+    maxCharacters: 800,
+  })
 })
 
 test("server.info uses the public HTTP contract", async () => {

@@ -357,6 +357,7 @@ export type SessionExportOutput = {
               readonly type: string
               readonly message: string
               readonly status?: number | undefined
+              readonly response?: { readonly body: string } | undefined
               readonly resolution?:
                 | {
                     readonly kind:
@@ -448,6 +449,7 @@ export type SessionExportOutput = {
           readonly type: string
           readonly message: string
           readonly status?: number | undefined
+          readonly response?: { readonly body: string } | undefined
           readonly resolution?:
             | {
                 readonly kind:
@@ -530,6 +532,7 @@ export type SessionSwitchModelOperation<E = never> = (
 export type SessionUpdateInput = {
   readonly sessionID: Session.ID
   readonly title?: string | undefined
+  readonly archivedAt?: number | null | undefined
   readonly metadata?: Session.Metadata | undefined
   readonly permissions?: Permission.Ruleset | undefined
 }
@@ -824,6 +827,20 @@ export type SessionLogOutput =
           readonly id: Event.ID
           readonly created: number
           readonly metadata?: { readonly [x: string]: unknown } | undefined
+          readonly type: "session.archive.updated"
+          readonly durable: { readonly aggregateID: string; readonly seq: Event.Seq; readonly version: Event.Version }
+          readonly location?:
+            | {
+                readonly directory: AbsolutePath
+                readonly workspaceID?: (string & Brand.Brand<"Workspace.ID">) | undefined
+              }
+            | undefined
+          readonly data: { readonly sessionID: Session.ID; readonly archivedAt: number | null }
+        }
+      | {
+          readonly id: Event.ID
+          readonly created: number
+          readonly metadata?: { readonly [x: string]: unknown } | undefined
           readonly type: "session.permissions"
           readonly durable: { readonly aggregateID: string; readonly seq: Event.Seq; readonly version: Event.Version }
           readonly location?:
@@ -995,6 +1012,34 @@ export type SessionLogOutput =
               readonly message: string
               readonly status?: number | undefined
               readonly response?: { readonly body: string } | undefined
+              readonly resolution?:
+                | {
+                    readonly kind:
+                      | "rate_limited"
+                      | "usage_limited"
+                      | "plan_not_included"
+                      | "quota_exceeded"
+                      | "policy_blocked"
+                      | "authentication"
+                      | "invalid_input"
+                      | "network"
+                      | "server"
+                    readonly retry: "automatic" | "never"
+                    readonly action:
+                      | "switch_model"
+                      | "wait"
+                      | "manage_billing"
+                      | "reauthenticate"
+                      | "fix_input"
+                      | "check_network"
+                      | "retry"
+                    readonly retryAfterMs?: number | undefined
+                    readonly providerCode?: string | undefined
+                  }
+                | undefined
+              readonly responseBody?: string | undefined
+              readonly responseHeaders?: { readonly [x: string]: string } | undefined
+              readonly url?: string | undefined
             }
           }
         }
@@ -1192,6 +1237,34 @@ export type SessionLogOutput =
               readonly message: string
               readonly status?: number | undefined
               readonly response?: { readonly body: string } | undefined
+              readonly resolution?:
+                | {
+                    readonly kind:
+                      | "rate_limited"
+                      | "usage_limited"
+                      | "plan_not_included"
+                      | "quota_exceeded"
+                      | "policy_blocked"
+                      | "authentication"
+                      | "invalid_input"
+                      | "network"
+                      | "server"
+                    readonly retry: "automatic" | "never"
+                    readonly action:
+                      | "switch_model"
+                      | "wait"
+                      | "manage_billing"
+                      | "reauthenticate"
+                      | "fix_input"
+                      | "check_network"
+                      | "retry"
+                    readonly retryAfterMs?: number | undefined
+                    readonly providerCode?: string | undefined
+                  }
+                | undefined
+              readonly responseBody?: string | undefined
+              readonly responseHeaders?: { readonly [x: string]: string } | undefined
+              readonly url?: string | undefined
             }
             readonly finish?: "content-filter" | undefined
             readonly rawFinish?: string | undefined
@@ -1407,6 +1480,34 @@ export type SessionLogOutput =
               readonly message: string
               readonly status?: number | undefined
               readonly response?: { readonly body: string } | undefined
+              readonly resolution?:
+                | {
+                    readonly kind:
+                      | "rate_limited"
+                      | "usage_limited"
+                      | "plan_not_included"
+                      | "quota_exceeded"
+                      | "policy_blocked"
+                      | "authentication"
+                      | "invalid_input"
+                      | "network"
+                      | "server"
+                    readonly retry: "automatic" | "never"
+                    readonly action:
+                      | "switch_model"
+                      | "wait"
+                      | "manage_billing"
+                      | "reauthenticate"
+                      | "fix_input"
+                      | "check_network"
+                      | "retry"
+                    readonly retryAfterMs?: number | undefined
+                    readonly providerCode?: string | undefined
+                  }
+                | undefined
+              readonly responseBody?: string | undefined
+              readonly responseHeaders?: { readonly [x: string]: string } | undefined
+              readonly url?: string | undefined
             }
             readonly content?:
               | readonly [
@@ -1439,6 +1540,85 @@ export type SessionLogOutput =
           readonly id: Event.ID
           readonly created: number
           readonly metadata?: { readonly [x: string]: unknown } | undefined
+          readonly type: "session.exec.captured"
+          readonly durable: { readonly aggregateID: string; readonly seq: Event.Seq; readonly version: Event.Version }
+          readonly location?:
+            | {
+                readonly directory: AbsolutePath
+                readonly workspaceID?: (string & Brand.Brand<"Workspace.ID">) | undefined
+              }
+            | undefined
+          readonly data: {
+            readonly sessionID: Session.ID
+            readonly assistantMessageID: SessionMessage.ID
+            readonly id: string & Brand.Brand<"Tool.CallID">
+            readonly childID?: string | undefined
+            readonly revision: number
+            readonly metadata: {
+              readonly command: string
+              readonly output: string
+              readonly interactions: ReadonlyArray<{ readonly type: "stdin" | "terminate"; readonly time: number }>
+              readonly execID?: number | undefined
+              readonly laneID?: number | undefined
+              readonly shellGeneration?: number | undefined
+              readonly shellReused?: boolean | undefined
+              readonly cwd?: string | undefined
+              readonly sessionExposed?: boolean | undefined
+              readonly startedAt?: number | undefined
+              readonly durationMs?: number | undefined
+              readonly processRunning: boolean
+              readonly exitCode?: number | undefined
+              readonly outputError?: string | undefined
+              readonly truncated: boolean
+              readonly terminationRequested?: boolean | undefined
+              readonly execDisplay: "root" | "poll" | "stdin" | "terminate"
+              readonly execError?: string | undefined
+            }
+          }
+        }
+      | {
+          readonly id: Event.ID
+          readonly created: number
+          readonly metadata?: { readonly [x: string]: unknown } | undefined
+          readonly type: "session.script.captured"
+          readonly durable: { readonly aggregateID: string; readonly seq: Event.Seq; readonly version: Event.Version }
+          readonly location?:
+            | {
+                readonly directory: AbsolutePath
+                readonly workspaceID?: (string & Brand.Brand<"Workspace.ID">) | undefined
+              }
+            | undefined
+          readonly data: {
+            readonly sessionID: Session.ID
+            readonly assistantMessageID: SessionMessage.ID
+            readonly id: string & Brand.Brand<"Tool.CallID">
+            readonly revision: number
+            readonly toolCalls: ReadonlyArray<{
+              readonly id?: string
+              readonly tool: string
+              readonly name?: string
+              readonly title?: string
+              readonly status: "running" | "completed" | "error"
+              readonly input?: { readonly [x: string]: Schema.Json }
+              readonly metadata?: { readonly [x: string]: Schema.Json }
+              readonly content?: ReadonlyArray<
+                | { readonly type: "text"; readonly text: string }
+                | {
+                    readonly type: "file"
+                    readonly uri: string
+                    readonly mime: string
+                    readonly name?: string | undefined
+                  }
+              >
+              readonly error?: string
+              readonly time?: { readonly start: number; readonly end?: number }
+            }>
+          }
+        }
+      | {
+          readonly id: Event.ID
+          readonly created: number
+          readonly metadata?: { readonly [x: string]: unknown } | undefined
           readonly type: "session.retry.scheduled"
           readonly durable: { readonly aggregateID: string; readonly seq: Event.Seq; readonly version: Event.Version }
           readonly location?:
@@ -1457,6 +1637,34 @@ export type SessionLogOutput =
               readonly message: string
               readonly status?: number | undefined
               readonly response?: { readonly body: string } | undefined
+              readonly resolution?:
+                | {
+                    readonly kind:
+                      | "rate_limited"
+                      | "usage_limited"
+                      | "plan_not_included"
+                      | "quota_exceeded"
+                      | "policy_blocked"
+                      | "authentication"
+                      | "invalid_input"
+                      | "network"
+                      | "server"
+                    readonly retry: "automatic" | "never"
+                    readonly action:
+                      | "switch_model"
+                      | "wait"
+                      | "manage_billing"
+                      | "reauthenticate"
+                      | "fix_input"
+                      | "check_network"
+                      | "retry"
+                    readonly retryAfterMs?: number | undefined
+                    readonly providerCode?: string | undefined
+                  }
+                | undefined
+              readonly responseBody?: string | undefined
+              readonly responseHeaders?: { readonly [x: string]: string } | undefined
+              readonly url?: string | undefined
             }
           }
         }
@@ -1543,6 +1751,34 @@ export type SessionLogOutput =
               readonly message: string
               readonly status?: number | undefined
               readonly response?: { readonly body: string } | undefined
+              readonly resolution?:
+                | {
+                    readonly kind:
+                      | "rate_limited"
+                      | "usage_limited"
+                      | "plan_not_included"
+                      | "quota_exceeded"
+                      | "policy_blocked"
+                      | "authentication"
+                      | "invalid_input"
+                      | "network"
+                      | "server"
+                    readonly retry: "automatic" | "never"
+                    readonly action:
+                      | "switch_model"
+                      | "wait"
+                      | "manage_billing"
+                      | "reauthenticate"
+                      | "fix_input"
+                      | "check_network"
+                      | "retry"
+                    readonly retryAfterMs?: number | undefined
+                    readonly providerCode?: string | undefined
+                  }
+                | undefined
+              readonly responseBody?: string | undefined
+              readonly responseHeaders?: { readonly [x: string]: string } | undefined
+              readonly url?: string | undefined
             }
             readonly inputID?: SessionMessage.ID | undefined
             readonly cost?: (number & Brand.Brand<"Money.USD">) | undefined
@@ -1649,6 +1885,10 @@ export type SessionInterruptOutput = { readonly interrupted: boolean }
 export type SessionInterruptOperation<E = never> = (
   input: SessionInterruptInput,
 ) => Effect.Effect<SessionInterruptOutput, E>
+
+export type SessionStopInput = { readonly sessionID: Session.ID }
+export type SessionStopOutput = { readonly matched: number; readonly terminated: number; readonly failed: number }
+export type SessionStopOperation<E = never> = (input: SessionStopInput) => Effect.Effect<SessionStopOutput, E>
 
 export type SessionBackgroundInput = { readonly sessionID: Session.ID }
 export type SessionBackgroundOutput = void
@@ -1791,6 +2031,7 @@ export type SessionMessageGetOutput =
             readonly type: string
             readonly message: string
             readonly status?: number | undefined
+            readonly response?: { readonly body: string } | undefined
             readonly resolution?:
               | {
                   readonly kind:
@@ -1882,6 +2123,7 @@ export type SessionMessageGetOutput =
         readonly type: string
         readonly message: string
         readonly status?: number | undefined
+        readonly response?: { readonly body: string } | undefined
         readonly resolution?:
           | {
               readonly kind:
@@ -2032,6 +2274,7 @@ export interface SessionApi<E = never> {
   readonly generate: SessionGenerateOperation<E>
   readonly log: SessionLogOperation<E>
   readonly interrupt: SessionInterruptOperation<E>
+  readonly stop: SessionStopOperation<E>
   readonly background: SessionBackgroundOperation<E>
   readonly message: { readonly get: SessionMessageGetOperation<E> }
   readonly form: {
@@ -2198,6 +2441,7 @@ export type MessageListOutput = {
               readonly type: string
               readonly message: string
               readonly status?: number | undefined
+              readonly response?: { readonly body: string } | undefined
               readonly resolution?:
                 | {
                     readonly kind:
@@ -2289,6 +2533,7 @@ export type MessageListOutput = {
           readonly type: string
           readonly message: string
           readonly status?: number | undefined
+          readonly response?: { readonly body: string } | undefined
           readonly resolution?:
             | {
                 readonly kind:
@@ -3196,6 +3441,11 @@ export type WebsearchProvidersOperation<E = never> = (
 export type WebsearchQueryInput = {
   readonly location?: { readonly directory?: string | undefined } | undefined
   readonly query: string
+  readonly numResults?: number | undefined
+  readonly includeDomains?: ReadonlyArray<string> | undefined
+  readonly excludeDomains?: ReadonlyArray<string> | undefined
+  readonly highlightsQuery?: string | undefined
+  readonly maxCharacters?: number | undefined
   readonly providerID?: WebSearch.ID | undefined
 }
 export type WebsearchQueryOutput = { readonly location: Location.PublicRef; readonly data: WebSearch.Response }

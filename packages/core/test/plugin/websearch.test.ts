@@ -19,7 +19,16 @@ beforeEach(() => {
         content: [
           {
             type: "text",
-            text: "Title: Effect\nURL: https://effect.website\nPublished: 2026-07-25T00:00:00.000Z\nAuthor: N/A\nHighlights:\nEffect documentation",
+            text: JSON.stringify({
+              results: [
+                {
+                  url: "https://effect.website",
+                  title: "Effect",
+                  publishedDate: "2026-07-25T00:00:00.000Z",
+                  highlights: ["Effect documentation"],
+                },
+              ],
+            }),
             _meta: { searchTime: 123 },
           },
         ],
@@ -31,6 +40,128 @@ beforeEach(() => {
 const it = webSearchIntegrationTest
 
 describe("built-in web search providers", () => {
+  it.effect("accepts the largest advertised Exa result and excerpt budgets", () =>
+    Effect.gen(function* () {
+      const results = Array.from({ length: 20 }, (_, index) => ({
+        url: `https://example.com/${index}`,
+        text: "正文".repeat(4000),
+        highlights: ["证据".repeat(4000)],
+      }))
+      resetWebSearchFixture(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          result: { content: [{ type: "text", text: JSON.stringify({ results }) }] },
+        }),
+      )
+      const integrations = yield* Integration.Service
+      const websearch = yield* WebSearch.Service
+      yield* WebSearchExa.Plugin.effect(
+        host({ integration: integrationHost(integrations), websearch: webSearchHost(websearch) }),
+      )
+      const result = yield* websearch.query({
+        query: "evidence",
+        providerID: WebSearch.ID.make("exa"),
+        numResults: 20,
+        maxCharacters: 8000,
+      })
+      expect(result.results).toHaveLength(20)
+      expect(result.results.every((item) => item.content === "证据".repeat(4000))).toBe(true)
+    }),
+  )
+
+  it.effect("forwards Exa controls, prefers relevant highlights, and bounds the excerpt", () =>
+    Effect.gen(function* () {
+      resetWebSearchFixture(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          result: {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify({
+                  results: [
+                    {
+                      url: "https://example.com/docs",
+                      title: "Docs",
+                      text: "irrelevant header",
+                      highlights: ["evidence ".repeat(100)],
+                    },
+                  ],
+                }),
+              },
+            ],
+          },
+        }),
+      )
+      const integrations = yield* Integration.Service
+      const websearch = yield* WebSearch.Service
+      yield* WebSearchExa.Plugin.effect(
+        host({ integration: integrationHost(integrations), websearch: webSearchHost(websearch) }),
+      )
+      const result = yield* websearch.query({
+        query: "file names",
+        providerID: WebSearch.ID.make("exa"),
+        numResults: 3,
+        includeDomains: ["example.com/docs"],
+        excludeDomains: ["example.com/old"],
+        highlightsQuery: "file ID permissions",
+        maxCharacters: 200,
+      })
+      expect(result.results[0]?.content).toBe("evidence ".repeat(100).slice(0, 200))
+      expect(result.results[0]?.contentKind).toBe("highlights")
+      expect(requests[0]?.body).toMatchObject({
+        params: {
+          name: "web_search_advanced_exa",
+          arguments: {
+            numResults: 3,
+            includeDomains: ["example.com/docs"],
+            excludeDomains: ["example.com/old"],
+            highlightsQuery: "file ID permissions",
+            highlightsMaxCharacters: 200,
+            textMaxCharacters: 200,
+          },
+        },
+      })
+    }),
+  )
+
+  it.effect("rejects unsupported filters before sending a provider request", () =>
+    Effect.gen(function* () {
+      const integrations = yield* Integration.Service
+      const websearch = yield* WebSearch.Service
+      yield* WebSearchParallel.Plugin.effect(
+        host({ integration: integrationHost(integrations), websearch: webSearchHost(websearch) }),
+      )
+      const error = yield* websearch
+        .query({ query: "file names", providerID: WebSearch.ID.make("parallel"), includeDomains: ["example.com"] })
+        .pipe(Effect.flip)
+      expect(error).toBeInstanceOf(WebSearch.UnsupportedOptionsError)
+      expect(requests).toHaveLength(0)
+    }),
+  )
+
+  it.effect("does not convert Exa application errors into empty success", () =>
+    Effect.gen(function* () {
+      resetWebSearchFixture(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          result: { isError: true, content: [{ type: "text", text: "Search quota exceeded" }] },
+        }),
+      )
+      const integrations = yield* Integration.Service
+      const websearch = yield* WebSearch.Service
+      yield* WebSearchExa.Plugin.effect(
+        host({ integration: integrationHost(integrations), websearch: webSearchHost(websearch) }),
+      )
+      const error = yield* websearch
+        .query({ query: "file names", providerID: WebSearch.ID.make("exa") })
+        .pipe(Effect.flip)
+      expect(error).toBeInstanceOf(WebSearch.RequestError)
+    }),
+  )
   ;[
     WebSearchExa.Plugin,
     WebSearchParallel.Plugin,
@@ -116,6 +247,7 @@ describe("built-in web search providers", () => {
               url: "https://effect.website",
               title: "Effect",
               content: "Effect documentation",
+              contentKind: "highlights",
               time: { published: Date.parse("2026-07-25T00:00:00.000Z") },
             },
           ],
@@ -123,15 +255,22 @@ describe("built-in web search providers", () => {
       )
       expect(requests).toEqual([
         {
-          url: `${WebSearchExa.endpoint}?exaApiKey=exa+secret`,
-          headers: expect.any(Object),
+          url: `${WebSearchExa.endpoint}?tools=web_search_advanced_exa`,
+          headers: expect.objectContaining({ "x-api-key": "exa secret" }),
           body: {
             jsonrpc: "2.0",
             id: 1,
             method: "tools/call",
             params: {
-              name: "web_search_exa",
-              arguments: { query: "effect typescript", numResults: 8 },
+              name: "web_search_advanced_exa",
+              arguments: {
+                query: "effect typescript",
+                numResults: 8,
+                enableHighlights: true,
+                highlightsQuery: "effect typescript",
+                highlightsMaxCharacters: 1800,
+                textMaxCharacters: 1800,
+              },
             },
           },
         },

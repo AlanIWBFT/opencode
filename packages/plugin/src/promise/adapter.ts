@@ -552,6 +552,7 @@ export function fromPromise(plugin: Plugin) {
                       editor.add({
                         id: definition.id,
                         name: definition.name,
+                        options: definition.options,
                         execute: (input) => attempt((signal) => definition.execute(input, { signal })),
                       }),
                     default: editor.default,

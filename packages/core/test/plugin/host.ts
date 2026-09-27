@@ -9,7 +9,7 @@ import { Project } from "@opencode/core/project"
 import { Provider } from "@opencode/core/provider"
 import { AbsolutePath } from "@opencode/core/schema"
 import { WebSearch } from "@opencode/core/websearch"
-import { Effect, Stream } from "effect"
+import { Effect, Schema, Stream } from "effect"
 
 type Overrides = Partial<Omit<Plugin.Context, "options" | "session">> & {
   readonly session?: Partial<Plugin.Context["session"]>
@@ -231,13 +231,15 @@ export function providerHost(providers: Provider.Interface): Plugin.Context["pro
   return {
     list: () => providers.available().pipe(Effect.map(located)),
     get: (input) =>
-      providers.get(Provider.ID.make(input.providerID)).pipe(
-        Effect.flatMap((provider) =>
-          provider === undefined
-            ? Effect.fail(new Error(`Provider not found: ${input.providerID}`))
-            : Effect.succeed(located(provider)),
+      providers
+        .get(Provider.ID.make(input.providerID))
+        .pipe(
+          Effect.flatMap((provider) =>
+            provider === undefined
+              ? Effect.fail(new Error(`Provider not found: ${input.providerID}`))
+              : Effect.succeed(located(provider)),
+          ),
         ),
-      ),
     reload: providers.reload,
     transform: (callback) =>
       providers.transform((editor) =>
@@ -445,9 +447,10 @@ export function webSearchHost(websearch: WebSearch.Interface): Plugin.Context["w
   return {
     providers: () => websearch.providers().pipe(Effect.map((data) => ({ location, data }))),
     query: (input) =>
-      websearch
-        .query({ query: input.query, providerID: input.providerID && WebSearch.ID.make(input.providerID) })
-        .pipe(Effect.map((data) => ({ location, data }))),
+      Schema.decodeUnknownEffect(WebSearch.Input)(input).pipe(
+        Effect.flatMap((query) => websearch.query(query)),
+        Effect.map((data) => ({ location, data })),
+      ),
     reload: websearch.reload,
     transform: (callback) =>
       websearch.transform((editor) => {
@@ -456,6 +459,7 @@ export function webSearchHost(websearch: WebSearch.Interface): Plugin.Context["w
             editor.add({
               id: WebSearch.ID.make(definition.id),
               name: definition.name,
+              options: definition.options,
               execute: definition.execute,
             }),
           default: {
