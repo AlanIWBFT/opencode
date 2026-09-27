@@ -22,6 +22,12 @@ export const WebSearchHandler = HttpApiBuilder.group(Api, "server.websearch", (h
           return yield* response(
             websearch.query(request.payload).pipe(
               Effect.catchTags({
+                "WebSearch.UnsupportedOptions": (error) =>
+                  new InvalidRequestError({
+                    message: `${error.providerID} does not support search options: ${error.options.join(", ")}`,
+                    kind: "websearch_unsupported_options",
+                    field: error.options[0],
+                  }),
                 "WebSearch.ProviderRequired": () =>
                   new InvalidRequestError({
                     message: "Web search provider is required",

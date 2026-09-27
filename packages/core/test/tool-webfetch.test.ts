@@ -11,6 +11,11 @@ import { Tool } from "@opencode/core/tool"
 import { WebFetchTool } from "@opencode/core/tool/plugin/webfetch"
 import { makeLocationNode } from "@opencode/util/effect/app-node"
 import { Image } from "@opencode/core/image"
+import { ToolOutput } from "@opencode/core/tool-output"
+import { WebPage } from "@opencode/core/tool/web-page"
+import { mainHTML, markdownBody } from "@opencode/core/tool/web-content"
+import { FSUtil } from "@opencode/util/fs-util"
+import { Global } from "@opencode/util/global"
 import { testEffect } from "./lib/effect"
 import { imagePassthrough } from "./lib/image"
 import { permissionLayer } from "./lib/permission"
@@ -19,7 +24,7 @@ import { toolIdentity, executeTool, registerToolPlugin, toolDefinitions } from "
 const webFetchToolNode = makeLocationNode({
   name: "test/webfetch-tool-plugin",
   layer: Layer.effectDiscard(registerToolPlugin(WebFetchTool.Plugin)),
-  deps: [Tool.node, Permission.node, LayerNodePlatform.httpClient],
+  deps: [Tool.node, Permission.node, FSUtil.node, Global.node, ToolOutput.node, LayerNodePlatform.httpClient],
 })
 
 const sessionID = Session.ID.make("ses_webfetch_test")
@@ -41,7 +46,7 @@ const http = Layer.succeed(
 )
 const permission = permissionLayer({ assert: (input) => Effect.sync(() => assertions.push(input)) })
 const toolLayer = (replacements: LayerNode.Replacements = []) =>
-  AppNodeBuilder.build(LayerNode.group([Tool.node, webFetchToolNode]), [
+  AppNodeBuilder.build(LayerNode.group([Tool.node, webFetchToolNode, FSUtil.node, Global.node]), [
     Permission.node.replace(permission),
     Image.node.replace(imagePassthrough),
     ...replacements,
@@ -62,9 +67,134 @@ const call = (input: typeof WebFetchTool.Input.Type, id = "call-webfetch") => ({
 })
 
 describe("WebFetchTool helpers", () => {
+  test("selects semantic content without losing sibling articles, code, or tables", () => {
+    const html =
+      "<nav>global navigation</nav><main><h1>Title</h1><article><pre><code>x &lt; y</code></pre></article><article><table><tr><th>Value</th></tr><tr><td>42</td></tr></table></article></main><footer>global footer</footer>"
+    expect(WebFetchTool.convertHTMLToMarkdown(mainHTML(html))).toBe(
+      "# Title\n\n```\nx < y\n```\n\n| Value |\n| --- |\n| 42 |",
+    )
+    expect(mainHTML("<nav>menu</nav><article>A</article><article>B</article>")).toBe(
+      "<article>A</article>\n<article>B</article>",
+    )
+    expect(mainHTML('<main hidden>hidden</main><div role="main">visible</div>')).toBe('<div role="main">visible</div>')
+    expect(mainHTML("<main><p>unfinished")).toBe("<main><p>unfinished")
+    expect(mainHTML("<main></main><p>fallback</p>")).toBe("<main></main><p>fallback</p>")
+    expect(mainHTML("<p>ordinary page</p>")).toBe("<p>ordinary page</p>")
+  })
+
+  test("reduces YAML frontmatter while preserving provenance and ordinary Markdown", () => {
+    expect(
+      markdownBody(
+        "---\r\ntitle: Example\r\ncanonicalUrl: https://example.com\r\nlayout: Conceptual\r\n---\r\n\r\n# Body",
+      ),
+    ).toBe("title: Example\ncanonicalUrl: https://example.com\n\n# Body")
+    for (const source of [
+      "---\nordinary prose\n---\nbody",
+      "---\n# heading",
+      "---\ntitle: [invalid\n---\nbody",
+      "# Body\n\n---\ntitle: example\n---",
+    ])
+      expect(markdownBody(source)).toBe(source)
+  })
+
+  test("rejects snapshot path traversal and invalid operation arguments", () => {
+    const decode = Schema.decodeUnknownSync(WebFetchTool.Input)
+    expect(() => decode({ action: "read", ref: "../../secret" })).toThrow()
+    expect(() => decode({ action: "find", ref: "tool_0123456789abABCDEFGHIJKLMN", pattern: "" })).toThrow()
+    expect(() => decode({ action: "read", ref: "tool_0123456789abABCDEFGHIJKLMN", offset: -1 })).toThrow()
+  })
+
+  test("pages long unbroken and Unicode text without losing content", () => {
+    const snapshot = {
+      version: 1 as const,
+      url: "https://example.com",
+      contentType: "text/plain",
+      format: "text" as const,
+      fetchedAt: 0,
+      text: "x".repeat(8000) + "😀" + "z".repeat(8000),
+    }
+    const parts: string[] = []
+    let offset = 0
+    while (offset < snapshot.text.length) {
+      const page = WebPage.read("tool_0123456789abABCDEFGHIJKLMN", snapshot, offset, 8001)
+      parts.push(page.output)
+      expect(page.end).toBeGreaterThan(offset)
+      offset = page.end
+    }
+    expect(parts.join("")).toBe(snapshot.text)
+    expect(WebPage.read("tool_0123456789abABCDEFGHIJKLMN", snapshot, 8000, 1).output).toBe("😀")
+    expect(WebPage.find("tool_0123456789abABCDEFGHIJKLMN", snapshot, "x😀z").matches).toHaveLength(1)
+  })
+
+  test("find continuation keeps literal matches and original Unicode offsets", () => {
+    const snapshot = {
+      version: 1 as const,
+      url: "https://example.com",
+      contentType: "text/plain",
+      format: "text" as const,
+      fetchedAt: 0,
+      text: "İ😀 x.* ".repeat(24),
+    }
+    const first = WebPage.find("tool_0123456789abABCDEFGHIJKLMN", snapshot, "X.*", 0, false, 0)
+    const second = WebPage.find("tool_0123456789abABCDEFGHIJKLMN", snapshot, "X.*", first.nextOffset, false, 0)
+    const third = WebPage.find("tool_0123456789abABCDEFGHIJKLMN", snapshot, "X.*", second.nextOffset, false, 0)
+    const matches = [...first.matches, ...second.matches, ...third.matches]
+    expect(matches).toHaveLength(24)
+    expect(new Set(matches.map((match) => match.matchOffset)).size).toBe(24)
+    expect(matches.every((match) => snapshot.text.slice(match.matchOffset, match.matchOffset + 3) === "x.*")).toBe(true)
+    expect(third.nextOffset).toBeUndefined()
+    expect(WebPage.find("tool_0123456789abABCDEFGHIJKLMN", snapshot, "X.*", 0, true).matches).toEqual([])
+  })
+
+  test("merges neighboring contexts and lists every hit without repeating text", () => {
+    const snapshot = {
+      version: 1 as const,
+      url: "https://example.com",
+      contentType: "text/plain",
+      format: "text" as const,
+      fetchedAt: 0,
+      text: "😀 Defender Defender" + " x".repeat(30) + " Defender",
+    }
+    const found = WebPage.find("tool_0123456789abABCDEFGHIJKLMN", snapshot, "Defender", 0, false, 12)
+    expect(found.matches).toHaveLength(2)
+    expect(found.matches[0]!.matchOffsets).toEqual([3, 12])
+    expect(found.matches[0]!.matchOffset).toBe(3)
+    expect(found.matches[0]!.output).toBe(snapshot.text.slice(0, 32))
+    expect(WebPage.renderFound(found)).toContain("Matches at 3, 12; context 0-32:")
+    expect(found.nextOffset).toBeUndefined()
+  })
+
+  test("merged windows honor character and hit budgets with lossless continuation", () => {
+    for (const text of ["needle".repeat(240), ("needle" + "x".repeat(994)).repeat(25)]) {
+      const snapshot = {
+        version: 1 as const,
+        url: "https://example.com",
+        contentType: "text/plain",
+        format: "text" as const,
+        fetchedAt: 0,
+        text,
+      }
+      const hits: number[] = []
+      let offset: number | undefined = 0
+      while (offset !== undefined) {
+        const found = WebPage.find("tool_0123456789abABCDEFGHIJKLMN", snapshot, "needle", offset, false, 1000)
+        const positions = found.matches.flatMap((match) => match.matchOffsets)
+        expect(positions.length).toBeGreaterThan(0)
+        expect(positions.length).toBeLessThanOrEqual(100)
+        expect(found.matches.reduce((sum, match) => sum + match.output.length, 0)).toBeLessThanOrEqual(10000)
+        expect(found.matches.length).toBeLessThanOrEqual(10)
+        for (const window of found.matches) expect(window.output).toBe(text.slice(window.offset, window.end))
+        if (found.nextOffset !== undefined) expect(found.nextOffset).toBeGreaterThan(positions.at(-1)!)
+        hits.push(...positions)
+        offset = found.nextOffset
+      }
+      expect(hits).toEqual([...text.matchAll(/needle/g)].map((match) => match.index))
+    }
+  })
+
   test("defaults format and rejects invalid timeout controls", () => {
     const decode = Schema.decodeUnknownSync(WebFetchTool.Input)
-    expect(decode({ url: "https://example.com" })).toEqual({ url: "https://example.com", format: "markdown" })
+    expect(decode({ url: "https://example.com" })).toEqual({ url: "https://example.com" })
     expect(() => decode({ url: "https://example.com", timeout: 0 })).toThrow()
     expect(() => decode({ url: "https://example.com", timeout: WebFetchTool.MAX_TIMEOUT_SECONDS + 1 })).toThrow()
   })
@@ -409,18 +539,92 @@ describe("WebFetchTool helpers", () => {
 })
 
 describe("WebFetchTool registration", () => {
+  it.effect("persists extracted content before paging, with raw response access", () =>
+    Effect.gen(function* () {
+      reset()
+      const registry = yield* Tool.Service
+      for (const [mime, body, expected] of [
+        [
+          "text/html",
+          "<nav>menu</nav><main><h1>Title</h1><p>needle 😀 evidence</p></main><footer>end</footer>",
+          "# Title\n\nneedle 😀 evidence",
+        ],
+        [
+          "text/markdown",
+          "---\ntitle: Title\nlayout: Conceptual\n---\n\n# Body\nneedle 😀 evidence",
+          "title: Title\n\n# Body\nneedle 😀 evidence",
+        ],
+      ]) {
+        respond = () => Effect.succeed(new Response(body, { headers: { "content-type": mime! } }))
+        const opened = yield* executeTool(registry, call({ url: "https://example.com", limit: 5 }))
+        const page = Schema.decodeUnknownSync(WebPage.Page)(opened.output)
+        const found = yield* executeTool(
+          registry,
+          call({ action: "find", ref: page.ref, pattern: "needle", context: 0 }),
+        )
+        const matches = Schema.decodeUnknownSync(WebPage.Found)(found.output)
+        expect(matches.matches[0]?.matchOffset).toBe(expected!.indexOf("needle"))
+        const read = yield* executeTool(registry, call({ action: "read", ref: page.ref }))
+        expect(Schema.decodeUnknownSync(WebPage.Page)(read.output).output).toBe(expected!)
+        const raw = yield* executeTool(registry, call({ url: "https://example.com", format: "html" }))
+        expect(Schema.decodeUnknownSync(WebPage.Page)(raw.output).output).toBe(body!)
+      }
+      expect(requests).toHaveLength(4)
+    }),
+  )
+
+  it.effect("opens once, finds literal evidence, and reads the same snapshot after the source changes", () =>
+    Effect.gen(function* () {
+      reset()
+      const body = "prefix ".repeat(1200) + "needle.* 😀 original evidence" + " suffix".repeat(1200)
+      respond = () => Effect.succeed(new Response(body, { headers: { "content-type": "text/plain" } }))
+      const registry = yield* Tool.Service
+      const opened = yield* executeTool(
+        registry,
+        call({ action: "open", url: "https://example.com/evidence", format: "text", limit: 200 }),
+      )
+      expect(opened.status).toBe("completed")
+      const page = Schema.decodeUnknownSync(WebPage.Page)(opened.output)
+      expect(page.output).toBe(body.slice(0, 200))
+      expect(page.nextOffset).toBe(200)
+      respond = () => Effect.succeed(new Response("changed"))
+      const found = yield* executeTool(
+        registry,
+        call({ action: "find", ref: page.ref, pattern: "NEEDLE.*", context: 40 }),
+      )
+      const matches = Schema.decodeUnknownSync(WebPage.Found)(found.output)
+      expect(matches.matches).toHaveLength(1)
+      expect(matches.matches[0]?.output).toContain("original evidence")
+      const read = yield* executeTool(
+        registry,
+        call({ action: "read", ref: page.ref, offset: matches.matches[0]!.offset, limit: 100 }),
+      )
+      expect(Schema.decodeUnknownSync(WebPage.Page)(read.output).output).toContain("needle.* 😀 original evidence")
+      expect(requests).toHaveLength(1)
+      expect(assertions).toHaveLength(3)
+      expect(assertions.every((item) => item.resources[0] === "https://example.com/evidence")).toBe(true)
+      // Loading through a new producer instance still resolves the persisted snapshot.
+      const pages = yield* WebPage.make
+      expect((yield* pages.load(page.ref)).text).toBe(body)
+      yield* TestClock.adjust("7 days")
+      const expired = yield* executeTool(registry, call({ action: "read", ref: page.ref }))
+      expect(expired).toMatchObject({ status: "error", error: { message: expect.stringContaining("expired") } })
+      expect(requests).toHaveLength(1)
+    }),
+  )
+
   it.effect("registers and fetches an ordinary hostname HTTP URL without rewriting it", () =>
     Effect.gen(function* () {
       reset()
       const registry = yield* Tool.Service
       const url = "http://example.com/public"
 
-      expect((yield* toolDefinitions(registry)).map((tool) => tool.name)).toEqual(["webfetch", "execute"])
+      expect((yield* toolDefinitions(registry)).map((tool) => tool.name)).toContain("webfetch")
       expect(yield* executeTool(registry, call({ url, format: "text", timeout: 4 }))).toEqual({
         status: "completed",
-        output: { url, contentType: "text/plain", format: "text", output: "hello" },
-        content: [{ type: "text", text: "hello" }],
-        metadata: { contentType: "text/plain" },
+        output: expect.objectContaining({ url, contentType: "text/plain", format: "text", output: "hello" }),
+        content: [{ type: "text", text: expect.stringContaining("\n\nhello") }],
+        metadata: expect.objectContaining({ contentType: "text/plain" }),
       })
       expect(assertions).toMatchObject([
         { sessionID, action: "webfetch", resources: [url], save: ["*"], metadata: { url, format: "text", timeout: 4 } },
@@ -447,7 +651,7 @@ describe("WebFetchTool registration", () => {
 
       expect(yield* executeTool(registry, call({ url, format: "text" }))).toMatchObject({
         status: "completed",
-        content: [{ type: "text", text: "hello" }],
+        content: [{ type: "text", text: expect.stringContaining("\n\nhello") }],
       })
       expect(assertions).toMatchObject([
         { sessionID, action: "webfetch", resources: [url], save: ["*"], metadata: { url, format: "text" } },
@@ -483,7 +687,7 @@ describe("WebFetchTool registration", () => {
 
           expect(yield* executeTool(registry, call({ url, format: "text" }))).toMatchObject({
             status: "completed",
-            content: [{ type: "text", text: "redirected" }],
+            content: [{ type: "text", text: expect.stringContaining("\n\nredirected") }],
           })
           expect(assertions).toMatchObject([
             { sessionID, action: "webfetch", resources: [url], save: ["*"], metadata: { url, format: "text" } },
@@ -529,11 +733,11 @@ describe("WebFetchTool registration", () => {
 
       expect(yield* executeTool(registry, call({ url: "https://1.1.1.1", format: "markdown" }))).toMatchObject({
         status: "completed",
-        content: [{ type: "text", text: "# Hello\n\nworld" }],
+        content: [{ type: "text", text: expect.stringContaining("\n\n# Hello\n\nworld") }],
       })
       expect(yield* executeTool(registry, call({ url: "https://1.1.1.1", format: "text" }))).toMatchObject({
         status: "completed",
-        content: [{ type: "text", text: "Helloworld" }],
+        content: [{ type: "text", text: expect.stringContaining("\n\nHelloworld") }],
       })
     }),
   )
@@ -552,7 +756,7 @@ describe("WebFetchTool registration", () => {
 
       expect(yield* executeTool(registry, call({ url, format: "markdown" }))).toMatchObject({
         status: "completed",
-        content: [{ type: "text", text: "content" }],
+        content: [{ type: "text", text: expect.stringContaining("\n\ncontent") }],
       })
     }),
   )
@@ -621,7 +825,7 @@ describe("WebFetchTool registration", () => {
 
       expect(yield* executeTool(registry, call({ url: "https://1.1.1.1", format: "text" }))).toMatchObject({
         status: "completed",
-        content: [{ type: "text", text: "ok" }],
+        content: [{ type: "text", text: expect.stringContaining("\n\nok") }],
       })
       expect(requests).toHaveLength(2)
       expect(requests[0]?.headers["user-agent"]).toBe(webFetchUserAgent)

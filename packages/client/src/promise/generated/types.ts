@@ -64,6 +64,60 @@ export type SessionStatsToolUsage = {
 
 export type SessionStatsActivity = { date: string; steps: number }
 
+export type PromptBase64 = string
+
+export type PromptFileSource = { type: "inline" } | { type: "uri"; uri: string }
+
+export type PromptMention = { start: number; end: number; text: string }
+
+export type SessionMessageProviderState = { [x: string]: JsonValue }
+
+export type SessionMessageToolStateStreaming = { status: "streaming"; input: string }
+
+export type SessionMessageToolStateRunning = {
+  status: "running"
+  input: { [x: string]: JsonValue }
+  metadata: { [x: string]: JsonValue }
+}
+
+export type ToolTextContent = { type: "text"; text: string }
+
+export type ToolFileContent = { type: "file"; uri: string; mime: string; name?: string | null }
+
+export type SessionErrorResolution = {
+  kind:
+    | "rate_limited"
+    | "usage_limited"
+    | "plan_not_included"
+    | "quota_exceeded"
+    | "policy_blocked"
+    | "authentication"
+    | "invalid_input"
+    | "network"
+    | "server"
+  retry: "automatic" | "never"
+  action: "switch_model" | "wait" | "manage_billing" | "reauthenticate" | "fix_input" | "check_network" | "retry"
+  retryAfterMs?: number
+  providerCode?: string
+}
+
+export type SessionProviderContextProvenance = {
+  providerID: string
+  provider: string
+  modelID: string
+  route: string
+  protocol: string
+  endpoint: string
+}
+
+export type SessionActive = { type: "running" }
+
+export type SessionInboxDelivery = "steer" | "queue"
+
+export type SessionInboxSyntheticPayload = { text: string; description?: string; metadata?: { [x: string]: JsonValue } }
+
+export type SessionInboxCompactionPayload = {}
+
 export type SessionMessageAgentSelected = {
   id: string
   metadata?: { [x: string]: JsonValue }
@@ -72,12 +126,6 @@ export type SessionMessageAgentSelected = {
   agent: string
   previous?: string
 }
-
-export type PromptBase64 = string
-
-export type PromptFileSource = { type: "inline" } | { type: "uri"; uri: string }
-
-export type PromptMention = { start: number; end: number; text: string }
 
 export type SessionMessageSynthetic = {
   id: string
@@ -119,22 +167,6 @@ export type SessionMessageShell = {
   output?: { output: string; cursor: number; size: number; truncated: boolean }
 }
 
-export type SessionMessageProviderState = { [x: string]: JsonValue }
-
-export type SessionMessageToolStateStreaming = { status: "streaming"; input: string }
-
-export type SessionMessageToolStateRunning = {
-  status: "running"
-  input: { [x: string]: JsonValue }
-  metadata: { [x: string]: JsonValue }
-}
-
-export type ToolTextContent = { type: "text"; text: string }
-
-export type ToolFileContent = { type: "file"; uri: string; mime: string; name?: string | null }
-
-export type SessionStructuredError = { type: string; message: string; status?: number; response?: { body: string } }
-
 export type SessionMessageCompactionRunning = {
   type: "compaction"
   id: string
@@ -146,15 +178,6 @@ export type SessionMessageCompactionRunning = {
   recent: string
 }
 
-export type SessionProviderContextProvenance = {
-  providerID: string
-  provider: string
-  modelID: string
-  route: string
-  protocol: string
-  endpoint: string
-}
-
 export type SessionMessageIdle = {
   id: string
   metadata?: { [x: string]: JsonValue }
@@ -162,14 +185,6 @@ export type SessionMessageIdle = {
   type: "idle"
   outcome: "succeeded" | "failed" | "interrupted"
 }
-
-export type SessionActive = { type: "running" }
-
-export type SessionInboxDelivery = "steer" | "queue"
-
-export type SessionInboxSyntheticPayload = { text: string; description?: string; metadata?: { [x: string]: JsonValue } }
-
-export type SessionInboxCompactionPayload = {}
 
 export type InstructionEntryKey = string
 
@@ -197,6 +212,27 @@ export type SessionMessageProviderState1 = { [x: string]: any }
 
 export type ToolFileContent1 = { type: "file"; uri: string; mime: string; name?: string | undefined }
 
+export type SessionExecMetadata = {
+  command: string
+  output: string
+  interactions: Array<{ type: "stdin" | "terminate"; time: number }>
+  execID?: number
+  laneID?: number
+  shellGeneration?: number
+  shellReused?: boolean
+  cwd?: string
+  sessionExposed?: boolean
+  startedAt?: number
+  durationMs?: number
+  processRunning: boolean
+  exitCode?: number
+  outputError?: string
+  truncated: boolean
+  terminationRequested?: boolean
+  execDisplay: "root" | "poll" | "stdin" | "terminate"
+  execError?: string
+}
+
 export type SessionMessageToolStateRunning1 = {
   status: "running"
   input: { [x: string]: any }
@@ -206,6 +242,8 @@ export type SessionMessageToolStateRunning1 = {
 export type EventLogSynced = { type: "log.synced"; aggregateID: string; seq?: number }
 
 export type SessionInterruptResponse = { interrupted: boolean }
+
+export type SessionStopResponse = { matched: number; terminated: number; failed: number }
 
 export type FormMetadata = { [x: string]: JsonValue }
 
@@ -429,9 +467,20 @@ export type VcsFileStatus = {
 
 export type VcsBranchList = Array<string>
 
-export type WebSearchProvider = { id: string; name: string }
+export type WebSearchOptionName =
+  | "numResults"
+  | "includeDomains"
+  | "excludeDomains"
+  | "highlightsQuery"
+  | "maxCharacters"
 
-export type WebSearchResult = { url: string; title?: string; content?: string; time: { published?: number } }
+export type WebSearchResult = {
+  url: string
+  title?: string
+  content?: string
+  contentKind?: "highlights" | "text-preview"
+  time: { published?: number }
+}
 
 export type McpProtocol = "legacy" | "auto" | "2026-07-28"
 
@@ -533,18 +582,15 @@ export type SessionMessageAssistantReasoning = {
 
 export type ToolContent = ToolTextContent | ToolFileContent
 
-export type SessionMessageAssistantRetry = { attempt: number; at: number; error: SessionStructuredError }
-
-export type SessionMessageCompactionFailed = {
-  type: "compaction"
-  id: string
-  metadata?: { [x: string]: JsonValue }
-  time: { created: number }
-  status: "failed"
-  reason: "auto" | "manual"
-  error: SessionStructuredError
-  cost?: MoneyUSD
-  tokens?: TokenUsageInfo
+export type SessionStructuredError = {
+  type: string
+  message: string
+  status?: number
+  response?: { body: string }
+  resolution?: SessionErrorResolution
+  responseBody?: string
+  responseHeaders?: { [x: string]: string }
+  url?: string
 }
 
 export type SessionProviderContext = { version: 1; provenance: SessionProviderContextProvenance; messages: JsonValue }
@@ -599,6 +645,16 @@ export type SessionRenamed = {
   durable: { aggregateID: string; seq: number; version: 1 }
   location?: LocationRef
   data: { sessionID: string; title: string }
+}
+
+export type SessionArchiveUpdated = {
+  id: string
+  created: number
+  metadata?: { [x: string]: any }
+  type: "session.archive.updated"
+  durable: { aggregateID: string; seq: number; version: 1 }
+  location?: LocationRef
+  data: { sessionID: string; archivedAt: number | null }
 }
 
 export type SessionViewed = {
@@ -669,16 +725,6 @@ export type SessionExecutionSucceeded = {
   durable: { aggregateID: string; seq: number; version: 1 }
   location?: LocationRef
   data: { sessionID: string }
-}
-
-export type SessionExecutionFailed = {
-  id: string
-  created: number
-  metadata?: { [x: string]: any }
-  type: "session.execution.failed"
-  durable: { aggregateID: string; seq: number; version: 1 }
-  location?: LocationRef
-  data: { sessionID: string; error: SessionStructuredError }
 }
 
 export type SessionExecutionInterrupted = {
@@ -778,16 +824,6 @@ export type SessionToolInputEnded = {
   data: { sessionID: string; assistantMessageID: string; id: string; text: string }
 }
 
-export type SessionRetryScheduled = {
-  id: string
-  created: number
-  metadata?: { [x: string]: any }
-  type: "session.retry.scheduled"
-  durable: { aggregateID: string; seq: number; version: 1 }
-  location?: LocationRef
-  data: { sessionID: string; assistantMessageID: string; attempt: number; at: number; error: SessionStructuredError }
-}
-
 export type SessionCompactionStarted = {
   id: string
   created: number
@@ -796,23 +832,6 @@ export type SessionCompactionStarted = {
   durable: { aggregateID: string; seq: number; version: 1 }
   location?: LocationRef
   data: { sessionID: string; reason: "auto" | "manual"; recent: string; inputID?: string }
-}
-
-export type SessionCompactionFailed = {
-  id: string
-  created: number
-  metadata?: { [x: string]: any }
-  type: "session.compaction.failed"
-  durable: { aggregateID: string; seq: number; version: 1 }
-  location?: LocationRef
-  data: {
-    sessionID: string
-    reason: "auto" | "manual"
-    error: SessionStructuredError
-    inputID?: string
-    cost?: MoneyUSD
-    tokens?: TokenUsageInfo
-  }
 }
 
 export type SessionRevertCleared = {
@@ -1297,27 +1316,6 @@ export type SessionStepEnded = {
   }
 }
 
-export type SessionStepFailed = {
-  id: string
-  created: number
-  metadata?: { [x: string]: any }
-  type: "session.step.failed"
-  durable: { aggregateID: string; seq: number; version: 1 }
-  location?: LocationRef
-  data: {
-    sessionID: string
-    assistantMessageID: string
-    error: SessionStructuredError
-    finish?: "content-filter"
-    rawFinish?: string
-    providerState?: SessionMessageProviderState1
-    cost?: MoneyUSD
-    tokens?: TokenUsageInfo
-    snapshot?: string
-    files?: Array<string>
-  }
-}
-
 export type SessionTextEnded = {
   id: string
   created: number
@@ -1387,6 +1385,39 @@ export type SessionMessageAssistantReasoning1 = {
 }
 
 export type ToolContent1 = ToolTextContent | ToolFileContent1
+
+export type SessionExecCaptured = {
+  id: string
+  created: number
+  metadata?: { [x: string]: any }
+  type: "session.exec.captured"
+  durable: { aggregateID: string; seq: number; version: 1 }
+  location?: LocationRef
+  data: {
+    sessionID: string
+    assistantMessageID: string
+    id: string
+    childID?: string
+    revision: number
+    metadata: SessionExecMetadata
+  }
+}
+
+export type SessionExecUpdated = {
+  id: string
+  created: number
+  metadata?: { [x: string]: any }
+  type: "session.exec.updated"
+  location?: LocationRef
+  data: {
+    sessionID: string
+    assistantMessageID: string
+    id: string
+    childID?: string
+    revision: number
+    metadata: SessionExecMetadata
+  }
+}
 
 export type FormNumberField = {
   key: string
@@ -1682,6 +1713,8 @@ export type WorktreeList = Array<WorktreeDirectory>
 
 export type VcsInfo = { provider?: string; branch: VcsBranch }
 
+export type WebSearchProvider = { id: string; name: string; options?: Array<WebSearchOptionName> }
+
 export type SessionInboxMove = {
   id: string
   sessionID: string
@@ -1743,6 +1776,14 @@ export type SessionStatsInfo = {
   models: Array<SessionStatsModelUsage>
 }
 
+export type SessionInboxUserPayload = {
+  text: string
+  files?: Array<PromptFileAttachment>
+  agents?: Array<PromptAgentAttachment>
+  skills?: Array<PromptSkillAttachment>
+  metadata?: { [x: string]: JsonValue }
+}
+
 export type SessionMessageUser = {
   id: string
   metadata?: { [x: string]: JsonValue }
@@ -1752,14 +1793,6 @@ export type SessionMessageUser = {
   agents?: Array<PromptAgentAttachment>
   skills?: Array<PromptSkillAttachment>
   type: "user"
-}
-
-export type SessionInboxUserPayload = {
-  text: string
-  files?: Array<PromptFileAttachment>
-  agents?: Array<PromptAgentAttachment>
-  skills?: Array<PromptSkillAttachment>
-  metadata?: { [x: string]: JsonValue }
 }
 
 export type SessionInboxUserPayload1 = {
@@ -1783,6 +1816,78 @@ export type SessionMessageToolStateError = {
   error: SessionStructuredError
   content?: [ToolContent, ...Array<ToolContent>]
   metadata?: { [x: string]: JsonValue }
+}
+
+export type SessionMessageAssistantRetry = { attempt: number; at: number; error: SessionStructuredError }
+
+export type SessionMessageCompactionFailed = {
+  type: "compaction"
+  id: string
+  metadata?: { [x: string]: JsonValue }
+  time: { created: number }
+  status: "failed"
+  reason: "auto" | "manual"
+  error: SessionStructuredError
+  cost?: MoneyUSD
+  tokens?: TokenUsageInfo
+}
+
+export type SessionExecutionFailed = {
+  id: string
+  created: number
+  metadata?: { [x: string]: any }
+  type: "session.execution.failed"
+  durable: { aggregateID: string; seq: number; version: 1 }
+  location?: LocationRef
+  data: { sessionID: string; error: SessionStructuredError }
+}
+
+export type SessionStepFailed = {
+  id: string
+  created: number
+  metadata?: { [x: string]: any }
+  type: "session.step.failed"
+  durable: { aggregateID: string; seq: number; version: 1 }
+  location?: LocationRef
+  data: {
+    sessionID: string
+    assistantMessageID: string
+    error: SessionStructuredError
+    finish?: "content-filter"
+    rawFinish?: string
+    providerState?: SessionMessageProviderState1
+    cost?: MoneyUSD
+    tokens?: TokenUsageInfo
+    snapshot?: string
+    files?: Array<string>
+  }
+}
+
+export type SessionRetryScheduled = {
+  id: string
+  created: number
+  metadata?: { [x: string]: any }
+  type: "session.retry.scheduled"
+  durable: { aggregateID: string; seq: number; version: 1 }
+  location?: LocationRef
+  data: { sessionID: string; assistantMessageID: string; attempt: number; at: number; error: SessionStructuredError }
+}
+
+export type SessionCompactionFailed = {
+  id: string
+  created: number
+  metadata?: { [x: string]: any }
+  type: "session.compaction.failed"
+  durable: { aggregateID: string; seq: number; version: 1 }
+  location?: LocationRef
+  data: {
+    sessionID: string
+    reason: "auto" | "manual"
+    error: SessionStructuredError
+    inputID?: string
+    cost?: MoneyUSD
+    tokens?: TokenUsageInfo
+  }
 }
 
 export type SessionMessageCompactionCompleted = {
@@ -1872,6 +1977,19 @@ export type SessionToolFailed = {
     executed: boolean
     resultState?: SessionMessageProviderState1
   }
+}
+
+export type ToolChildCall = {
+  id?: string
+  tool: string
+  name?: string
+  title?: string
+  status: "running" | "completed" | "error"
+  input?: { [x: string]: JsonValue }
+  metadata?: { [x: string]: JsonValue }
+  content?: Array<ToolContent1>
+  error?: string
+  time?: { start: number; end?: number }
 }
 
 export type SessionMessageToolStateCompleted1 = {
@@ -2227,6 +2345,16 @@ export type SessionMessageCompaction =
   | SessionMessageCompactionCompleted
   | SessionMessageCompactionFailed
 
+export type SessionScriptCaptured = {
+  id: string
+  created: number
+  metadata?: { [x: string]: any }
+  type: "session.script.captured"
+  durable: { aggregateID: string; seq: number; version: 1 }
+  location?: LocationRef
+  data: { sessionID: string; assistantMessageID: string; id: string; revision: number; toolCalls: Array<ToolChildCall> }
+}
+
 export type SessionMessageAssistantTool1 = {
   type: "tool"
   id: string
@@ -2261,6 +2389,153 @@ export type SessionInboxEnqueued = {
   location?: LocationRef
   data: { sessionID: string; inboxID: string; item: SessionInboxItem }
 }
+
+export type SessionMessageStoredInfo =
+  | {
+      id: string
+      metadata?: { [x: string]: JsonValue }
+      time: { created: number }
+      type: "agent-switched"
+      agent: string
+      previous?: string
+      seq: number
+    }
+  | {
+      id: string
+      metadata?: { [x: string]: JsonValue }
+      time: { created: number }
+      type: "model-switched"
+      model: ModelRef
+      previous?: ModelRef
+      seq: number
+    }
+  | {
+      id: string
+      metadata?: { [x: string]: JsonValue }
+      time: { created: number }
+      type: "location-switched"
+      projectID?: string
+      subpath?: string
+      location: LocationPublicRef
+      previous?: { location: LocationPublicRef; projectID?: string; subpath?: string } | null
+      seq: number
+    }
+  | {
+      id: string
+      metadata?: { [x: string]: JsonValue }
+      time: { created: number }
+      text: string
+      files?: Array<PromptFileAttachment>
+      agents?: Array<PromptAgentAttachment>
+      skills?: Array<PromptSkillAttachment>
+      type: "user"
+      seq: number
+    }
+  | {
+      id: string
+      metadata?: { [x: string]: JsonValue }
+      time: { created: number }
+      text: string
+      description?: string
+      type: "synthetic"
+      seq: number
+    }
+  | {
+      id: string
+      metadata?: { [x: string]: JsonValue }
+      time: { created: number }
+      type: "system"
+      text: string
+      description?: string
+      seq: number
+    }
+  | {
+      id: string
+      metadata?: { [x: string]: JsonValue }
+      time: { created: number }
+      type: "skill"
+      skill: string
+      name: string
+      text: string
+      seq: number
+    }
+  | {
+      id: string
+      metadata?: { [x: string]: JsonValue }
+      time: { created: number; completed?: number }
+      type: "shell"
+      shellID: string
+      command: string
+      status: "running" | "exited" | "timeout" | "killed"
+      exit?: number | "Infinity" | "-Infinity" | "NaN"
+      output?: { output: string; cursor: number; size: number; truncated: boolean }
+      seq: number
+    }
+  | {
+      id: string
+      metadata?: { [x: string]: JsonValue }
+      time: { created: number; streamed?: number; completed?: number }
+      type: "assistant"
+      agent: string
+      model: ModelRef
+      content: Array<SessionMessageAssistantText | SessionMessageAssistantReasoning | SessionMessageAssistantTool>
+      snapshot?: { start?: string; end?: string; files?: Array<string> }
+      finish?: "stop" | "length" | "tool-calls" | "content-filter" | "error" | "unknown"
+      rawFinish?: string
+      providerState?: SessionMessageProviderState
+      cost?: MoneyUSD
+      tokens?: TokenUsageInfo
+      error?: SessionStructuredError
+      retry?: SessionMessageAssistantRetry
+      seq: number
+    }
+  | {
+      type: "compaction"
+      id: string
+      metadata?: { [x: string]: JsonValue }
+      time: { created: number }
+      status: "running"
+      reason: "auto" | "manual"
+      summary: string
+      recent: string
+      seq: number
+    }
+  | {
+      type: "compaction"
+      id: string
+      metadata?: { [x: string]: JsonValue }
+      time: { created: number }
+      status: "completed"
+      reason: "auto" | "manual"
+      model?: ModelRef
+      providerState?: SessionMessageProviderState
+      summary: string
+      recent: string
+      providerContext?: SessionProviderContext
+      cost?: MoneyUSD
+      tokens?: TokenUsageInfo
+      seq: number
+    }
+  | {
+      type: "compaction"
+      id: string
+      metadata?: { [x: string]: JsonValue }
+      time: { created: number }
+      status: "failed"
+      reason: "auto" | "manual"
+      error: SessionStructuredError
+      cost?: MoneyUSD
+      tokens?: TokenUsageInfo
+      seq: number
+    }
+  | {
+      id: string
+      metadata?: { [x: string]: JsonValue }
+      time: { created: number }
+      type: "idle"
+      outcome: "succeeded" | "failed" | "interrupted"
+      seq: number
+    }
 
 export type SessionMessageAssistant = {
   id: string
@@ -2310,6 +2585,13 @@ export type CredentialEntry = {
 
 export type FormInfo1 = { id: string; sessionID: string; title: string; metadata?: FormMetadata1; fields: FormFields2 }
 
+export type SessionTransferExported = { info: SessionInfo; messages: Array<SessionMessageStoredInfo> }
+
+export type SessionMessagesResponse = {
+  data: Array<SessionMessageStoredInfo>
+  cursor: { previous?: string | null; next?: string | null }
+}
+
 export type SessionMessageInfo =
   | SessionMessageAgentSelected
   | SessionMessageModelSelected
@@ -2348,13 +2630,6 @@ export type FormCreated = {
   data: { form: FormInfo1 }
 }
 
-export type SessionTransferData = { info: SessionInfo; messages: Array<SessionMessageInfo> }
-
-export type SessionMessagesResponse = {
-  data: Array<SessionMessageInfo>
-  cursor: { previous?: string | null; next?: string | null }
-}
-
 export type SessionEventDurable =
   | SessionCreated
   | SessionAgentSelected
@@ -2362,6 +2637,7 @@ export type SessionEventDurable =
   | SessionMoved
   | SessionRenamed
   | SessionMetadataUpdated
+  | SessionArchiveUpdated
   | SessionPermissions
   | SessionViewed
   | SessionDeleted
@@ -2392,6 +2668,8 @@ export type SessionEventDurable =
   | SessionToolCalled
   | SessionToolSuccess
   | SessionToolFailed
+  | SessionExecCaptured
+  | SessionScriptCaptured
   | SessionRetryScheduled
   | SessionCompactionStarted
   | SessionCompactionEnded
@@ -2425,6 +2703,7 @@ export type V2Event =
   | SessionMoved
   | SessionRenamed
   | SessionMetadataUpdated
+  | SessionArchiveUpdated
   | SessionPermissions
   | SessionViewed
   | SessionUsageUpdated
@@ -2460,6 +2739,9 @@ export type V2Event =
   | SessionToolProgress
   | SessionToolSuccess
   | SessionToolFailed
+  | SessionExecUpdated
+  | SessionExecCaptured
+  | SessionScriptCaptured
   | SessionRetryScheduled
   | SessionCompactionStarted
   | SessionCompactionDelta
@@ -3217,6 +3499,32 @@ export type SessionImportInput = {
                         readonly message: string
                         readonly status?: number
                         readonly response?: { readonly body: string }
+                        readonly resolution?: {
+                          readonly kind:
+                            | "rate_limited"
+                            | "usage_limited"
+                            | "plan_not_included"
+                            | "quota_exceeded"
+                            | "policy_blocked"
+                            | "authentication"
+                            | "invalid_input"
+                            | "network"
+                            | "server"
+                          readonly retry: "automatic" | "never"
+                          readonly action:
+                            | "switch_model"
+                            | "wait"
+                            | "manage_billing"
+                            | "reauthenticate"
+                            | "fix_input"
+                            | "check_network"
+                            | "retry"
+                          readonly retryAfterMs?: number
+                          readonly providerCode?: string
+                        }
+                        readonly responseBody?: string
+                        readonly responseHeaders?: { readonly [x: string]: string }
+                        readonly url?: string
                       }
                       readonly content?: readonly [
                         (
@@ -3259,6 +3567,32 @@ export type SessionImportInput = {
             readonly message: string
             readonly status?: number
             readonly response?: { readonly body: string }
+            readonly resolution?: {
+              readonly kind:
+                | "rate_limited"
+                | "usage_limited"
+                | "plan_not_included"
+                | "quota_exceeded"
+                | "policy_blocked"
+                | "authentication"
+                | "invalid_input"
+                | "network"
+                | "server"
+              readonly retry: "automatic" | "never"
+              readonly action:
+                | "switch_model"
+                | "wait"
+                | "manage_billing"
+                | "reauthenticate"
+                | "fix_input"
+                | "check_network"
+                | "retry"
+              readonly retryAfterMs?: number
+              readonly providerCode?: string
+            }
+            readonly responseBody?: string
+            readonly responseHeaders?: { readonly [x: string]: string }
+            readonly url?: string
           }
           readonly retry?: {
             readonly attempt: number
@@ -3268,6 +3602,32 @@ export type SessionImportInput = {
               readonly message: string
               readonly status?: number
               readonly response?: { readonly body: string }
+              readonly resolution?: {
+                readonly kind:
+                  | "rate_limited"
+                  | "usage_limited"
+                  | "plan_not_included"
+                  | "quota_exceeded"
+                  | "policy_blocked"
+                  | "authentication"
+                  | "invalid_input"
+                  | "network"
+                  | "server"
+                readonly retry: "automatic" | "never"
+                readonly action:
+                  | "switch_model"
+                  | "wait"
+                  | "manage_billing"
+                  | "reauthenticate"
+                  | "fix_input"
+                  | "check_network"
+                  | "retry"
+                readonly retryAfterMs?: number
+                readonly providerCode?: string
+              }
+              readonly responseBody?: string
+              readonly responseHeaders?: { readonly [x: string]: string }
+              readonly url?: string
             }
           }
         }
@@ -3325,6 +3685,32 @@ export type SessionImportInput = {
                 readonly message: string
                 readonly status?: number
                 readonly response?: { readonly body: string }
+                readonly resolution?: {
+                  readonly kind:
+                    | "rate_limited"
+                    | "usage_limited"
+                    | "plan_not_included"
+                    | "quota_exceeded"
+                    | "policy_blocked"
+                    | "authentication"
+                    | "invalid_input"
+                    | "network"
+                    | "server"
+                  readonly retry: "automatic" | "never"
+                  readonly action:
+                    | "switch_model"
+                    | "wait"
+                    | "manage_billing"
+                    | "reauthenticate"
+                    | "fix_input"
+                    | "check_network"
+                    | "retry"
+                  readonly retryAfterMs?: number
+                  readonly providerCode?: string
+                }
+                readonly responseBody?: string
+                readonly responseHeaders?: { readonly [x: string]: string }
+                readonly url?: string
               }
               readonly cost?: number
               readonly tokens?: {
@@ -3554,6 +3940,32 @@ export type SessionImportInput = {
                         readonly message: string
                         readonly status?: number
                         readonly response?: { readonly body: string }
+                        readonly resolution?: {
+                          readonly kind:
+                            | "rate_limited"
+                            | "usage_limited"
+                            | "plan_not_included"
+                            | "quota_exceeded"
+                            | "policy_blocked"
+                            | "authentication"
+                            | "invalid_input"
+                            | "network"
+                            | "server"
+                          readonly retry: "automatic" | "never"
+                          readonly action:
+                            | "switch_model"
+                            | "wait"
+                            | "manage_billing"
+                            | "reauthenticate"
+                            | "fix_input"
+                            | "check_network"
+                            | "retry"
+                          readonly retryAfterMs?: number
+                          readonly providerCode?: string
+                        }
+                        readonly responseBody?: string
+                        readonly responseHeaders?: { readonly [x: string]: string }
+                        readonly url?: string
                       }
                       readonly content?: readonly [
                         (
@@ -3596,6 +4008,32 @@ export type SessionImportInput = {
             readonly message: string
             readonly status?: number
             readonly response?: { readonly body: string }
+            readonly resolution?: {
+              readonly kind:
+                | "rate_limited"
+                | "usage_limited"
+                | "plan_not_included"
+                | "quota_exceeded"
+                | "policy_blocked"
+                | "authentication"
+                | "invalid_input"
+                | "network"
+                | "server"
+              readonly retry: "automatic" | "never"
+              readonly action:
+                | "switch_model"
+                | "wait"
+                | "manage_billing"
+                | "reauthenticate"
+                | "fix_input"
+                | "check_network"
+                | "retry"
+              readonly retryAfterMs?: number
+              readonly providerCode?: string
+            }
+            readonly responseBody?: string
+            readonly responseHeaders?: { readonly [x: string]: string }
+            readonly url?: string
           }
           readonly retry?: {
             readonly attempt: number
@@ -3605,6 +4043,32 @@ export type SessionImportInput = {
               readonly message: string
               readonly status?: number
               readonly response?: { readonly body: string }
+              readonly resolution?: {
+                readonly kind:
+                  | "rate_limited"
+                  | "usage_limited"
+                  | "plan_not_included"
+                  | "quota_exceeded"
+                  | "policy_blocked"
+                  | "authentication"
+                  | "invalid_input"
+                  | "network"
+                  | "server"
+                readonly retry: "automatic" | "never"
+                readonly action:
+                  | "switch_model"
+                  | "wait"
+                  | "manage_billing"
+                  | "reauthenticate"
+                  | "fix_input"
+                  | "check_network"
+                  | "retry"
+                readonly retryAfterMs?: number
+                readonly providerCode?: string
+              }
+              readonly responseBody?: string
+              readonly responseHeaders?: { readonly [x: string]: string }
+              readonly url?: string
             }
           }
         }
@@ -3662,6 +4126,32 @@ export type SessionImportInput = {
                 readonly message: string
                 readonly status?: number
                 readonly response?: { readonly body: string }
+                readonly resolution?: {
+                  readonly kind:
+                    | "rate_limited"
+                    | "usage_limited"
+                    | "plan_not_included"
+                    | "quota_exceeded"
+                    | "policy_blocked"
+                    | "authentication"
+                    | "invalid_input"
+                    | "network"
+                    | "server"
+                  readonly retry: "automatic" | "never"
+                  readonly action:
+                    | "switch_model"
+                    | "wait"
+                    | "manage_billing"
+                    | "reauthenticate"
+                    | "fix_input"
+                    | "check_network"
+                    | "retry"
+                  readonly retryAfterMs?: number
+                  readonly providerCode?: string
+                }
+                readonly responseBody?: string
+                readonly responseHeaders?: { readonly [x: string]: string }
+                readonly url?: string
               }
               readonly cost?: number
               readonly tokens?: {
@@ -3891,6 +4381,32 @@ export type SessionImportInput = {
                         readonly message: string
                         readonly status?: number
                         readonly response?: { readonly body: string }
+                        readonly resolution?: {
+                          readonly kind:
+                            | "rate_limited"
+                            | "usage_limited"
+                            | "plan_not_included"
+                            | "quota_exceeded"
+                            | "policy_blocked"
+                            | "authentication"
+                            | "invalid_input"
+                            | "network"
+                            | "server"
+                          readonly retry: "automatic" | "never"
+                          readonly action:
+                            | "switch_model"
+                            | "wait"
+                            | "manage_billing"
+                            | "reauthenticate"
+                            | "fix_input"
+                            | "check_network"
+                            | "retry"
+                          readonly retryAfterMs?: number
+                          readonly providerCode?: string
+                        }
+                        readonly responseBody?: string
+                        readonly responseHeaders?: { readonly [x: string]: string }
+                        readonly url?: string
                       }
                       readonly content?: readonly [
                         (
@@ -3933,6 +4449,32 @@ export type SessionImportInput = {
             readonly message: string
             readonly status?: number
             readonly response?: { readonly body: string }
+            readonly resolution?: {
+              readonly kind:
+                | "rate_limited"
+                | "usage_limited"
+                | "plan_not_included"
+                | "quota_exceeded"
+                | "policy_blocked"
+                | "authentication"
+                | "invalid_input"
+                | "network"
+                | "server"
+              readonly retry: "automatic" | "never"
+              readonly action:
+                | "switch_model"
+                | "wait"
+                | "manage_billing"
+                | "reauthenticate"
+                | "fix_input"
+                | "check_network"
+                | "retry"
+              readonly retryAfterMs?: number
+              readonly providerCode?: string
+            }
+            readonly responseBody?: string
+            readonly responseHeaders?: { readonly [x: string]: string }
+            readonly url?: string
           }
           readonly retry?: {
             readonly attempt: number
@@ -3942,6 +4484,32 @@ export type SessionImportInput = {
               readonly message: string
               readonly status?: number
               readonly response?: { readonly body: string }
+              readonly resolution?: {
+                readonly kind:
+                  | "rate_limited"
+                  | "usage_limited"
+                  | "plan_not_included"
+                  | "quota_exceeded"
+                  | "policy_blocked"
+                  | "authentication"
+                  | "invalid_input"
+                  | "network"
+                  | "server"
+                readonly retry: "automatic" | "never"
+                readonly action:
+                  | "switch_model"
+                  | "wait"
+                  | "manage_billing"
+                  | "reauthenticate"
+                  | "fix_input"
+                  | "check_network"
+                  | "retry"
+                readonly retryAfterMs?: number
+                readonly providerCode?: string
+              }
+              readonly responseBody?: string
+              readonly responseHeaders?: { readonly [x: string]: string }
+              readonly url?: string
             }
           }
         }
@@ -3999,6 +4567,32 @@ export type SessionImportInput = {
                 readonly message: string
                 readonly status?: number
                 readonly response?: { readonly body: string }
+                readonly resolution?: {
+                  readonly kind:
+                    | "rate_limited"
+                    | "usage_limited"
+                    | "plan_not_included"
+                    | "quota_exceeded"
+                    | "policy_blocked"
+                    | "authentication"
+                    | "invalid_input"
+                    | "network"
+                    | "server"
+                  readonly retry: "automatic" | "never"
+                  readonly action:
+                    | "switch_model"
+                    | "wait"
+                    | "manage_billing"
+                    | "reauthenticate"
+                    | "fix_input"
+                    | "check_network"
+                    | "retry"
+                  readonly retryAfterMs?: number
+                  readonly providerCode?: string
+                }
+                readonly responseBody?: string
+                readonly responseHeaders?: { readonly [x: string]: string }
+                readonly url?: string
               }
               readonly cost?: number
               readonly tokens?: {
@@ -4028,7 +4622,7 @@ export type SessionExportInput = {
   readonly sanitize?: { readonly sanitize?: boolean | undefined }["sanitize"]
 }
 
-export type SessionExportOutput = { data: SessionTransferData }["data"]
+export type SessionExportOutput = { data: SessionTransferExported }["data"]
 
 export type SessionActiveOutput = { data: { [x: string]: SessionActive } }["data"]
 
@@ -4067,13 +4661,23 @@ export type SessionUpdateInput = {
   readonly sessionID: { readonly sessionID: string }["sessionID"]
   readonly title?: {
     readonly title?: string | undefined
+    readonly archivedAt?: number | null | undefined
     readonly metadata?: { readonly [x: string]: JsonValue } | undefined
     readonly permissions?:
       | ReadonlyArray<{ readonly action: string; readonly resource: string; readonly effect: "allow" | "deny" | "ask" }>
       | undefined
   }["title"]
+  readonly archivedAt?: {
+    readonly title?: string | undefined
+    readonly archivedAt?: number | null | undefined
+    readonly metadata?: { readonly [x: string]: JsonValue } | undefined
+    readonly permissions?:
+      | ReadonlyArray<{ readonly action: string; readonly resource: string; readonly effect: "allow" | "deny" | "ask" }>
+      | undefined
+  }["archivedAt"]
   readonly metadata?: {
     readonly title?: string | undefined
+    readonly archivedAt?: number | null | undefined
     readonly metadata?: { readonly [x: string]: JsonValue } | undefined
     readonly permissions?:
       | ReadonlyArray<{ readonly action: string; readonly resource: string; readonly effect: "allow" | "deny" | "ask" }>
@@ -4081,6 +4685,7 @@ export type SessionUpdateInput = {
   }["metadata"]
   readonly permissions?: {
     readonly title?: string | undefined
+    readonly archivedAt?: number | null | undefined
     readonly metadata?: { readonly [x: string]: JsonValue } | undefined
     readonly permissions?:
       | ReadonlyArray<{ readonly action: string; readonly resource: string; readonly effect: "allow" | "deny" | "ask" }>
@@ -4578,6 +5183,10 @@ export type SessionInterruptInput = {
 
 export type SessionInterruptOutput = SessionInterruptResponse
 
+export type SessionStopInput = { readonly sessionID: { readonly sessionID: string }["sessionID"] }
+
+export type SessionStopOutput = SessionStopResponse
+
 export type SessionBackgroundInput = { readonly sessionID: { readonly sessionID: string }["sessionID"] }
 
 export type SessionBackgroundOutput = void
@@ -4587,7 +5196,7 @@ export type SessionMessageGetInput = {
   readonly messageID: { readonly sessionID: string; readonly messageID: string }["messageID"]
 }
 
-export type SessionMessageGetOutput = { data: SessionMessageInfo }["data"]
+export type SessionMessageGetOutput = { data: SessionMessageStoredInfo }["data"]
 
 export type SessionFormListInput = { readonly sessionID: { readonly sessionID: string }["sessionID"] }
 
@@ -6557,8 +7166,69 @@ export type WebsearchProvidersOutput = { location: LocationPublicRef; data: Arra
 
 export type WebsearchQueryInput = {
   readonly location?: { readonly location?: { readonly directory?: string | undefined } | undefined }["location"]
-  readonly query: { readonly query: string; readonly providerID?: string }["query"]
-  readonly providerID?: { readonly query: string; readonly providerID?: string }["providerID"]
+  readonly query: {
+    readonly query: string
+    readonly numResults?: number
+    readonly includeDomains?: ReadonlyArray<string>
+    readonly excludeDomains?: ReadonlyArray<string>
+    readonly highlightsQuery?: string
+    readonly maxCharacters?: number
+    readonly providerID?: string
+  }["query"]
+  readonly numResults?: {
+    readonly query: string
+    readonly numResults?: number
+    readonly includeDomains?: ReadonlyArray<string>
+    readonly excludeDomains?: ReadonlyArray<string>
+    readonly highlightsQuery?: string
+    readonly maxCharacters?: number
+    readonly providerID?: string
+  }["numResults"]
+  readonly includeDomains?: {
+    readonly query: string
+    readonly numResults?: number
+    readonly includeDomains?: ReadonlyArray<string>
+    readonly excludeDomains?: ReadonlyArray<string>
+    readonly highlightsQuery?: string
+    readonly maxCharacters?: number
+    readonly providerID?: string
+  }["includeDomains"]
+  readonly excludeDomains?: {
+    readonly query: string
+    readonly numResults?: number
+    readonly includeDomains?: ReadonlyArray<string>
+    readonly excludeDomains?: ReadonlyArray<string>
+    readonly highlightsQuery?: string
+    readonly maxCharacters?: number
+    readonly providerID?: string
+  }["excludeDomains"]
+  readonly highlightsQuery?: {
+    readonly query: string
+    readonly numResults?: number
+    readonly includeDomains?: ReadonlyArray<string>
+    readonly excludeDomains?: ReadonlyArray<string>
+    readonly highlightsQuery?: string
+    readonly maxCharacters?: number
+    readonly providerID?: string
+  }["highlightsQuery"]
+  readonly maxCharacters?: {
+    readonly query: string
+    readonly numResults?: number
+    readonly includeDomains?: ReadonlyArray<string>
+    readonly excludeDomains?: ReadonlyArray<string>
+    readonly highlightsQuery?: string
+    readonly maxCharacters?: number
+    readonly providerID?: string
+  }["maxCharacters"]
+  readonly providerID?: {
+    readonly query: string
+    readonly numResults?: number
+    readonly includeDomains?: ReadonlyArray<string>
+    readonly excludeDomains?: ReadonlyArray<string>
+    readonly highlightsQuery?: string
+    readonly maxCharacters?: number
+    readonly providerID?: string
+  }["providerID"]
 }
 
 export type WebsearchQueryOutput = {
