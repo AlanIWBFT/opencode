@@ -1,5 +1,5 @@
 import { expect } from "bun:test"
-import { ConfigProvider, Effect, Layer, Schema } from "effect"
+import { Effect, Schema } from "effect"
 import { mkdir } from "node:fs/promises"
 import path from "node:path"
 import { AppNodeBuilder } from "@opencode/core/effect/app-node-builder"
@@ -21,14 +21,7 @@ const it = testEffect(
   AppNodeBuilder.build(LayerNode.group([Session.node, Instance.node]), [
     Global.node.replace(tempGlobalLayer),
     offlineModels,
-  ]).pipe(
-    Layer.provide(
-      Layer.succeed(
-        ConfigProvider.ConfigProvider,
-        ConfigProvider.fromUnknown({ OPENCODE_EXPERIMENTAL_CODE_MODE: false }),
-      ),
-    ),
-  ),
+  ]),
 )
 const native = process.platform === "win32" && Bun.which("pwsh") ? it.live : it.live.skip
 

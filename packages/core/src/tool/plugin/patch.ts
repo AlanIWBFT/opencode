@@ -78,7 +78,7 @@ export const Plugin = {
       .transform((editor) =>
         editor.add({
           name,
-          options: { codemode: { namespace: "$opencode", concurrency: { group: "filesystem-write", limit: 1 } }, permission: "edit" },
+          options: { codemode: false, permission: "edit" },
           description: DESCRIPTION,
           input: Input,
           output: Output,

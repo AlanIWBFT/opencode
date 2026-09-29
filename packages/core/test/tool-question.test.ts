@@ -1,5 +1,5 @@
 import { describe, expect } from "bun:test"
-import { Cause, ConfigProvider, Effect, Exit, Fiber, Layer } from "effect"
+import { Cause, Effect, Exit, Fiber, Layer } from "effect"
 import { AppNodeBuilder } from "@opencode/core/effect/app-node-builder"
 import { LayerNode } from "@opencode/util/effect/layer-node"
 import { Form } from "@opencode/core/form"
@@ -69,14 +69,7 @@ const it = testEffect(
     Permission.node.replace(permission),
     Form.node.replace(form),
     Image.node.replace(imagePassthrough),
-  ]).pipe(
-    Layer.provide(
-      Layer.succeed(
-        ConfigProvider.ConfigProvider,
-        ConfigProvider.fromUnknown({ OPENCODE_EXPERIMENTAL_CODE_MODE: true }),
-      ),
-    ),
-  ),
+  ]),
 )
 
 describe("QuestionTool", () => {

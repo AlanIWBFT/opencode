@@ -4,7 +4,7 @@ import { Location } from "@opencode/core/location"
 import { AbsolutePath } from "@opencode/core/schema"
 import { Tool } from "@opencode/core/tool"
 import type { Info } from "@opencode/schema/tool"
-import { ConfigProvider, Effect, Schema } from "effect"
+import { Effect, Schema } from "effect"
 import { it } from "./lib/effect"
 
 const toolNode = AppNodeBuilder.build(Tool.node, [
@@ -49,7 +49,6 @@ describe("CodeMode", () => {
     }).pipe(
       Effect.scoped,
       Effect.provide(toolNode),
-      Effect.provideService(ConfigProvider.ConfigProvider, ConfigProvider.fromUnknown({ OPENCODE_EXPERIMENTAL_CODE_MODE: true })),
     ),
   )
 
@@ -97,11 +96,10 @@ describe("CodeMode", () => {
     }).pipe(
       Effect.scoped,
       Effect.provide(toolNode),
-      Effect.provideService(ConfigProvider.ConfigProvider, ConfigProvider.fromUnknown({ OPENCODE_EXPERIMENTAL_CODE_MODE: true })),
     ),
   )
 
-  it.effect("keeps tools directly available unless Code Mode is explicitly enabled", () =>
+  it.effect("keeps explicitly direct tools available when execute is denied", () =>
     Effect.gen(function* () {
       const tools = yield* Tool.Service
       yield* tools.transform((editor) => editor.add({
@@ -109,16 +107,15 @@ describe("CodeMode", () => {
         description: "Echo",
         input: Schema.Struct({}),
         output: Schema.String,
-        options: { codemode: { namespace: "$opencode" } },
+        options: { codemode: false },
         execute: () => Effect.succeed({ output: "ok" }),
       }))
-      const snapshot = yield* tools.snapshot()
+      const snapshot = yield* tools.snapshot([{ action: "execute", resource: "*", effect: "deny" }])
       expect(snapshot.definitions.map((tool) => tool.name)).toEqual(["echo"])
       expect(snapshot.codeModeCatalog).toBeUndefined()
     }).pipe(
       Effect.scoped,
       Effect.provide(AppNodeBuilder.build(Tool.node, [Location.node.replace(Location.boundNode({ directory: AbsolutePath.make("/project") }))])),
-      Effect.provideService(ConfigProvider.ConfigProvider, ConfigProvider.fromUnknown({})),
     ),
   )
 })
