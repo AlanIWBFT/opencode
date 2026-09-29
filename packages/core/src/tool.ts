@@ -4,7 +4,7 @@ export type { Context, Metadata, Namespace, Options, Result } from "@opencode/sc
 
 import { ToolDefinition, type ToolCall } from "@opencode/ai"
 import { Tool } from "@opencode/schema/tool"
-import { Config, Context, Effect, Layer, Result, Schema, SchemaIssue, Types } from "effect"
+import { Context, Effect, Layer, Result, Schema, SchemaIssue, Types } from "effect"
 import { makeLocationNode } from "@opencode/util/effect/app-node"
 import type { Agent } from "./agent.js"
 import { CodeModeCatalog } from "./codemode/catalog.js"
@@ -68,10 +68,6 @@ export class Service extends Context.Service<Service, Interface>()("@opencode/To
 const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
-    const codeMode = yield* Config.boolean("OPENCODE_EXPERIMENTAL_CODE_MODE").pipe(
-      Config.withDefault(false),
-      Effect.orDie,
-    )
     const hooks = yield* PluginHooks.Service
     const image = yield* Image.Service
     const snapshots = yield* SessionExecSnapshots.Service
@@ -237,13 +233,9 @@ const layer = Layer.effect(
             if (whollyDisabled(tool.options?.permission ?? name, rules)) continue
             active.set(name, tool)
           }
-          const codeModeEnabled = codeMode && !whollyDisabled("execute", rules)
-          const direct = new Map(
-            Array.from(active).filter(([, tool]) => !codeModeEnabled || tool.options?.codemode === false),
-          )
-          const codeModeTools = new Map(
-            Array.from(active).filter(([, tool]) => codeModeEnabled && tool.options?.codemode !== false),
-          )
+          const codeModeEnabled = !whollyDisabled("execute", rules)
+          const direct = new Map(Array.from(active).filter(([, tool]) => tool.options?.codemode === false))
+          const codeModeTools = new Map(Array.from(active).filter(([, tool]) => tool.options?.codemode !== false))
           const namespaces = data.namespaces
           const codeModeInventory = { tools: codeModeTools, namespaces }
           const codeModeTool = codeModeEnabled

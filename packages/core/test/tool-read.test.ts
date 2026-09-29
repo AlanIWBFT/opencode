@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect } from "bun:test"
 import path from "path"
-import { ConfigProvider, Effect, Exit, Layer, Result } from "effect"
+import { Effect, Exit, Layer, Result } from "effect"
 import { Config } from "@opencode/core/config"
 import { AppNodeBuilder } from "@opencode/core/effect/app-node-builder"
 import { LayerNode } from "@opencode/util/effect/layer-node"
@@ -133,9 +133,6 @@ const readLayer = (imageLayer: Layer.Layer<Image.Service>) =>
   )
 const it = testEffect(readLayer(imageLayer))
 const itWithoutResizer = testEffect(readLayer(unavailableImage))
-const itCodeMode = testEffect(readLayer(imageLayer).pipe(
-  Layer.provide(Layer.succeed(ConfigProvider.ConfigProvider, ConfigProvider.fromUnknown({ OPENCODE_EXPERIMENTAL_CODE_MODE: true }))),
-))
 const sessionID = Session.ID.make("ses_read_tool_test")
 
 describe("ReadTool", () => {
@@ -160,9 +157,12 @@ describe("ReadTool", () => {
     readOverride = undefined
   })
 
-  itCodeMode.effect("exposes native reads inside Script while retaining permission filtering", () =>
+  it.effect("can opt native reads into Script through a plugin transform while retaining permission filtering", () =>
     Effect.gen(function* () {
       const registry = yield* Tool.Service
+      yield* registry.transform((editor) => editor.update("read", (tool) => {
+        tool.options = { ...tool.options, codemode: { namespace: "$opencode" } }
+      }))
       const snapshot = yield* registry.snapshot()
       expect(snapshot.definitions.map((tool) => tool.name)).toEqual(["execute"])
       const input = {
@@ -184,12 +184,12 @@ describe("ReadTool", () => {
     Effect.gen(function* () {
       const registry = yield* Tool.Service
 
-      expect((yield* toolDefinitions(registry)).map((tool) => tool.name)).toEqual(["read"])
+      expect((yield* toolDefinitions(registry)).map((tool) => tool.name)).toEqual(["read", "execute"])
       expect(
         (yield* toolDefinitions(registry, [{ action: "read", resource: "*", effect: "deny" }])).map(
           (tool) => tool.name,
         ),
-      ).toEqual([])
+      ).toEqual(["execute"])
       const execution = yield* executeTool(registry, {
         sessionID,
         ...toolIdentity,

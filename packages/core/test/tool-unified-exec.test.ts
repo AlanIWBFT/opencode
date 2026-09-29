@@ -1,5 +1,5 @@
 import { expect } from "bun:test"
-import { ConfigProvider, Effect, Layer, Schema } from "effect"
+import { Effect, Layer, Schema } from "effect"
 import { AppNodeBuilder } from "@opencode/core/effect/app-node-builder"
 import { LayerNode } from "@opencode/util/effect/layer-node"
 import { makeLocationNode } from "@opencode/util/effect/app-node"
@@ -46,26 +46,8 @@ const base = AppNodeBuilder.build(
     SessionExecution.node.replace(SessionExecution.noopLayer),
   ],
 )
-const direct = testEffect(
-  base.pipe(
-    Layer.provide(
-      Layer.succeed(
-        ConfigProvider.ConfigProvider,
-        ConfigProvider.fromUnknown({ OPENCODE_EXPERIMENTAL_CODE_MODE: false }),
-      ),
-    ),
-  ),
-)
-const scripts = testEffect(
-  base.pipe(
-    Layer.provide(
-      Layer.succeed(
-        ConfigProvider.ConfigProvider,
-        ConfigProvider.fromUnknown({ OPENCODE_EXPERIMENTAL_CODE_MODE: true }),
-      ),
-    ),
-  ),
-)
+const direct = testEffect(base)
+const scripts = testEffect(base)
 const windowsDirect = process.platform === "win32" && Bun.which("pwsh") ? direct.live : direct.live.skip
 const windowsScript = process.platform === "win32" && Bun.which("pwsh") ? scripts.live : scripts.live.skip
 
@@ -85,6 +67,7 @@ windowsDirect(
         "poll_exec",
         "terminate_exec",
         "write_stdin",
+        "execute",
       ])
       const result = yield* executeTool(tools, {
         ...toolIdentity,
@@ -124,6 +107,19 @@ windowsScript(
       const tools = yield* Tool.Service
       const sessions = yield* Session.Service
       const executions = yield* ExecSession.Service
+      yield* tools.transform((editor) => {
+        for (const name of ["exec_command", "poll_exec", "write_stdin", "terminate_exec"]) {
+          editor.update(name, (tool) => {
+            tool.options = {
+              ...tool.options,
+              codemode: {
+                namespace: "$opencode",
+                ...(name === "exec_command" ? {} : { concurrency: { group: "exec-session", limit: 1, inputKey: "exec_id" } }),
+              },
+            }
+          })
+        }
+      })
       const location = yield* Location.Service
       const session = yield* sessions.create({
         location: { directory: location.directory },

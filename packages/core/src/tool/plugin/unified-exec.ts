@@ -74,11 +74,6 @@ export const TerminateInput = Schema.Struct({
   }),
 })
 
-const followup = {
-  namespace: "$opencode",
-  concurrency: { group: "exec-session", limit: 1, inputKey: "exec_id" },
-} as const
-
 export const Plugin = {
   id: "opencode.tool.unified-exec",
   effect: Effect.fn("UnifiedExecTool.Plugin")(function* (ctx: Context) {
@@ -140,7 +135,7 @@ export const Plugin = {
         editor.remove("shell")
         editor.add({
           name: "exec_command",
-          options: { permission: "shell", codemode: { namespace: "$opencode" } },
+          options: { permission: "shell", codemode: false },
           description: description(),
           input: ExecInput,
           output: Schema.String,
@@ -213,7 +208,7 @@ export const Plugin = {
         })
         editor.add({
           name: "poll_exec",
-          options: { permission: "shell", codemode: followup },
+          options: { permission: "shell", codemode: false },
           input: PollInput,
           output: Schema.String,
           description: "Poll a running exec_command execution for more output without writing to stdin.",
@@ -229,7 +224,7 @@ export const Plugin = {
         })
         editor.add({
           name: "write_stdin",
-          options: { permission: "shell", codemode: followup },
+          options: { permission: "shell", codemode: false },
           input: WriteInput,
           output: Schema.String,
           description:
@@ -266,7 +261,7 @@ export const Plugin = {
         })
         editor.add({
           name: "terminate_exec",
-          options: { permission: "shell", codemode: followup },
+          options: { permission: "shell", codemode: false },
           input: TerminateInput,
           output: Schema.String,
           description:
