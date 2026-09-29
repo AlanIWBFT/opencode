@@ -2,6 +2,23 @@
 
 Core runtime services for OpenCode.
 
+## Code Mode selection
+
+Code Mode follows upstream defaults: plugin tools use `execute` unless their
+registration sets `options.codemode: false`. Built-in file/web tools and the four
+persistent exec controls remain direct tools. There is no global experimental
+environment toggle.
+
+A plugin can opt a built-in into Script with the existing `tool.transform`
+editor, updating its `options.codemode` to `{ namespace: "$opencode" }`.
+For `edit`, `write`, and `patch`, use a shared concurrency policy
+`{ group: "filesystem-write", limit: 1 }`; web tools can share
+`{ group: "network", limit: 4 }`. Exec follow-ups use
+`{ group: "exec-session", limit: 1, inputKey: "exec_id" }`. These policies belong
+inside the `codemode` object. Preserve the registration's other options.
+Lane launch serialization, child-call snapshots and Script-owned failure cleanup
+remain in the runtime regardless of which tools a plugin opts into Code Mode.
+
 ## Web research tools
 
 `websearch` accepts a natural-language `query` and optional `numResults` (1–20),

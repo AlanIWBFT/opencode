@@ -56,7 +56,7 @@ export const Plugin = {
       .transform((editor) =>
         editor.add({
           name,
-          options: { codemode: { namespace: "$opencode", concurrency: { group: "filesystem-write", limit: 1 } }, permission: "edit" },
+          options: { codemode: false, permission: "edit" },
           description:
             "Writes a file to the local filesystem, overwriting if one exists.\n\nMissing parent directories are created automatically.\n\nUse this tool to create new files or overwrite existing files. For partial changes, use the edit tool instead.",
           input: Input,
