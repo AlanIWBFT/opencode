@@ -4,6 +4,7 @@ import { Tool } from "@opencode/schema/tool"
 import { AbsolutePath } from "@opencode/schema/schema"
 import { makeLocationNode } from "@opencode/util/effect/app-node"
 import { Location } from "../location.js"
+import { LocationLifecycle } from "../location-lifecycle.js"
 import { Environment } from "../environment/index.js"
 import { SessionStore } from "../session/store.js"
 import { SessionExecPresentation } from "../session/exec-presentation.js"
@@ -322,6 +323,7 @@ const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const location = yield* Location.Service
+    const lifecycle = yield* LocationLifecycle.Service
     const sessions = yield* SessionStore.Service
     const presentation = yield* SessionExecPresentation.Service
     const control = yield* ExecSessionControl.Service
@@ -477,6 +479,9 @@ const layer = Layer.effect(
       spawnLock: Semaphore.makeUnsafe(1),
     }
     const current = () => Effect.succeed(state)
+    // A boot detached before exec registration is closed by its own Location lifecycle.
+    // Replacement graphs may already be running while the old graph finishes cleanup.
+    const isClosed = () => state.closed || lifecycle.isClosed()
 
     function findEntry(state: State, execID: number, invocation: Invocation) {
       const entry = state.executions.get(execID)
@@ -1215,7 +1220,7 @@ const layer = Layer.effect(
       }
       const preparation = yield* state.laneLock.withPermits(1)(
         Effect.gen(function* () {
-          if (state.closed || state.stopOperations.has(input.invocation.sessionID)) {
+          if (isClosed() || state.stopOperations.has(input.invocation.sessionID)) {
             return "this session changed while preparing the command"
           }
           const slot = slotsFor(state, input.invocation.sessionID)[laneID]
@@ -1316,7 +1321,7 @@ const layer = Layer.effect(
                   Effect.gen(function* () {
                     if (
                       launch.invalidatedReason ||
-                      state.closed ||
+                      isClosed() ||
                       state.stopOperations.has(input.invocation.sessionID)
                     ) {
                       return `lane slot ${laneID} preparation was invalidated because the session changed`
@@ -1426,7 +1431,7 @@ const layer = Layer.effect(
       const started = performance.now()
       const state = yield* current()
       const laneID = input.laneID ?? 0
-      if (state.closed) return failedLaunch(input.command, "execution workspace has closed", started, { laneID })
+      if (isClosed()) return failedLaunch(input.command, "execution workspace has closed", started, { laneID })
       if (state.deletedSessions.has(input.invocation.sessionID))
         return failedLaunch(input.command, "this session no longer exists", started, { laneID })
       if (!Number.isInteger(laneID) || laneID < 0 || laneID >= MAX_LANES_PER_SESSION) {
@@ -1439,7 +1444,7 @@ const layer = Layer.effect(
       if (!session) {
         return failedLaunch(input.command, "this session no longer exists", started, { laneID: input.laneID ?? 0 })
       }
-      if (session.time.archived || state.closed || state.stopOperations.has(input.invocation.sessionID)) {
+      if (session.time.archived || isClosed() || state.stopOperations.has(input.invocation.sessionID)) {
         return failedLaunch(
           input.command,
           "this session is archived; unarchive it before running another command",
@@ -1464,7 +1469,7 @@ const layer = Layer.effect(
             Effect.sync(() => {
               if (
                 (state.lifecycleEpochs.get(input.invocation.sessionID) ?? 0) !== lifecycleEpoch ||
-                state.closed ||
+                isClosed() ||
                 state.stopOperations.has(input.invocation.sessionID)
               ) {
                 return "this session changed while queuing the command"
@@ -2023,7 +2028,19 @@ const layer = Layer.effect(
       }
     })
 
-    yield* control.register(stop)
+    yield* control.register(stop, {
+      location: Location.Ref.make({ directory: location.directory, workspaceID: location.workspaceID }),
+      busy: () =>
+        liveLanes(state).some((lane) => !lane.resourcesReleased) ||
+        Array.from(state.slots.values()).some((slots) =>
+          slots.some(
+            (slot) => slot.preparation !== undefined || slot.activeLaunch !== undefined || slot.launchQueue.length > 0,
+          ),
+        ),
+      close: () => {
+        state.closed = true
+      },
+    })
     yield* Effect.addFinalizer(() =>
       Effect.gen(function* () {
         state.closed = true
@@ -2101,6 +2118,7 @@ export const node = makeLocationNode({
   layer,
   deps: [
     Location.node,
+    LocationLifecycle.node,
     Environment.node,
     Pty.node,
     SessionStore.node,

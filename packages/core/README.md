@@ -11,6 +11,17 @@ page-generated values submitted by the user rather than verbatim user text.
 Unanswered pages are excluded. Intact calls and results already retained in the
 model context are not duplicated.
 
+## Conditional location release
+
+Automatic UI cleanup calls `debug.location.evict` with `preserveExec: true`.
+Existing exec owners reject it with HTTP 409 while any running, idle, or starting
+lane remains. A free owner's launch admission closes before eviction, so a late
+launch cannot recreate a shell inside the retiring owner. Explicit eviction
+without the option, reload, and shutdown retain their normal cleanup semantics.
+Replacement locations may boot while the retired graph finishes cleanup. Exec
+checks its own location lifecycle, so a detached boot cannot launch commands and
+the retiring directory does not close its replacement's exec owner.
+
 ## Code Mode selection
 
 Code Mode follows upstream defaults: plugin tools use `execute` unless their
