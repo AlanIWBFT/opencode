@@ -22,6 +22,7 @@ import { SessionEvent } from "@opencode/core/session/event"
 import { SessionRunner } from "@opencode/core/session/runner/index"
 import { SessionTable } from "@opencode/core/session/sql"
 import { SessionStore } from "@opencode/core/session/store"
+import { ExecSessionControl } from "@opencode/core/tool/exec-session/control"
 import { Workspace } from "@opencode/core/workspace"
 import { Document, Info } from "@opencode/schema/config"
 import { ConfigExperimental } from "@opencode/schema/config/experimental"
@@ -110,6 +111,7 @@ const it = testEffect(
       LocationServiceMap.node,
       SessionExecution.node,
       LocationActivity.node,
+      ExecSessionControl.node,
     ]),
     [
       LocationServiceMap.node.replace(
@@ -124,6 +126,31 @@ const it = testEffect(
 )
 
 describe("LocationActivity eviction", () => {
+  it.effect("retains a persistent exec owner without session activity until its lanes are released", () =>
+    Effect.gen(function* () {
+      const map = yield* LocationServiceMap.Service
+      const exec = yield* ExecSessionControl.Service
+      const ref = LocationServiceMap.canonical({ directory: AbsolutePath.make("/project") })
+      const idle = Location.Ref.make({ directory: ref.directory, workspaceID: Workspace.ID.make("wrk_idle") })
+      const state = { busy: true, closed: false }
+      yield* exec.register(() => Effect.succeed({ matched: 0, terminated: 0, failed: 0 }), {
+        location: ref,
+        busy: () => state.busy,
+        close: () => { state.closed = true },
+      })
+      yield* Location.Service.pipe(Effect.provide(map.get(ref)), Effect.scoped)
+      yield* Location.Service.pipe(Effect.provide(map.get(idle)), Effect.scoped)
+      yield* TestClock.adjust("1 minute")
+      yield* TestClock.adjust("62 minutes")
+      expect(Array.from(yield* RcMap.keys(map.rcMap))).toEqual([ref])
+      expect(state.closed).toBe(false)
+      state.busy = false
+      yield* TestClock.adjust("62 minutes")
+      expect(Array.from(yield* RcMap.keys(map.rcMap))).toEqual([])
+      expect(state.closed).toBe(true)
+    }),
+  )
+
   for (const count of [1, 2]) {
     it.effect(`keeps a location with ${count} executions waiting on a question until they go idle`, () =>
       Effect.gen(function* () {
