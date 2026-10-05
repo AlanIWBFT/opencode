@@ -1,12 +1,56 @@
 import { expect } from "bun:test"
-import { Context, Effect, Exit, Layer, Scope } from "effect"
+import { Context, Deferred, Duration, Effect, Exit, Layer, LayerMap, Scope } from "effect"
 import { KV } from "@opencode/core/kv"
+import { Location } from "@opencode/core/location"
+import { AbsolutePath } from "@opencode/schema/schema"
 import { ExecSessionControl } from "@opencode/core/tool/exec-session/control"
 import { Session } from "@opencode/schema/session"
 import { LayerNode } from "@opencode/util/effect/layer-node"
 import { testEffect } from "./lib/effect"
 
 const it = testEffect(LayerNode.compile(LayerNode.group([ExecSessionControl.node, KV.node])))
+
+class Owner extends Context.Service<Owner, { closed: boolean }>()("test/ExecOwner") {}
+
+it.effect("conditional eviction keeps the cached replacement open while the old graph finishes cleanup", () =>
+  Effect.gen(function* () {
+    const control = yield* ExecSessionControl.Service
+    const location = Location.Ref.make({ directory: AbsolutePath.make(process.cwd()) })
+    const cleaning = yield* Deferred.make<void>()
+    const finish = yield* Deferred.make<void>()
+    const owners: { closed: boolean }[] = []
+    const map = yield* LayerMap.make(
+      (_ref: Location.Ref) => Layer.effect(Owner, Effect.gen(function* () {
+        const owner = { closed: false }
+        owners.push(owner)
+        yield* control.register(() => Effect.succeed({ matched: 0, terminated: 0, failed: 0 }), {
+          location,
+          busy: () => false,
+          close: () => { owner.closed = true },
+        })
+        if (owners.length === 1) yield* Effect.addFinalizer(() => Effect.gen(function* () {
+          yield* Deferred.succeed(cleaning, undefined)
+          yield* Deferred.await(finish)
+        }))
+        return owner
+      })),
+      { idleTimeToLive: Duration.infinity },
+    )
+    yield* Effect.scoped(map.contextEffect(location))
+    const [released, replacement] = yield* Effect.all([
+      control.releaseLocation(location, map.invalidate(location)),
+      Effect.gen(function* () {
+        yield* Deferred.await(cleaning)
+        expect(owners[0].closed).toBe(true)
+        expect(yield* control.releaseLocation(location, Effect.die("concurrent eviction"))).toBe(false)
+        return Context.get(yield* Effect.scoped(map.contextEffect(location)), Owner)
+      }).pipe(Effect.ensuring(Deferred.succeed(finish, undefined))),
+    ], { concurrency: "unbounded" })
+    expect(released).toBe(true)
+    expect(replacement.closed).toBe(false)
+    expect(Context.get(yield* Effect.scoped(map.contextEffect(location)), Owner)).toBe(replacement)
+  }),
+)
 
 it.effect("execution IDs remain distinct across concurrent owners and a reconstructed runtime", () =>
   Effect.gen(function* () {
