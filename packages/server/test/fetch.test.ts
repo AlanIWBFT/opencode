@@ -5,8 +5,13 @@ import path from "node:path"
 import { Agent } from "@opencode/schema/agent"
 import { Integration } from "@opencode/schema/integration"
 import { ServerInfo } from "@opencode/protocol/groups/server"
-import { Effect, Schedule, Schema } from "effect"
 import { Session } from "@opencode/schema/session"
+import { ExecSessionControl } from "@opencode/core/tool/exec-session/control"
+import { KV } from "@opencode/core/kv"
+import { makeGlobalNode } from "@opencode/util/effect/app-node"
+import { Location } from "@opencode/core/location"
+import { AbsolutePath } from "@opencode/schema/schema"
+import { Effect, Layer, Schedule, Schema } from "effect"
 import { tmpdir } from "../../core/test/fixture/tmpdir"
 import { it } from "../../core/test/lib/effect"
 import { ServerFetch } from "../src/fetch"
@@ -74,6 +79,46 @@ it.live("returns LocationNotFoundError for a missing folder and recovers once it
 )
 
 type Handler = (request: Request) => Promise<Response>
+
+it.live("conditional location eviction rejects live exec owners while explicit eviction remains unconditional", () =>
+  Effect.gen(function* () {
+    const directory = AbsolutePath.make(process.cwd())
+    const protectedControl = Layer.effect(
+      ExecSessionControl.Service,
+      Effect.gen(function* () {
+        const control = yield* ExecSessionControl.Service
+        yield* control.register(() => Effect.succeed({ matched: 0, terminated: 0, failed: 0 }), {
+          location: Location.Ref.make({ directory }),
+          busy: () => true,
+          close: () => {},
+        })
+        return control
+      }),
+    ).pipe(Layer.provide(ExecSessionControl.layer))
+    const handler = yield* ServerFetch.make(options, {
+      overrides: [
+        ExecSessionControl.node.replace(
+          makeGlobalNode({
+            service: ExecSessionControl.Service,
+            layer: protectedControl,
+            deps: [KV.node],
+          }),
+        ),
+      ],
+    })
+    const request = (query: string) =>
+      Effect.promise(() =>
+        handler(
+          new Request(`http://opencode.local/api/debug/location?directory=${encodeURIComponent(directory)}${query}`, {
+            method: "DELETE",
+          }),
+        ),
+      )
+    expect((yield* request("&preserveExec=true")).status).toBe(409)
+    expect((yield* request("&preserveExec=false")).status).toBe(204)
+    expect((yield* request("")).status).toBe(204)
+  }),
+)
 
 function occupy(port: number, cancel = false) {
   return Effect.gen(function* () {
