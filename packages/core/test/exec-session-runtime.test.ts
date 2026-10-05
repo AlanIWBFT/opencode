@@ -3,22 +3,90 @@ import { Effect } from "effect"
 import { AppNodeBuilder } from "@opencode/core/effect/app-node-builder"
 import { LayerNode } from "@opencode/util/effect/layer-node"
 import { Location } from "@opencode/core/location"
+import { LocationLifecycle } from "@opencode/core/location-lifecycle"
 import { Session } from "@opencode/core/session"
 import { SessionExecution } from "@opencode/core/session/execution"
 import { SessionMessage } from "@opencode/schema/session-message"
 import { ExecSession } from "@opencode/core/tool/exec-session"
+import { ExecSessionControl } from "@opencode/core/tool/exec-session/control"
 import { persistentShellExecutable, persistentShellScript } from "@opencode/core/tool/exec-session/shell"
 import { tempLocationLayer } from "./fixture/location"
 import { testEffect } from "./lib/effect"
 
 const it = testEffect(
-  AppNodeBuilder.build(LayerNode.group([ExecSession.node, Session.node, Location.node]), [
+  AppNodeBuilder.build(LayerNode.group([ExecSession.node, ExecSessionControl.node, Session.node, Location.node, LocationLifecycle.node]), [
     Location.node.replace(tempLocationLayer),
     SessionExecution.node.replace(SessionExecution.noopLayer),
   ]),
 )
 const shell = process.platform === "win32" ? Bun.which("pwsh") : null
 const windowsTest = shell ? it.live : it.live.skip
+
+it.live("exec refuses a launch after its own location lifecycle shuts down", () =>
+  Effect.gen(function* () {
+    const location = yield* Location.Service
+    const sessions = yield* Session.Service
+    const executions = yield* ExecSession.Service
+    const lifecycle = yield* LocationLifecycle.Service
+    const session = yield* sessions.create({ location: { directory: location.directory } })
+    yield* lifecycle.shutdown
+    const result = yield* executions.launch({
+      command: "must not run",
+      shell: process.platform === "win32" ? "pwsh" : "/bin/bash",
+      cwd: location.directory,
+      env: {},
+      invocation: {
+        sessionID: session.id,
+        messageID: SessionMessage.ID.create(),
+        display: "root",
+        metadata: () => Effect.void,
+      },
+      prepare: () => Effect.die("closed location reached shell preparation"),
+    })
+    expect(result.error).toContain("execution workspace has closed")
+  }),
+)
+
+windowsTest(
+  "conditional location release preserves running and idle lanes and fences later launches",
+  () =>
+    Effect.gen(function* () {
+      const location = yield* Location.Service
+      const sessions = yield* Session.Service
+      const executions = yield* ExecSession.Service
+      const control = yield* ExecSessionControl.Service
+      const ref = Location.Ref.make({ directory: location.directory })
+      const session = yield* sessions.create({ location: ref })
+      const launch = (command: string, yieldTimeMs = 5000) =>
+        executions.launch({
+          command,
+          shell: shell!,
+          cwd: location.directory,
+          env: {},
+          invocation: {
+            sessionID: session.id,
+            messageID: SessionMessage.ID.create(),
+            display: "root",
+            metadata: () => Effect.void,
+          },
+          yieldTimeMs,
+          prepare: () => Effect.succeed({ script: persistentShellScript(shell!, { command }) }),
+        })
+      const first = yield* launch("$retained = 'preserved'; Write-Output $retained")
+      expect(first.exitCode).toBe(0)
+      expect(yield* control.releaseLocation(ref, Effect.void)).toBe(false)
+      const second = yield* launch("Write-Output $retained")
+      expect(second.output).toContain("preserved")
+      const running = yield* launch("Start-Sleep -Seconds 60", 0)
+      expect(running.running).toBe(true)
+      expect(yield* control.releaseLocation(ref, Effect.void)).toBe(false)
+      yield* sessions.stop(session.id)
+      expect(yield* control.releaseLocation(ref, Effect.void)).toBe(true)
+      const closed = yield* launch("Write-Output 'must not run'")
+      expect(closed.error).toContain("closed")
+    }),
+  { timeout: 20_000 },
+)
 
 for (const tty of [false, true]) {
   const linuxTest = process.platform === "linux" ? it.live : it.live.skip

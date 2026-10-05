@@ -21,6 +21,7 @@ import { Session } from "@opencode/core/session"
 import { Instance } from "@opencode/core/instance/service"
 import { SessionTransfer } from "@opencode/core/session/transfer"
 import { InstructionEntry } from "@opencode/core/session/instruction-entry"
+import { ExecSessionControl } from "@opencode/core/tool/exec-session/control"
 import { ShellSelect } from "@opencode/core/shell/select"
 import { Shell } from "@opencode/core/shell"
 import { Job } from "@opencode/core/job"
@@ -79,6 +80,7 @@ const applicationServiceNodes = [
   Instance.node,
   SessionTransfer.node,
   InstructionEntry.node,
+  ExecSessionControl.node,
   SdkPlugins.node,
   PluginUpdate.node,
   PermissionSaved.node,
