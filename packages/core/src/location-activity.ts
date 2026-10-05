@@ -10,6 +10,7 @@ import { LocationServiceMap } from "./location-service-map.js"
 import { SessionEvent } from "./session/event.js"
 import { SessionExecution } from "./session/execution.js"
 import { SessionStore } from "./session/store.js"
+import { ExecSessionControl } from "./tool/exec-session/control.js"
 import { makeGlobalNode } from "@opencode/util/effect/app-node"
 
 const isSessionEvent = Schema.is(SessionEvent.Durable)
@@ -26,6 +27,7 @@ export function layer(options: { readonly timeToLive?: Duration.Input; readonly 
       const execution = yield* SessionExecution.Service
       const jobs = yield* Job.Service
       const sessions = yield* SessionStore.Service
+      const exec = yield* ExecSessionControl.Service
       const timeToLive = Duration.fromInputUnsafe(options.timeToLive ?? "60 minutes")
       const entries = new Map<string, { readonly ref: Location.Ref; touchedAt: number }>()
       const key = (ref: Location.Ref) => `${LocationServiceMap.canonical(ref).directory}\0${ref.workspaceID ?? ""}`
@@ -87,14 +89,19 @@ export function layer(options: { readonly timeToLive?: Duration.Input; readonly 
         )
         yield* Effect.forEach(
           expired,
-          (entry) => {
-            if (occupied.has(key(entry.ref))) return touch(entry.ref)
-            entries.delete(key(entry.ref))
-            return Effect.logInfo("location services evicted", {
-              directory: entry.ref.directory,
-              workspaceID: entry.ref.workspaceID,
-            }).pipe(Effect.andThen(locations.invalidate(entry.ref)))
-          },
+          (entry) =>
+            Effect.gen(function* () {
+              if (occupied.has(key(entry.ref))) return yield* touch(entry.ref)
+              if (!(yield* exec.releaseLocation(entry.ref, locations.invalidate(entry.ref)))) {
+                yield* touch(entry.ref)
+                return
+              }
+              entries.delete(key(entry.ref))
+              yield* Effect.logInfo("location services evicted", {
+                directory: entry.ref.directory,
+                workspaceID: entry.ref.workspaceID,
+              })
+            }),
           { discard: true },
         )
       }).pipe(Effect.forever, Effect.forkScoped)
@@ -107,5 +114,5 @@ export function layer(options: { readonly timeToLive?: Duration.Input; readonly 
 export const node = makeGlobalNode({
   service: Service,
   layer: layer(),
-  deps: [Bus.node, Job.node, LocationServiceMap.node, SessionExecution.node, SessionStore.node],
+  deps: [Bus.node, Job.node, LocationServiceMap.node, SessionExecution.node, SessionStore.node, ExecSessionControl.node],
 })
