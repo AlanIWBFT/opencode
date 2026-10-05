@@ -2168,9 +2168,9 @@ export function make(options: ClientOptions) {
             {
               method: "DELETE",
               path: `/api/debug/location`,
-              query: { location: input?.["location"] },
+              query: { location: input?.["location"], preserveExec: input?.["preserveExec"] },
               successStatus: 204,
-              declaredStatuses: [400, 401],
+              declaredStatuses: [400, 401, 409],
               empty: true,
             },
             requestOptions,

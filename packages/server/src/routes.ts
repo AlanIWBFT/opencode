@@ -18,6 +18,7 @@ import { Worktree } from "@opencode/core/worktree"
 import { Session } from "@opencode/core/session"
 import { Instance } from "@opencode/core/instance/service"
 import { SessionTransfer } from "@opencode/core/session/transfer"
+import { ExecSessionControl } from "@opencode/core/tool/exec-session/control"
 import { ShellSelect } from "@opencode/core/shell/select"
 import { Job } from "@opencode/core/job"
 import { Mcp } from "@opencode/core/mcp/index"
@@ -61,6 +62,7 @@ const applicationServiceNodes = [
   Session.node,
   Instance.node,
   SessionTransfer.node,
+  ExecSessionControl.node,
   SdkPlugins.node,
   PluginUpdate.node,
   PermissionSaved.node,

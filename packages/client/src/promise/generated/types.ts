@@ -7267,7 +7267,14 @@ export type VcsDiffOutput = { location: LocationPublicRef; data: Array<FileDiffI
 export type DebugLocationListOutput = Array<LocationPublicRef>
 
 export type DebugLocationEvictInput = {
-  readonly location?: { readonly location?: { readonly directory?: string | undefined } | undefined }["location"]
+  readonly location?: {
+    readonly location?: { readonly directory?: string | undefined } | undefined
+    readonly preserveExec?: boolean | undefined
+  }["location"]
+  readonly preserveExec?: {
+    readonly location?: { readonly directory?: string | undefined } | undefined
+    readonly preserveExec?: boolean | undefined
+  }["preserveExec"]
 }
 
 export type DebugLocationEvictOutput = void

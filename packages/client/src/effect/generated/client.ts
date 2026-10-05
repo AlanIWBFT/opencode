@@ -1558,7 +1558,9 @@ const EndpointDebugLocationList = (raw: RawClient["server.debug"]) => () =>
 
 const EndpointDebugLocationEvict = (raw: RawClient["server.debug"]) => (input?: DebugLocationEvictInput) =>
   preserveEffect<DebugLocationEvictOutput>()(
-    raw["debug.location.evict"]({ query: { location: input?.["location"] } }).pipe(Effect.mapError(mapClientError)),
+    raw["debug.location.evict"]({
+      query: { location: input?.["location"], preserveExec: input?.["preserveExec"] },
+    }).pipe(Effect.mapError(mapClientError)),
   )
 
 const adaptGroupDebug = (raw: RawClient["server.debug"]) => ({

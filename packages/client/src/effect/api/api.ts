@@ -3402,7 +3402,10 @@ export interface VcsApi<E = never> {
 export type DebugLocationListOutput = ReadonlyArray<Location.PublicRef>
 export type DebugLocationListOperation<E = never> = () => Effect.Effect<DebugLocationListOutput, E>
 
-export type DebugLocationEvictInput = { readonly location?: { readonly directory?: string | undefined } | undefined }
+export type DebugLocationEvictInput = {
+  readonly location?: { readonly directory?: string | undefined } | undefined
+  readonly preserveExec?: boolean | undefined
+}
 export type DebugLocationEvictOutput = void
 export type DebugLocationEvictOperation<E = never> = (
   input?: DebugLocationEvictInput,
