@@ -4,7 +4,6 @@ import path from "path"
 import { Clock, Duration, Effect, Schema } from "effect"
 import { FSUtil } from "@opencode/util/fs-util"
 import { Global } from "@opencode/util/global"
-import { Identifier } from "../id/id.js"
 import { ToolOutput } from "../tool-output.js"
 
 export const Ref = Schema.String.check(Schema.isPattern(/^tool_[0-9a-f]{12}[A-Za-z0-9]{14}$/))
@@ -57,7 +56,7 @@ export const make = Effect.gen(function* () {
   const decode = Schema.decodeUnknownEffect(Schema.fromJsonString(Snapshot))
   return {
     save: Effect.fn("WebPage.save")(function* (input: Omit<Snapshot, "version" | "fetchedAt">) {
-      const ref = Identifier.ascending("tool")
+      const ref = ToolOutput.fileName()
       const snapshot = { ...input, version: 1 as const, fetchedAt: yield* Clock.currentTimeMillis }
       yield* fs.ensureDir(directory)
       yield* fs.writeFileString(path.join(directory, `${ref}.web.json`), JSON.stringify(snapshot))
