@@ -1,7 +1,6 @@
 import { SessionID } from "@opencode/schema/session-id"
 import { SessionMessage } from "@opencode/schema/session-message"
 import { Tool } from "@opencode/schema/tool"
-import { AbsolutePath } from "@opencode/schema/schema"
 import { makeLocationNode } from "@opencode/util/effect/app-node"
 import { Location } from "../location.js"
 import { LocationLifecycle } from "../location-lifecycle.js"
