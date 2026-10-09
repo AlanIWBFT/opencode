@@ -24,7 +24,7 @@ import { executeTool, registerToolPlugin, toolIdentity } from "./lib/tool"
 
 const plugin = makeLocationNode({
   name: "test/unified-exec-plugin",
-  layer: Layer.effectDiscard(registerToolPlugin(UnifiedExecTool.Plugin)),
+  layer: Layer.effectDiscard(registerToolPlugin(UnifiedExecTool.Plugin, { app: { name: "test", version: "test", channel: "dev" } })),
   deps: [
     Tool.node,
     ExecSession.node,

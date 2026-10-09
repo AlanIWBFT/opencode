@@ -111,7 +111,9 @@ export const Plugin = {
       context: Tool.Context,
     ) {
       const target = yield* access.resolve({ path: cwd, kind: "directory" })
-      const portable = Config.latest(yield* config.entries(), "experimental")?.portable_shell_scanner === true
+      const portable =
+        Config.latest(yield* config.entries(), "experimental")?.portable_shell_scanner ??
+        (ctx.app.channel === "local" || ctx.app.channel === "dev")
       const parsed = yield* ShellParse.scan(command, shell, target.absolute, { portable })
       const directories = yield* Effect.forEach(parsed.directories, (directory) =>
         access.resolve({ path: FileAccess.resolvePath(target.absolute, directory), kind: "directory" }),
