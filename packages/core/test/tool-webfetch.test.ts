@@ -906,10 +906,129 @@ describe("WebFetchTool registration", () => {
 
       expect(yield* executeTool(registry, call({ url, format: "text" }))).toEqual({
         status: "error",
-        error: { type: "unknown", message: `StatusCode: non 2xx status code (403 GET ${url})` },
+        error: { type: "unknown", message: expect.stringContaining('"failureKind":"access_denied"') },
       })
       expect(requests).toHaveLength(1)
       expect(requests[0]?.headers["user-agent"]).toBe(webFetchUserAgent)
+    }),
+  )
+
+  it.effect("reports persistent Cloudflare verification without exposing cookies or page tokens", () =>
+    Effect.gen(function* () {
+      reset()
+      respond = () => Effect.succeed(new Response("secret-token", {
+        status: 403, headers: { "cf-mitigated": "challenge", "set-cookie": "private-cookie" },
+      }))
+      const registry = yield* Tool.Service
+      const result = yield* executeTool(registry, call({ url: "https://example.com/blocked" }))
+      const serialized = JSON.stringify(result)
+      expect(result).toMatchObject({ status: "error", error: {
+        message: expect.stringContaining('"suggestedAction":"browse_with_headed_playwright"'),
+      } })
+      expect(serialized).toContain("cf-mitigated: challenge")
+      expect(serialized).not.toContain("secret-token")
+      expect(serialized).not.toContain("private-cookie")
+      expect(requests).toHaveLength(2)
+    }),
+  )
+
+  it.effect("rejects HTTP 200 challenge pages but preserves ordinary articles discussing challenges", () =>
+    Effect.gen(function* () {
+      reset()
+      const registry = yield* Tool.Service
+      respond = () => Effect.succeed(new Response('<title>Just a moment...</title><script src="/cdn-cgi/challenge-platform/test"></script>', {
+        headers: { "content-type": "text/html" },
+      }))
+      expect(yield* executeTool(registry, call({ url: "https://example.com/challenge" }))).toMatchObject({
+        status: "error", error: { message: expect.stringContaining('"failureKind":"browser_challenge"') },
+      })
+      respond = () => Effect.succeed(new Response('<title>Cloudflare troubleshooting</title><article>Enable JavaScript and cookies to continue. /cdn-cgi/challenge-platform/</article>', {
+        headers: { "content-type": "text/html" },
+      }))
+      expect(yield* executeTool(registry, call({ url: "https://example.com/article" }))).toMatchObject({ status: "completed" })
+    }),
+  )
+
+  it.effect("diagnoses challenge headers without reading stalled bodies for both 403 and 200", () =>
+    Effect.gen(function* () {
+      const registry = yield* Tool.Service
+      for (const status of [403, 200]) {
+        reset()
+        let reads = 0
+        respond = () => Effect.succeed(new Response(new ReadableStream({
+          pull() {
+            reads++
+            return new Promise(() => {})
+          },
+        }, { highWaterMark: 0 }), { status, headers: { "cf-mitigated": "challenge" } }))
+        const result = yield* executeTool(registry, call({ url: "https://example.com/stalled-challenge" }))
+        expect(result.status).toBe("error")
+        expect(JSON.stringify(result)).toContain("browse_with_headed_playwright")
+        expect(reads).toBe(0)
+        expect(requests).toHaveLength(status === 403 ? 2 : 1)
+      }
+    }),
+  )
+
+  it.effect("keeps challenge evidence from oversized error-page prefixes without waiting for the tail", () =>
+    Effect.gen(function* () {
+      const registry = yield* Tool.Service
+      const html = '<title>Just a moment...</title><script>window._cf_chl_opt = {}</script>' + " ".repeat(64 * 1024)
+      for (const declared of [true, false]) {
+        reset()
+        let cancelled = false
+        respond = () => Effect.succeed(new Response(new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode(html.slice(0, 16)))
+            controller.enqueue(new TextEncoder().encode(html.slice(16)))
+            // Never close: a prefix reader must stop at its limit, not at EOF.
+          },
+          cancel() { cancelled = true },
+        }), { status: 403, headers: declared ? { "content-length": String(html.length) } : {} }))
+        const result = yield* executeTool(registry, call({ url: "https://example.com/large-challenge" }))
+        expect(result.status).toBe("error")
+        expect(JSON.stringify(result)).toContain("browse_with_headed_playwright")
+        expect(cancelled).toBe(true)
+        expect(requests).toHaveLength(1)
+      }
+    }),
+  )
+
+  it.effect("retains an error-page prefix when the remaining body fails", () =>
+    Effect.gen(function* () {
+      reset()
+      respond = () => Effect.succeed(new Response(new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('<title>Just a moment...</title><script>window._cf_chl_opt = {}</script>'))
+        },
+        pull(controller) { controller.error(new Error("Connection lost")) },
+      }, { highWaterMark: 0 }), { status: 403 }))
+      const registry = yield* Tool.Service
+      const result = yield* executeTool(registry, call({ url: "https://example.com/interrupted-challenge" }))
+      expect(result.status).toBe("error")
+      expect(JSON.stringify(result)).toContain("browse_with_headed_playwright")
+    }),
+  )
+
+  it.effect("preserves HTTP failures on body timeouts without misclassifying successful response timeouts", () =>
+    Effect.gen(function* () {
+      const registry = yield* Tool.Service
+      for (const status of [403, 200]) {
+        reset()
+        respond = () => Effect.succeed(new Response(new ReadableStream({
+          start(controller) { controller.enqueue(new TextEncoder().encode("partial body")) },
+        }), { status }))
+        const fiber = yield* executeTool(registry, call({ url: "https://example.com/slow-body", timeout: 1 })).pipe(Effect.forkChild)
+        yield* TestClock.adjust(Duration.seconds(1))
+        const result = yield* Fiber.join(fiber)
+        if (status === 403) {
+          expect(result.status).toBe("error")
+          expect(JSON.stringify(result)).toContain("access_denied")
+          expect(JSON.stringify(result)).not.toContain("Request timed out")
+          continue
+        }
+        expect(result).toEqual({ status: "error", error: { type: "unknown", message: "Request timed out" } })
+      }
     }),
   )
 

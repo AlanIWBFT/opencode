@@ -8,14 +8,11 @@ import { HttpClientError } from "effect/http"
 import { Form } from "../../form.js"
 import { Permission } from "../../permission.js"
 import { WebSearch } from "../../websearch.js"
+import { WebDiagnostic } from "../web-diagnostic.js"
 
 export const name = "websearch"
 export const NO_RESULTS = "No search results found. Please try a different query."
 const providerSelectionLock = Semaphore.makeUnsafe(1)
-const httpErrors = new Map([
-  [429, "Web search rate limited (HTTP 429)"],
-  [401, "Web search authentication failed (HTTP 401)"],
-])
 
 export const description = `Search the web using the user's selected search integration. Use this for current information beyond knowledge cutoff.
 
@@ -185,8 +182,11 @@ export const Plugin = {
                   message:
                     status === undefined
                       ? fallback
-                      : (httpErrors.get(status) ?? `Web search request failed (HTTP ${status})`),
-                  error,
+                      : WebDiagnostic.message(WebDiagnostic.diagnose({
+                          source: "search_provider", status,
+                          headers: HttpClientError.isHttpClientError(error.cause) ? error.cause.response?.headers ?? {} : {},
+                        })),
+                  error: status === undefined ? error : undefined,
                   metadata: { provider: error.providerID },
                 })
               }),
