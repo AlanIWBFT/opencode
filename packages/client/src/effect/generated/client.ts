@@ -515,6 +515,7 @@ const EndpointSessionPrompt = (raw: RawClient["server.session"]) => (input: Sess
       payload: {
         id: input["id"],
         text: input["text"],
+        context: input["context"],
         files: input["files"],
         agents: input["agents"],
         skills: input["skills"],
@@ -535,6 +536,7 @@ const EndpointSessionCommand = (raw: RawClient["server.session"]) => (input: Ses
       payload: {
         name: input["name"],
         text: input["text"],
+        context: input["context"],
         files: input["files"],
         agents: input["agents"],
         skills: input["skills"],

@@ -587,6 +587,13 @@ export type SessionPromptInput = {
   readonly sessionID: Session.ID
   readonly id?: SessionMessage.ID | undefined
   readonly text: string
+  readonly context?:
+    | ReadonlyArray<{
+        readonly text: string
+        readonly description?: string | undefined
+        readonly metadata?: { readonly [x: string]: Schema.Json } | undefined
+      }>
+    | undefined
   readonly files?: ReadonlyArray<PromptInput.FileAttachment> | undefined
   readonly agents?: ReadonlyArray<AgentAttachment> | undefined
   readonly skills?: ReadonlyArray<PromptInput.SkillAttachment> | undefined
@@ -601,6 +608,13 @@ export type SessionCommandInput = {
   readonly sessionID: Session.ID
   readonly name: string
   readonly text: string
+  readonly context?:
+    | ReadonlyArray<{
+        readonly text: string
+        readonly description?: string | undefined
+        readonly metadata?: { readonly [x: string]: Schema.Json } | undefined
+      }>
+    | undefined
   readonly files?: ReadonlyArray<PromptInput.FileAttachment> | undefined
   readonly agents?: ReadonlyArray<AgentAttachment> | undefined
   readonly skills?: ReadonlyArray<PromptInput.SkillAttachment> | undefined

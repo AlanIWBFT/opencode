@@ -730,6 +730,7 @@ export function make(options: ClientOptions) {
             body: {
               id: input["id"],
               text: input["text"],
+              context: input["context"],
               files: input["files"],
               agents: input["agents"],
               skills: input["skills"],
@@ -751,6 +752,7 @@ export function make(options: ClientOptions) {
             body: {
               name: input["name"],
               text: input["text"],
+              context: input["context"],
               files: input["files"],
               agents: input["agents"],
               skills: input["skills"],

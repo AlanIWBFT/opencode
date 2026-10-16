@@ -161,12 +161,12 @@ export const make = Effect.fn("Session.make")(function* () {
               Effect.provideService(FSUtil.Service, fs),
             ),
           )
-          // Commit a staged revert only after preparation succeeds, before admitting new work.
-          if (session.revert) yield* SessionRevert.commit(bus, session)
+          // Revert and admission commit together, only after preparation succeeds.
           return yield* admission.admit({
             id: messageID,
             sessionID: session.id,
             item,
+            revertTo: (yield* get(sessionID)).revert?.messageID,
           })
         }).pipe(
           Effect.catchTag("SessionInbox.LifecycleConflict", () => new PromptConflictError({ sessionID, messageID })),
