@@ -17,7 +17,7 @@ export function description(shell?: string, platform: NodeJS.Platform = process.
     "If a slot's shell state was lost, the next command automatically creates a new generation and reports that inherited shell state was reset.",
     "If a slot reports that its environment changed, retry with reset_lane=true; reset deliberately discards the old shell generation.",
     "Use poll_exec with the returned exec_id to collect more output.",
-    "Use write_stdin with the returned exec_id only when the current command is waiting for that exact input. Unconsumed input can be read by the slot protocol after the command exits.",
+    "Use write_stdin with the returned exec_id only when the current command is waiting for that exact input. Unconsumed input can interfere with later commands or the slot protocol.",
     "Use terminate_exec to stop a running execution and end its slot generation.",
     "Set tty=true when creating or resetting a slot for a REPL, Read-Host, or a full-screen terminal program.",
     "To switch an existing slot between non-TTY and TTY, pass the desired tty value and reset_lane=true in the same call. This discards its shell state; use another unused slot to preserve it. Omitting tty reuses the current mode; creating or resetting a slot defaults to tty=false.",
