@@ -22,7 +22,9 @@ export const description = `Open and inspect web pages. action=open (the default
 
 Use action=find with ref and a literal pattern to locate evidence and see surrounding context. Use action=read with ref, offset, and limit to expand a passage or continue reading. Read/find use the same captured text without another network request. Offsets are zero-based UTF-16 character positions; follow returned offsets. Search snippets are not complete pages: verify important claims against the captured text. Use a more targeted tool when available.
 
-HTTP failures include source, status, failureKind, evidence, and suggestedAction. When browser verification is detected, consider headed Playwright. A bare 403 does not establish a browser challenge. Detected challenge pages are not saved as article snapshots, even with HTTP 200.`
+HTTP failures include source, status, failureKind, evidence, and suggestedAction. A bare 403 does not establish a browser challenge. Detected challenge pages are not saved as article snapshots, even with HTTP 200.
+
+When needed, such as when a page requires login or blocks access with browser verification, use an available Web/browser tool (such as openchamber_web) to browse the page. If the page requires login in that tool, ask the user to sign in before continuing.`
 
 const Timeout = Schema.Finite.check(Schema.isGreaterThan(0), Schema.isLessThanOrEqualTo(MAX_TIMEOUT_SECONDS))
 
