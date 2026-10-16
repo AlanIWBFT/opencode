@@ -93,6 +93,21 @@ operations are read-only with respect to the source site. Extraction uses HTTP
 and does not execute JavaScript; the snapshot is the captured extraction, not a
 claim that every part of the site was rendered or preserved.
 
+HTTP failure messages carry JSON diagnostics (`source`, `status`, `failureKind`,
+`evidence`, `suggestedAction`). Target-page browser challenges suggest headed
+Playwright; ordinary 403 responses do not. Search-provider HTTP failures are
+identified separately and suggest checking the provider rather than treating a
+browser as an API repair. Evidence uses fixed strings, never raw response bodies
+or cookies. Cloudflare detection uses `cf-mitigated: challenge` or a challenge
+page title together with its challenge script marker; a recognized HTTP 200
+challenge is rejected before snapshot persistence. The existing one-time
+Cloudflare user-agent retry remains in place.
+Explicit challenge headers are diagnosed without reading the body. Other HTTP
+errors use at most the first 64 KiB of the body, retaining the prefix when the
+stream fails and stopping without waiting for the remainder. If this diagnostic
+read times out, the already received HTTP status and headers still determine the
+failure instead of being replaced with a generic request timeout.
+
 ## Windows Recycle Bin helper
 
 Persistent PowerShell filesystem deletion uses the protocol-2 helper under
