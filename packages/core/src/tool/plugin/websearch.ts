@@ -18,6 +18,8 @@ export const description = `Search the web using the user's selected search inte
 
 Describe the pages and evidence you want in natural language, especially with Exa. Optional search controls are currently supported by Exa; unsupported controls return an error rather than being ignored. Results are candidate sources, not verified claims. Open promising URLs with webfetch and verify context; refine the query when results do not answer the question.
 
+When needed, such as when a page requires login or blocks access with browser verification, use an available Web/browser tool (such as openchamber_web) to browse the page. If the page requires login in that tool, ask the user to sign in before continuing.
+
 The current year is ${new Date().getFullYear()}. Use this year when searching for recent information or current events.`
 
 export const Input = Schema.Struct({
