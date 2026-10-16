@@ -1,6 +1,23 @@
 import { Effect, Stream } from "effect"
 import { HttpClientResponse } from "effect/http"
 
+// Error-page diagnostics need a prefix, not an all-or-nothing download. Stop
+// consuming at the limit and retain received bytes if the remaining stream fails.
+export const collectResponsePrefix = (response: HttpClientResponse.HttpClientResponse, maximumBytes: number) =>
+  Effect.gen(function* () {
+    const body = Buffer.allocUnsafe(maximumBytes)
+    let size = 0
+    yield* Stream.runForEachWhile(response.stream, (chunk) =>
+      Effect.sync(() => {
+        const prefix = chunk.subarray(0, maximumBytes - size)
+        body.set(prefix, size)
+        size += prefix.byteLength
+        return size < maximumBytes
+      }),
+    ).pipe(Effect.catch(() => Effect.void))
+    return body.subarray(0, size)
+  })
+
 export const collectBoundedResponseBody = (
   response: HttpClientResponse.HttpClientResponse,
   maximumBytes: number,
