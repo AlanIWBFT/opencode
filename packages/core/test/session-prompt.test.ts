@@ -190,6 +190,95 @@ const assistantRow = (id: SessionMessage.ID, seq: number) => {
 }
 
 describe("Session.prompt", () => {
+  it.effect("delivers attached context with a resent prompt after committing its revert", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const session = yield* Session.Service
+      const { db } = yield* Database.Service
+      const bus = yield* Bus.Service
+      const context = [{ text: "Read the SSH memory", metadata: { source: "knowledge" } }]
+      const first = yield* session.prompt({ sessionID, text: "original", context, resume: false })
+      expect(yield* admittedCount).toBe(1)
+      yield* SessionInbox.promote(db, bus, sessionID, "input")
+      const original = yield* session.messages({ sessionID, order: "asc" })
+      expect(original.map((message) => message.type)).toEqual(["synthetic", "user"])
+      yield* session.revert.stage({ sessionID, messageID: original[0].id, files: false })
+      const resent = yield* session.prompt({ sessionID, text: "resent", context, delivery: "queue", resume: false })
+      expect((yield* session.get(sessionID)).revert).toBeUndefined()
+      expect(yield* session.messages({ sessionID })).toEqual([])
+      expect(yield* admittedCount).toBe(1)
+      expect(yield* SessionInbox.promote(db, bus, sessionID, "steer")).toBe(0)
+      yield* session.prompt({ sessionID, id: resent.id, text: "retry", context: [{ text: "wrong" }], resume: false })
+      yield* SessionInbox.promote(db, bus, sessionID, "input")
+      const delivered = yield* session.messages({ sessionID, order: "asc" })
+      expect(delivered.map((message) => message.type)).toEqual(["synthetic", "user"])
+      expect(delivered[0]).toMatchObject({ text: context[0].text, metadata: context[0].metadata })
+      expect(delivered[1]).toMatchObject({ id: resent.id, text: "resent" })
+      expect(delivered.some((message) => message.id === first.id)).toBe(false)
+      yield* session.prompt({ sessionID, id: resent.id, text: "retry after delivery", context, resume: false })
+      expect(yield* admittedCount).toBe(0)
+      expect((yield* session.messages({ sessionID })).length).toBe(2)
+    }),
+  )
+
+  it.effect("cancels and steers attached context through its owning inbox item", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const session = yield* Session.Service
+      const { db } = yield* Database.Service
+      const bus = yield* Bus.Service
+      const cancelled = yield* session.prompt({ sessionID, text: "cancel", context: [{ text: "cancelled context" }], delivery: "queue", resume: false })
+      yield* session.cancelInbox({ sessionID, inboxID: cancelled.id })
+      yield* SessionInbox.promote(db, bus, sessionID, "input")
+      expect(yield* session.messages({ sessionID })).toEqual([])
+      const steered = yield* session.prompt({ sessionID, text: "steer", context: [{ text: "kept context" }], delivery: "queue", resume: false })
+      yield* session.steerInbox({ sessionID, inboxID: steered.id })
+      yield* SessionInbox.promote(db, bus, sessionID, "steer")
+      expect((yield* session.messages({ sessionID, order: "asc" })).map((message) => message.type)).toEqual(["synthetic", "user"])
+      expect(yield* admittedCount).toBe(0)
+    }),
+  )
+
+  it.effect("keeps the revert and old history when prompt preparation fails", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const session = yield* Session.Service
+      const { db } = yield* Database.Service
+      const bus = yield* Bus.Service
+      const first = yield* session.prompt({ sessionID, text: "original", resume: false })
+      yield* SessionInbox.promote(db, bus, sessionID, "input")
+      yield* session.revert.stage({ sessionID, messageID: first.id, files: false })
+      const result = yield* session.prompt({ sessionID, text: "invalid", context: [{ text: "must not leak" }], files: [{ uri: "unsupported://file" }], resume: false }).pipe(Effect.result)
+      expect(result._tag).toBe("Failure")
+      expect((yield* session.get(sessionID)).revert?.messageID).toBe(first.id)
+      expect(yield* admittedCount).toBe(0)
+      yield* session.revert.clear(sessionID)
+      expect((yield* session.messages({ sessionID })).map((message) => message.id)).toEqual([first.id])
+    }),
+  )
+
+  it.effect("rolls back revert commit when admission fails", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const session = yield* Session.Service
+      const { db } = yield* Database.Service
+      const bus = yield* Bus.Service
+      const first = yield* session.prompt({ sessionID, text: "original", resume: false })
+      yield* SessionInbox.promote(db, bus, sessionID, "input")
+      yield* session.revert.stage({ sessionID, messageID: first.id, files: false })
+      yield* bus.project(SessionEvent.InboxEnqueued, (event) =>
+        event.data.item.type === "user" && event.data.item.payload.text === "rejected"
+          ? Effect.die(new Error("admission failed"))
+          : Effect.void,
+      )
+      const exit = yield* session.prompt({ sessionID, text: "rejected", context: [{ text: "must not leak" }], resume: false }).pipe(Effect.exit)
+      expect(exit._tag).toBe("Failure")
+      expect((yield* session.get(sessionID)).revert?.messageID).toBe(first.id)
+      expect((yield* session.messages({ sessionID })).map((message) => message.id)).toEqual([first.id])
+      expect(yield* admittedCount).toBe(0)
+    }),
+  )
+
   it.effect("exposes the execution registry", () =>
     Effect.gen(function* () {
       const session = yield* Session.Service
@@ -457,6 +546,8 @@ describe("Session.prompt", () => {
       yield* setup
       const { db } = yield* Database.Service
       const mediaSessionID = Session.ID.make("ses_prompt_media")
+      const session = yield* Session.Service
+      const bus = yield* Bus.Service
       yield* db
         .insert(SessionTable)
         .values({
@@ -471,9 +562,10 @@ describe("Session.prompt", () => {
         .pipe(Effect.orDie)
       const bytes = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
 
-      const message = yield* (yield* Session.Service).prompt({
+      const message = yield* session.prompt({
         sessionID: mediaSessionID,
         text: "Inspect this image",
+        context: [{ text: "Attached image context", metadata: { source: "knowledge" } }],
         files: [{ uri: `data:image/png;base64,${bytes}` }],
         resume: false,
       })
@@ -490,6 +582,17 @@ describe("Session.prompt", () => {
       expect(yield* db.select().from(BlobRefTable).all().pipe(Effect.orDie)).toEqual([
         { session_id: mediaSessionID, message_id: message.id, seq: expect.any(Number), hash },
       ])
+      yield* SessionInbox.promote(db, bus, mediaSessionID, "input")
+      const hydrated = yield* session.messages({ sessionID: mediaSessionID, order: "asc" })
+      const refs = yield* session.messagesWithRefs({ sessionID: mediaSessionID, order: "asc" })
+      expect(hydrated.map((item) => item.type)).toEqual(["synthetic", "user"])
+      expect(hydrated[0]).toMatchObject({ text: "Attached image context", metadata: { source: "knowledge" } })
+      expect(hydrated[1]).toMatchObject({ id: message.id, files: [{ data: bytes, mime: "image/png" }] })
+      expect(refs[1]).toMatchObject({ id: message.id, files: [{ uri: SessionStored.ref(hash!), mime: "image/png" }] })
+      expect(hydrated.map((item) => item.seq)).toEqual(refs.map((item) => item.seq))
+      expect(hydrated[1].seq).toBeGreaterThan(hydrated[0].seq)
+      expect(yield* session.message({ sessionID: mediaSessionID, messageID: message.id })).toEqual(hydrated[1])
+      expect(yield* session.messageWithRefs({ sessionID: mediaSessionID, messageID: message.id })).toEqual(refs[1])
     }),
   )
 
