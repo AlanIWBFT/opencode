@@ -14,13 +14,121 @@ import { tempLocationLayer } from "./fixture/location"
 import { testEffect } from "./lib/effect"
 
 const it = testEffect(
-  AppNodeBuilder.build(LayerNode.group([ExecSession.node, ExecSessionControl.node, Session.node, Location.node, LocationLifecycle.node]), [
-    Location.node.replace(tempLocationLayer),
-    SessionExecution.node.replace(SessionExecution.noopLayer),
-  ]),
+  AppNodeBuilder.build(
+    LayerNode.group([ExecSession.node, ExecSessionControl.node, Session.node, Location.node, LocationLifecycle.node]),
+    [Location.node.replace(tempLocationLayer), SessionExecution.node.replace(SessionExecution.noopLayer)],
+  ),
 )
 const shell = process.platform === "win32" ? Bun.which("pwsh") : null
 const windowsTest = shell ? it.live : it.live.skip
+
+for (const tty of [false, true]) {
+  windowsTest(
+    `PowerShell control pipe preserves execution state and resets its ${tty ? "TTY" : "pipe"} generation`,
+    () =>
+      Effect.gen(function* () {
+        const location = yield* Location.Service
+        const sessions = yield* Session.Service
+        const executions = yield* ExecSession.Service
+        const session = yield* sessions.create({ location: { directory: location.directory } })
+        const invocation: ExecSession.Invocation = {
+          sessionID: session.id,
+          messageID: SessionMessage.ID.create(),
+          display: "root",
+          metadata: () => Effect.void,
+        }
+        const pluginEnv = { OPENCODE_PIPE_PLUGIN: "initial" }
+        const launch = (command: string, resetLane = false, yieldTimeMs = 5000) =>
+          executions.launch({
+            command,
+            shell: shell!,
+            cwd: location.directory,
+            env: Object.fromEntries(
+              Object.entries(process.env).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
+            ),
+            invocation,
+            tty,
+            resetLane,
+            yieldTimeMs,
+            prepare: () =>
+              Effect.succeed({ script: persistentShellScript(shell!, { command }), env: { ...pluginEnv } }),
+          })
+        const first = yield* launch(
+          "$retained = '你好'; $env:OPENCODE_PIPE_STATE = 'kept'; $env:OPENCODE_PIPE_PLUGIN = 'changed-in-shell'; function Get-Retained { 'function' }; Set-Location $env:TEMP; exit 17",
+        )
+        expect(first.error).toBeUndefined()
+        expect(first.exitCode).toBe(17)
+        const second = yield* launch(
+          `Write-Output ($retained + ':' + $env:OPENCODE_PIPE_STATE + ':' + (Get-Retained)); Write-Output $env:OPENCODE_PIPE_PLUGIN; # ${"large command ".repeat(20_000)}\n[Console]::Write(('x' * 16000) + 'output-tail')`,
+          false,
+          100,
+        )
+        let output = second.output
+        let last = second
+        while (last.running) {
+          last = yield* executions.write({ execID: second.execID!, invocation, yieldTimeMs: 5000 })
+          output += last.output
+        }
+        expect(last.error).toBeUndefined()
+        expect(last.exitCode).toBe(0)
+        expect(output).toContain("你好:kept:function")
+        expect(output).toContain("changed-in-shell")
+        expect(output).toContain("output-tail")
+        expect(first.metadata.cwd).toBeDefined()
+        expect(last.metadata.cwd).toBe(first.metadata.cwd)
+        expect(last.metadata.shellGeneration).toBe(first.metadata.shellGeneration)
+        expect(last.metadata.shellReused).toBe(true)
+        pluginEnv.OPENCODE_PIPE_PLUGIN = "replacement"
+        const rejected = yield* launch("Write-Output 'must-not-run'")
+        expect(rejected.error).toContain("environment changed")
+        const reset = yield* launch(
+          "Write-Output ('fresh:' + ($null -eq $retained) + ':' + ($null -eq $env:OPENCODE_PIPE_STATE)); Write-Output $env:OPENCODE_PIPE_PLUGIN",
+          true,
+        )
+        expect(reset.output).toContain("fresh:True:True")
+        expect(reset.output).toContain("replacement")
+        expect(reset.metadata.shellGeneration).toBe(first.metadata.shellGeneration! + 1)
+        expect(reset.metadata.cwd?.toLowerCase()).toBe(location.directory.toLowerCase())
+        if (tty) {
+          const input = yield* launch(
+            "Write-Output 'input-ready'; $key = [Console]::ReadKey($true); Write-Output ('key:' + $key.KeyChar)",
+            false,
+            200,
+          )
+          expect(input.running).toBe(true)
+          const reply = yield* executions.write({ execID: input.execID!, invocation, chars: "k", yieldTimeMs: 5000 })
+          expect(reply.running).toBe(false)
+          expect(reply.output).toContain("key:k")
+          const running = yield* launch("ping.exe -t 127.0.0.1", false, 500)
+          expect(running.running).toBe(true)
+          const interrupted = yield* executions.write({
+            execID: running.execID!,
+            invocation,
+            chars: "\x03",
+            yieldTimeMs: 5000,
+          })
+          expect(interrupted.running).toBe(false)
+        } else {
+          const input = yield* launch("$text = [Console]::In.ReadToEnd(); Write-Output ('eof:' + $text)", false, 100)
+          expect(input.running).toBe(true)
+          const reply = yield* executions.write({
+            execID: input.execID!,
+            invocation,
+            chars: "stdin-data",
+            closeStdin: true,
+            yieldTimeMs: 5000,
+          })
+          expect(reply.running).toBe(false)
+          expect(reply.output).toContain("eof:stdin-data")
+        }
+        const final = yield* launch("Write-Output 'next-command'")
+        expect(final.exitCode).toBe(0)
+        expect(final.output).toContain("next-command")
+        yield* sessions.stop(session.id)
+      }),
+    { timeout: 40_000 },
+  )
+}
 
 it.live("exec refuses a launch after its own location lifecycle shuts down", () =>
   Effect.gen(function* () {
@@ -45,6 +153,50 @@ it.live("exec refuses a launch after its own location lifecycle shuts down", () 
     })
     expect(result.error).toContain("execution workspace has closed")
   }),
+)
+
+windowsTest(
+  "PowerShell control pipe releases failed generations and retries with fresh state",
+  () =>
+    Effect.gen(function* () {
+      const location = yield* Location.Service
+      const sessions = yield* Session.Service
+      const executions = yield* ExecSession.Service
+      const session = yield* sessions.create({ location: { directory: location.directory } })
+      const launch = (command: string, failure?: "bootstrap" | "request") =>
+        executions.launch({
+          command,
+          shell: shell!,
+          cwd: location.directory,
+          env: {},
+          resetLane: failure !== undefined,
+          failLaneBootstrap: failure === "bootstrap",
+          failLaneRequest: failure === "request",
+          bootstrapTimeoutMs: failure === "bootstrap" ? 250 : 5000,
+          invocation: {
+            sessionID: session.id,
+            messageID: SessionMessage.ID.create(),
+            display: "root",
+            metadata: () => Effect.void,
+          },
+          prepare: () => Effect.succeed({ script: persistentShellScript(shell!, { command }) }),
+        })
+      expect((yield* launch("$retained = 'old-state' ")).exitCode).toBe(0)
+      expect((yield* launch("Write-Output 'must-not-run'", "bootstrap")).error).toContain(
+        "could not initialize persistent shell",
+      )
+      const recovered = yield* launch("Write-Output ('fresh:' + ($null -eq $retained))")
+      expect(recovered.output).toContain("fresh:True")
+      expect(recovered.warning).toContain("recreated")
+      expect((yield* launch("Write-Output 'must-not-run'", "request")).error).toContain(
+        "command transport is unavailable",
+      )
+      const retried = yield* launch("Write-Output 'recovered-again'")
+      expect(retried.exitCode).toBe(0)
+      expect(retried.output).toContain("recovered-again")
+      yield* sessions.stop(session.id)
+    }),
+  { timeout: 30_000 },
 )
 
 windowsTest(
@@ -185,6 +337,7 @@ Write-Output 'ready'
 $options = Get-PSReadLineOption
 Write-Output ('history-style:' + $options.HistorySaveStyle)
 Write-Output ('history-directory:' + [IO.Path]::GetFileName([IO.Path]::GetDirectoryName($options.HistorySavePath)))
+Write-Output ('lane-directory-exists:' + [IO.Directory]::Exists([IO.Path]::GetDirectoryName($options.HistorySavePath)))
 $history = if (Test-Path -LiteralPath $options.HistorySavePath) { [IO.File]::ReadAllText($options.HistorySavePath) } else { '' }
 Write-Output ('history-internal:' + $history.Contains('__opencode_run_'))`)
       expect(first.error).toBeUndefined()
@@ -192,6 +345,7 @@ Write-Output ('history-internal:' + $history.Contains('__opencode_run_'))`)
       expect(first.output).toContain("ready")
       expect(first.output).toContain("history-style:SaveNothing")
       expect(first.output).toContain("history-directory:opencode-lane-")
+      expect(first.output).toContain("lane-directory-exists:False")
       expect(first.output).toContain("history-internal:False")
       const read = yield* launch("Write-Output $retained; Write-Output ('reply:' + (Read-Host 'input'))", 200)
       expect(read.running).toBe(true)

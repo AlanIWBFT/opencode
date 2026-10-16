@@ -8,6 +8,7 @@ import { Environment } from "../environment/index.js"
 import { SessionStore } from "../session/store.js"
 import { SessionExecPresentation } from "../session/exec-presentation.js"
 import { ExecSessionControl } from "./exec-session/control.js"
+import { ExecPipe } from "./exec-session/pipe.js"
 import { Pty } from "../pty.js"
 import { Cause, Context, Deferred, Effect, Exit, Layer, Queue, Scope, Semaphore, Stream } from "effect"
 import { ChildProcess } from "effect/process"
@@ -19,7 +20,9 @@ import {
   persistentShellArgs,
   persistentShellBootstrapFrame,
   persistentShellBootstrapRequest,
+  persistentShellControlPipe,
   persistentShellExtension,
+  persistentShellPipeArgs,
   persistentShellRequest,
   persistentShellRunnerScript,
   persistentShellSupported,
@@ -215,6 +218,7 @@ type Lane = {
   nonce: string
   tempDir: string
   runnerFile: string
+  controlPipe?: ExecPipe.Channel
   bootstrap: {
     ready: boolean
     output: string
@@ -367,6 +371,7 @@ const layer = Layer.effect(
             yield* Deferred.await(lane.releaseDone)
           } else {
             lane.resourcesReleased = true
+            lane.controlPipe?.close()
             if (lane.transport.type === "pipe") {
               yield* Scope.close(lane.transport.scope, Exit.void).pipe(Effect.ignore)
             } else {
@@ -495,7 +500,7 @@ const layer = Layer.effect(
       state: State,
       input: LaunchInput,
       processStarted: number,
-      details: { id: number; lane: Lane; reused: boolean; commandFile: string; statusFile: string },
+      details: { id: number; lane: Lane; reused: boolean; commandFile?: string; statusFile?: string },
     ): Entry {
       return {
         execID: details.id,
@@ -801,9 +806,18 @@ const layer = Layer.effect(
         const output = terminal ? withoutProtocolNewline(before) : before
         if (output && lane.commandStarted) append(active, output)
         const statusFile = active.statusFile
-        const cwd = statusFile
-          ? yield* Effect.promise(() => Bun.file(statusFile).text()).pipe(Effect.catch(() => Effect.succeed(undefined)))
-          : undefined
+        // The IPC status and terminal output have independent delivery order. Commit only after both arrive;
+        // the stdout done frame remains the authoritative end of the command's output.
+        const cwd = lane.controlPipe
+          ? yield* Effect.promise(() => lane.controlPipe!.completion(active.execID)).pipe(
+              Effect.timeout("5 seconds"),
+              Effect.catch(() => Effect.succeed(undefined)),
+            )
+          : statusFile
+            ? yield* Effect.promise(() => Bun.file(statusFile).text()).pipe(
+                Effect.catch(() => Effect.succeed(undefined)),
+              )
+            : undefined
         const completed = payload.startsWith(terminal ? "d:" : "done:")
         const completionPayload = payload.slice(terminal ? 2 : 5)
         const completion = completed && cwd !== undefined ? parseLaneCompletion(completionPayload, cwd) : undefined
@@ -1021,6 +1035,7 @@ const layer = Layer.effect(
       const nonce = crypto.randomUUID().replaceAll("-", "")
       const tty = input.tty ?? false
       const extension = persistentShellExtension(input.shell)
+      const pipeName = persistentShellControlPipe(input.shell) ? `opencode-lane-${nonce}` : undefined
       const environment = mergeEnvironment(input.env, pluginEnv)
       if (process.platform === "linux") {
         // -p blocks Bash's option/function inheritance; keep nested shells and history quiet too.
@@ -1031,14 +1046,19 @@ const layer = Layer.effect(
       }
       let tempDir: string | undefined
       let lane: Lane | undefined
+      let controlPipe: ExecPipe.Channel | undefined
       return yield* Effect.uninterruptibleMask((restore) =>
         Effect.gen(function* () {
           if (extension === "cmd" && os.tmpdir().includes("%")) {
             return "could not prepare persistent shell: cmd temporary paths cannot contain percent signs"
           }
-          const created = yield* Effect.promise(() => mkdtemp(path.join(os.tmpdir(), "opencode-lane-"))).pipe(
-            Effect.exit,
-          )
+          // Pipe lanes only reserve a path for isolated TTY history. SaveNothing does not create it;
+          // keep the path owned by the generation in case a command explicitly enables history saving.
+          const created = yield* (
+            pipeName
+              ? Effect.succeed(path.join(os.tmpdir(), pipeName))
+              : Effect.promise(() => mkdtemp(path.join(os.tmpdir(), "opencode-lane-")))
+          ).pipe(Effect.exit)
           if (Exit.isFailure(created)) {
             const error = Cause.squash(created.cause)
             return `could not prepare persistent shell: ${error instanceof Error ? error.message : String(error)}`
@@ -1055,19 +1075,28 @@ const layer = Layer.effect(
           const runnerFile = path.join(tempDir, `runner.${extension}`)
           const bootstrapEnv = extension === "cmd" && tty ? `OPENCODE_CMD_BOOTSTRAP_${nonce.toUpperCase()}` : undefined
           if (bootstrapEnv) environment[bootstrapEnv] = `"${runnerFile.replaceAll('"', '""')}" --bootstrap`
-          const args = persistentShellArgs(input.shell, tty, runnerFile, bootstrapEnv)
+          const args = pipeName
+            ? persistentShellPipeArgs(pipeName)
+            : persistentShellArgs(input.shell, tty, runnerFile, bootstrapEnv)
+          const source = input.failLaneBootstrap
+            ? ""
+            : persistentShellRunnerScript(input.shell, {
+                nonce,
+                tty,
+                controlPipe: Boolean(pipeName),
+                historyDirectory: tempDir,
+              })
           const runner = yield* restore(
-            Effect.promise((signal) =>
-              writeFile(
-                runnerFile,
-                input.failLaneBootstrap ? "" : persistentShellRunnerScript(input.shell, { nonce, tty }),
-                {
-                  flag: "wx",
-                  mode: 0o600,
-                  signal,
-                },
-              ),
-            ),
+            pipeName
+              ? Effect.promise(async () => {
+                  controlPipe = await ExecPipe.open(pipeName, source, () => {
+                    if (!lane || lane.resourcesReleased) return
+                    lane.state = "lost"
+                    lane.lostReason ??= "shell control pipe disconnected"
+                    void runPromise(killLaneTransport(lane))
+                  })
+                }).pipe(Effect.uninterruptible)
+              : Effect.promise((signal) => writeFile(runnerFile, source, { flag: "wx", mode: 0o600, signal })),
           ).pipe(Effect.exit)
           if (Exit.isFailure(runner)) {
             if (Cause.hasInterrupts(runner.cause)) return yield* Effect.failCause(runner.cause)
@@ -1106,6 +1135,7 @@ const layer = Layer.effect(
             nonce,
             tempDir,
             runnerFile,
+            controlPipe,
             bootstrap: {
               ready: false,
               output: "",
@@ -1166,7 +1196,7 @@ const layer = Layer.effect(
           } else {
             yield* restore(attachPtyOutput(state, lane))
           }
-          const bootstrap = persistentShellBootstrapRequest(input.shell, runnerFile, tty)
+          const bootstrap = controlPipe ? undefined : persistentShellBootstrapRequest(input.shell, runnerFile, tty)
           if (bootstrap && !(yield* restore(writeLaneTransport(lane, [bootstrap], false)))) {
             lane.lostReason = "shell stdin is unavailable"
             return `could not initialize persistent shell: ${lane.lostReason}`
@@ -1189,17 +1219,16 @@ const layer = Layer.effect(
           }
           return lane
         }).pipe(
-          Effect.onExit((result) =>
-            Exit.isSuccess(result) && typeof result.value !== "string"
-              ? Effect.void
-              : lane
-                ? cleanupLane(state, lane)
-                : tempDir
-                  ? Effect.promise(() =>
-                      rm(tempDir!, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }),
-                    ).pipe(Effect.catchCause(() => Effect.void))
-                  : Effect.void,
-          ),
+          Effect.onExit((result) => {
+            if (Exit.isSuccess(result) && typeof result.value !== "string") return Effect.void
+            if (lane) return cleanupLane(state, lane)
+            controlPipe?.close()
+            return tempDir
+              ? Effect.promise(() =>
+                  rm(tempDir!, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }),
+                ).pipe(Effect.catchCause(() => Effect.void))
+              : Effect.void
+          }),
         ),
       )
     })
@@ -1295,12 +1324,14 @@ const layer = Layer.effect(
 
             const token = crypto.randomUUID()
             const extension = persistentShellExtension(input.shell)
-            const commandFile = path.join(created.tempDir, `command-${token}.${extension}`)
-            const statusFile = path.join(created.tempDir, `status-${token}.cwd`)
-            files = [commandFile, statusFile]
+            const commandFile = created.controlPipe
+              ? undefined
+              : path.join(created.tempDir, `command-${token}.${extension}`)
+            const statusFile = created.controlPipe ? undefined : path.join(created.tempDir, `status-${token}.cwd`)
+            files = [commandFile, statusFile].filter((file): file is string => file !== undefined)
             const written = yield* Effect.promise(async (signal) => {
-              await writeFile(commandFile, prepared.script, { flag: "wx", mode: 0o600, signal })
-              await writeFile(statusFile, "", { flag: "wx", mode: 0o600, signal })
+              if (commandFile) await writeFile(commandFile, prepared.script, { flag: "wx", mode: 0o600, signal })
+              if (statusFile) await writeFile(statusFile, "", { flag: "wx", mode: 0o600, signal })
             }).pipe(Effect.exit)
             if (Exit.isFailure(written)) {
               yield* cleanupLane(state, created)
@@ -1347,20 +1378,30 @@ const layer = Layer.effect(
                     created.stdinReleased = false
                     created.stdinPending = []
                     created.stdinClosePending = false
-                    const request = persistentShellRequest(input.shell, {
-                      executionID: entry.execID,
-                      commandFile,
-                      runnerFile: created.runnerFile,
-                      statusFile,
-                      nonce: created.nonce,
-                      tty: created.tty,
-                      cwd: input.laneCwd,
-                    })
-                    if (input.failLaneRequest || !(yield* writeLaneTransport(created, [request], false))) {
+                    const sent =
+                      !input.failLaneRequest &&
+                      (created.controlPipe
+                        ? yield* Effect.promise(() => created.controlPipe!.request(entry.execID, prepared.script))
+                        : yield* writeLaneTransport(
+                            created,
+                            [
+                              persistentShellRequest(input.shell, {
+                                executionID: entry.execID,
+                                commandFile: commandFile!,
+                                runnerFile: created.runnerFile,
+                                statusFile: statusFile!,
+                                nonce: created.nonce,
+                                tty: created.tty,
+                                cwd: input.laneCwd,
+                              }),
+                            ],
+                            false,
+                          ))
+                    if (!sent) {
                       created.active = undefined
                       created.state = "lost"
-                      created.lostReason = "shell stdin is unavailable"
-                      return `lane slot ${laneID} stdin is unavailable`
+                      created.lostReason = "shell command transport is unavailable"
+                      return `lane slot ${laneID} command transport is unavailable`
                     }
                     preparation.slot.generation = created.generation
                     preparation.slot.committed = { type: "live", lane: created }
