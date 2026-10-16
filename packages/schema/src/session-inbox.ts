@@ -3,7 +3,7 @@ export * as SessionInbox from "./session-inbox.js"
 import { Schema } from "effect"
 import { Location } from "./location.js"
 import { Project } from "./project.js"
-import { Attachment, Prompt } from "./prompt.js"
+import { Attachment, Context, Prompt } from "./prompt.js"
 import { DateTimeUtcFromMillis, optional, RelativePath } from "./schema.js"
 import { SessionID } from "./session-id.js"
 import { SessionMessage } from "./session-message.js"
@@ -14,6 +14,7 @@ export type Delivery = typeof Delivery.Type
 export interface UserPayload extends Schema.Schema.Type<typeof UserPayload> {}
 export const UserPayload = Schema.Struct({
   ...Prompt.fields,
+  context: Schema.Array(Context).pipe(optional),
   metadata: Schema.Record(Schema.String, Schema.Unknown).pipe(optional),
 }).annotate({ identifier: "Session.Inbox.UserPayload" })
 

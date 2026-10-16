@@ -12,6 +12,7 @@ export const execute = Effect.fn("SessionCommand.execute")(function* (input: {
   session: Session.Info
   command: string
   text: string
+  context?: PromptInput.Prompt["context"]
   files?: PromptInput.Prompt["files"]
   agents?: PromptInput.Prompt["agents"]
   skills?: PromptInput.Prompt["skills"]
@@ -27,6 +28,7 @@ export const execute = Effect.fn("SessionCommand.execute")(function* (input: {
         sessionID: input.session.id,
         prompt: {
           text: input.text,
+          context: input.context,
           files: input.files,
           agents: input.agents,
           skills: input.skills,

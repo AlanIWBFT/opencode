@@ -3,6 +3,14 @@ import { optional } from "./schema.js"
 import { statics } from "./schema.js"
 import { Skill } from "./skill.js"
 
+/** Background delivered immediately before its owning user prompt. */
+export interface Context extends Schema.Schema.Type<typeof Context> {}
+export const Context = Schema.Struct({
+  text: Schema.String,
+  description: Schema.String.pipe(optional),
+  metadata: Schema.Record(Schema.String, Schema.Json).pipe(optional),
+}).annotate({ identifier: "Prompt.Context" })
+
 export interface PromptMention extends Schema.Schema.Type<typeof PromptMention> {}
 export const PromptMention = Schema.Struct({
   start: Schema.Finite,
