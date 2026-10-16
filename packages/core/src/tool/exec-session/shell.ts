@@ -28,6 +28,31 @@ export function persistentShellPosix(shell: string) {
   return ["bash", "dash", "ksh", "sh", "zsh"].includes(ShellSelect.name(shell))
 }
 
+export function persistentShellControlPipe(shell: string) {
+  return process.platform === "win32" && ShellSelect.ps(shell)
+}
+
+export function persistentShellPipeArgs(name: string) {
+  // Only this fixed loader is on the process command line. Runner and command sources arrive over IPC.
+  return [
+    "-NoProfile",
+    "-Command",
+    String.raw`
+$ErrorActionPreference = 'Stop'
+$__opencodeControl = [IO.Pipes.NamedPipeClientStream]::new('.', ${powershellQuote(name)}, [IO.Pipes.PipeDirection]::InOut)
+try {
+  $__opencodeControl.Connect(5000)
+  $__opencodeControlReader = [IO.BinaryReader]::new($__opencodeControl, [Text.Encoding]::UTF8, $true)
+  $__opencodeControlWriter = [IO.BinaryWriter]::new($__opencodeControl, [Text.Encoding]::UTF8, $true)
+  $__opencodeBootstrapLength = $__opencodeControlReader.ReadInt32()
+  $__opencodeBootstrapBytes = $__opencodeControlReader.ReadBytes($__opencodeBootstrapLength)
+  if ($__opencodeBootstrapBytes.Length -ne $__opencodeBootstrapLength) { throw 'incomplete shell bootstrap' }
+  . ([ScriptBlock]::Create([Text.Encoding]::UTF8.GetString($__opencodeBootstrapBytes)))
+} finally { $__opencodeControl.Dispose() }
+`,
+  ]
+}
+
 export function persistentShellArgs(shell: string, tty: boolean, runnerFile: string, bootstrapEnv?: string) {
   const name = ShellSelect.name(shell)
   // A script operand keeps Bash non-interactive on a PTY; pipe stdin can be a socket, so use -s there.
@@ -103,7 +128,10 @@ export function persistentShellBootstrapFrame(nonce: string, tty: boolean) {
   return tty ? `OC${nonce}:b:CO` : `\x1e${nonce}:bootstrap\x1f`
 }
 
-export function persistentShellRunnerScript(shell: string, input: { nonce: string; tty: boolean }) {
+export function persistentShellRunnerScript(
+  shell: string,
+  input: { nonce: string; tty: boolean; controlPipe?: boolean; historyDirectory?: string },
+) {
   const name = ShellSelect.name(shell)
   const runner = persistentShellRunnerName(input.nonce)
   const bootstrap = persistentShellBootstrapFrame(input.nonce, input.tty)
@@ -143,7 +171,7 @@ export function persistentShellRunnerScript(shell: string, input: { nonce: strin
   $__opencodePSReadLine = @(Microsoft.PowerShell.Core\Get-Module -Name PSReadLine -ListAvailable -ErrorAction Stop)[0]
   if ($null -ne $__opencodePSReadLine) {
     $null = Microsoft.PowerShell.Core\Import-Module -Name PSReadLine -PassThru -ErrorAction Stop
-    PSReadLine\Set-PSReadLineOption -HistorySavePath ([IO.Path]::Combine($PSScriptRoot, 'PSReadLine_history.txt')) -HistorySaveStyle SaveNothing -ErrorAction Stop
+    PSReadLine\Set-PSReadLineOption -HistorySavePath ([IO.Path]::Combine(${input.historyDirectory ? powershellQuote(input.historyDirectory) : "$PSScriptRoot"}, 'PSReadLine_history.txt')) -HistorySaveStyle SaveNothing -ErrorAction Stop
   }
 } catch {
   [Console]::Error.WriteLine('could not isolate PSReadLine history: ' + $_.Exception.GetBaseException().Message)
@@ -159,7 +187,7 @@ export function persistentShellRunnerScript(shell: string, input: { nonce: strin
     const ready = powershellQuote(bootstrap)
     return String.raw`${POWERSHELL_UTF8_PRELUDE}
 ${history}
-$global:${session} = Microsoft.PowerShell.Core\New-Module -ScriptBlock {}
+$global:${session} = Microsoft.PowerShell.Core\New-Module -ScriptBlock {${input.controlPipe ? " $ErrorActionPreference = 'Continue' " : ""}}
 $global:${errorWriter} = [IO.StreamWriter]::new([Console]::OpenStandardOutput(), $__opencodeUtf8)
 $global:${errorWriter}.AutoFlush = $true
 [Console]::SetError($global:${errorWriter})
@@ -167,8 +195,11 @@ $global:${errorWriter}.AutoFlush = $true
 function global:${runner} {
   param(
     [Parameter(Mandatory = $true)] [int] $ExecutionID,
-    [Parameter(Mandatory = $true)] [string] $CommandFile,
-    [Parameter(Mandatory = $true)] [string] $StatusFile
+    ${
+      input.controlPipe
+        ? "[AllowEmptyString()] [string] $Source"
+        : "[Parameter(Mandatory = $true)] [string] $CommandFile,\n    [Parameter(Mandatory = $true)] [string] $StatusFile"
+    }
   )
   $__opencodeStdout = [Console]::OpenStandardOutput()
   $__opencodeStart = $__opencodeUtf8.GetBytes(${start} + $ExecutionID + ${startEnd})
@@ -177,7 +208,7 @@ function global:${runner} {
   $__opencodeExecCode = 0
   $__opencodeExecError = $null
   try {
-    $__opencodeExecSource = [IO.File]::ReadAllText($CommandFile, $__opencodeUtf8)
+    $__opencodeExecSource = ${input.controlPipe ? "$Source" : "[IO.File]::ReadAllText($CommandFile, $__opencodeUtf8)"}
     $__opencodeExecSource = '$global:LASTEXITCODE = $null' + [Environment]::NewLine + 'try {' + [Environment]::NewLine + $__opencodeExecSource + [Environment]::NewLine + '} finally {' + [Environment]::NewLine + '$script:__opencodeExecSuccess = $?' + [Environment]::NewLine + '$script:__opencodeExecNative = $global:LASTEXITCODE' + [Environment]::NewLine + '}' + [Environment]::NewLine + '$script:__opencodeExecCompleted = $true'
     $global:${session}.SessionState.PSVariable.Remove('__opencodeExecSuccess')
     $global:${session}.SessionState.PSVariable.Remove('__opencodeExecNative')
@@ -212,6 +243,7 @@ function global:${runner} {
   ${POWERSHELL_UTF8_PRELUDE}
   if ($null -ne $__opencodeExecError) { [Console]::Error.WriteLine($__opencodeExecError) }
   $__opencodeStatusError = $null
+  $__opencodeExecCwd = ''
   try {
     $__opencodeLocation = $global:${session}.SessionState.Path.CurrentLocation
     if ($null -eq $__opencodeLocation.Provider -or $__opencodeLocation.Provider.Name -ne 'FileSystem') {
@@ -219,12 +251,21 @@ function global:${runner} {
     }
     $__opencodeExecCwd = [string] $__opencodeLocation.ProviderPath
     if ([string]::IsNullOrEmpty($__opencodeExecCwd)) { throw 'persistent shell returned an empty FileSystem path' }
-    [IO.File]::WriteAllText($StatusFile, $__opencodeExecCwd, $__opencodeUtf8)
+    ${input.controlPipe ? "" : "[IO.File]::WriteAllText($StatusFile, $__opencodeExecCwd, $__opencodeUtf8)"}
   } catch {
     $__opencodeStatusError = [string] $_
     $__opencodeExecCode = 1
   }
   if ($null -ne $__opencodeStatusError) { [Console]::Error.WriteLine($__opencodeStatusError) }
+  ${
+    input.controlPipe
+      ? String.raw`$__opencodeCwdBytes = $__opencodeUtf8.GetBytes($(if ($null -eq $__opencodeStatusError) { $__opencodeExecCwd } else { '' }))
+  $__opencodeControlWriter.Write([int](4 + $__opencodeCwdBytes.Length))
+  $__opencodeControlWriter.Write([int]$ExecutionID)
+  $__opencodeControlWriter.Write([byte[]]$__opencodeCwdBytes)
+  $__opencodeControlWriter.Flush()`
+      : ""
+  }
   $__opencodeDone = $__opencodeUtf8.GetBytes(${input.tty ? "[Environment]::NewLine + " : ""}${done} + $ExecutionID + ${doneMiddle} + $__opencodeExecCode + ${doneEnd})
   $__opencodeStdout.Write($__opencodeDone, 0, $__opencodeDone.Length)
   $__opencodeStdout.Flush()
@@ -233,6 +274,18 @@ $__opencodeBootstrap = $__opencodeUtf8.GetBytes(${ready})
 $__opencodeBootstrapOutput = [Console]::OpenStandardOutput()
 $__opencodeBootstrapOutput.Write($__opencodeBootstrap, 0, $__opencodeBootstrap.Length)
 $__opencodeBootstrapOutput.Flush()
+${
+  input.controlPipe
+    ? String.raw`while ($true) {
+  try { $__opencodeRequestLength = $__opencodeControlReader.ReadInt32() } catch [IO.EndOfStreamException] { break }
+  if ($__opencodeRequestLength -lt 4) { throw 'invalid shell request length' }
+  $__opencodeRequestID = $__opencodeControlReader.ReadInt32()
+  $__opencodeRequestBytes = $__opencodeControlReader.ReadBytes($__opencodeRequestLength - 4)
+  if ($__opencodeRequestBytes.Length -ne $__opencodeRequestLength - 4) { throw 'incomplete shell request' }
+  ${runner} $__opencodeRequestID ($__opencodeUtf8.GetString($__opencodeRequestBytes))
+}`
+    : ""
+}
 `
   }
   const variable = `__opencode_${input.nonce}`
