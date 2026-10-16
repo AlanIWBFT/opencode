@@ -7,8 +7,9 @@ import { HttpClient, type HttpClientError, HttpClientRequest, HttpClientResponse
 import { Parser } from "htmlparser2"
 import { Permission } from "../../permission.js"
 import { convertHTMLToMarkdown, MAX_MARKDOWN_BYTES } from "../html-markdown.js"
-import { collectBoundedResponseBody } from "../http-body.js"
+import { collectBoundedResponseBody, collectResponsePrefix } from "../http-body.js"
 import { WebPage } from "../web-page.js"
+import { WebDiagnostic } from "../web-diagnostic.js"
 import { mainHTML, markdownBody } from "../web-content.js"
 
 export const name = "webfetch"
@@ -18,7 +19,9 @@ export const MAX_TIMEOUT_SECONDS = 120
 
 export const description = `Open and inspect web pages. action=open (the default) fetches an HTTP(S) URL as markdown, text, or HTML, saves an immutable snapshot for 7 days, and returns a bounded preview with a ref. Readable formats prefer HTML main/article regions and reduce Markdown frontmatter to source metadata. Use format=html to inspect the unfiltered response. JavaScript is not executed.
 
-Use action=find with ref and a literal pattern to locate evidence and see surrounding context. Use action=read with ref, offset, and limit to expand a passage or continue reading. Read/find use the same captured text without another network request. Offsets are zero-based UTF-16 character positions; follow returned offsets. Search snippets are not complete pages: verify important claims against the captured text. Use a more targeted tool when available.`
+Use action=find with ref and a literal pattern to locate evidence and see surrounding context. Use action=read with ref, offset, and limit to expand a passage or continue reading. Read/find use the same captured text without another network request. Offsets are zero-based UTF-16 character positions; follow returned offsets. Search snippets are not complete pages: verify important claims against the captured text. Use a more targeted tool when available.
+
+HTTP failures include source, status, failureKind, evidence, and suggestedAction. When browser verification is detected, consider headed Playwright. A bare 403 does not establish a browser challenge. Detected challenge pages are not saved as article snapshots, even with HTTP 200.`
 
 const Timeout = Schema.Finite.check(Schema.isGreaterThan(0), Schema.isLessThanOrEqualTo(MAX_TIMEOUT_SECONDS))
 
@@ -211,21 +214,48 @@ export const Plugin = {
                 source: { type: "tool", messageID: context.messageID, id: context.id },
               })
 
+              // Once headers establish an HTTP failure, a stalled diagnostic
+              // body must not replace that evidence with a generic timeout.
+              let failure: ReturnType<typeof WebDiagnostic.diagnose> | undefined
               const { body, contentType } = yield* Effect.gen(function* () {
                 const response = yield* execute(http, input.url, input.format).pipe(
                   Effect.catchIf(isCloudflareChallenge, () => execute(http, input.url, input.format, "opencode")),
+                  Effect.catchTag("HttpClientError", (error) =>
+                    Effect.gen(function* () {
+                      if (error.reason._tag !== "StatusCodeError") return yield* Effect.fail(error)
+                      const response = error.reason.response
+                      failure = WebDiagnostic.diagnose({ source: "target_page", status: response.status, headers: response.headers })
+                      if (failure.failureKind === "browser_challenge")
+                        return yield* Effect.fail(new Error(WebDiagnostic.message(failure)))
+                      const body = yield* collectResponsePrefix(response, 64 * 1024)
+                      failure = WebDiagnostic.diagnose({
+                        source: "target_page", status: response.status, headers: response.headers, body: new TextDecoder().decode(body),
+                      })
+                      return yield* Effect.fail(new Error(WebDiagnostic.message(failure)))
+                    }),
+                  ),
                 )
+                const headerDiagnostic = WebDiagnostic.diagnose({ source: "target_page", status: response.status, headers: response.headers })
+                if (headerDiagnostic.failureKind === "browser_challenge")
+                  return yield* Effect.fail(new Error(WebDiagnostic.message(headerDiagnostic)))
                 const contentType = response.headers["content-type"] || ""
                 const mime = mimeFrom(contentType)
                 if (isImageAttachment(mime))
                   return yield* Effect.fail(new Error(`Unsupported fetched image content type: ${mime}`))
                 if (!isTextualMime(mime))
                   return yield* Effect.fail(new Error(`Unsupported fetched file content type: ${mime}`))
-                return { body: yield* collectBody(response), contentType }
+                const body = yield* collectBody(response)
+                const diagnostic = WebDiagnostic.diagnose({
+                  source: "target_page", status: response.status, headers: response.headers,
+                  body: mime === "text/html" || mime === "application/xhtml+xml" ? new TextDecoder().decode(body) : undefined,
+                })
+                if (diagnostic.failureKind === "browser_challenge")
+                  return yield* Effect.fail(new Error(WebDiagnostic.message(diagnostic)))
+                return { body, contentType }
               }).pipe(
                 Effect.timeoutOrElse({
                   duration: Duration.seconds(input.timeout ?? DEFAULT_TIMEOUT_SECONDS),
-                  orElse: () => Effect.fail(new Error("Request timed out")),
+                  orElse: () => Effect.fail(new Error(failure ? WebDiagnostic.message(failure) : "Request timed out")),
                 }),
               )
               const content = new TextDecoder().decode(body)

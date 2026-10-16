@@ -420,7 +420,7 @@ describe("WebSearchTool registration", () => {
             .pipe(Effect.flip)
           expect(toSessionError(error)).toEqual({
             type: "tool.execution",
-            message: "Web search rate limited (HTTP 429)",
+            message: expect.stringContaining('"failureKind":"rate_limited"'),
           })
           expect(error.metadata).toMatchObject({ provider: expect.stringMatching(/^(exa|parallel)$/) })
         }),
@@ -439,11 +439,11 @@ describe("WebSearchTool registration", () => {
 
       yield* Effect.forEach(
         [
-          { status: 403, message: "Web search request failed (HTTP 403)" },
-          { status: 429, message: "Web search rate limited (HTTP 429)" },
-          { status: 401, message: "Web search authentication failed (HTTP 401)" },
+          { status: 403, kind: "access_denied" },
+          { status: 429, kind: "rate_limited" },
+          { status: 401, kind: "authentication_required" },
         ],
-        ({ status, message }, index) =>
+        ({ status, kind }, index) =>
           Effect.gen(function* () {
             fixture.error = TestWebSearch.httpError(status, undefined, "https://mcp.exa.ai/mcp?exaApiKey=secret")
             const progress: Tool.Metadata[] = []
@@ -462,8 +462,11 @@ describe("WebSearchTool registration", () => {
               .pipe(Effect.flip)
 
             const sessionError = toSessionError(error)
-            expect(sessionError).toEqual({ type: "tool.execution", message })
             expect(sessionError.message).not.toContain("secret")
+            expect(JSON.parse(sessionError.message)).toMatchObject({
+              source: "search_provider", status, failureKind: kind, suggestedAction: "check_search_provider",
+            })
+            expect(sessionError.type).toBe("tool.execution")
             expect(error.metadata).toEqual({ provider: "exa" })
             expect(progress).toEqual([{ provider: "exa" }])
           }),
