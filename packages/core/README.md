@@ -13,6 +13,19 @@ server when the call omits it, with the original input title as a legacy fallbac
 Unanswered pages are excluded. Intact calls and results already retained in the
 model context are not duplicated.
 
+`session.prompt` and prompt-producing commands accept `context`, an ordered
+array of background text, descriptions and JSON metadata. Preparation validates
+the prompt before committing a staged revert. Revert commit and admission share
+one `Bus.publishAll` transaction, so rejected admission preserves the old history.
+
+Context is stored inside the user inbox payload. Queue/steer changes and
+cancellation apply to that single item. Promotion creates synthetic messages
+in context order followed by the user message in one transaction, with
+server-assigned context message IDs. Model execution cannot observe half of
+that delivery. Repeating the user message ID preserves the original admission
+and does not regenerate its context. Standalone synthetic inputs remain available
+for independent notifications and compaction restoration.
+
 ## Conditional location release
 
 Automatic UI cleanup calls `debug.location.evict` with `preserveExec: true`.
