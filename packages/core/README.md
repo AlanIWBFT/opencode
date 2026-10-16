@@ -39,6 +39,20 @@ Replacement locations may boot while the retired graph finishes cleanup. Exec
 checks its own location lifecycle, so a detached boot cannot launch commands and
 the retiring directory does not close its replacement's exec owner.
 
+## Persistent exec control
+
+Windows PowerShell lanes use `src/tool/exec-session/pipe.ts` for a generation-owned
+named pipe. The fixed shell loader receives the runner in memory; subsequent
+frames carry command source and return cwd. No runner, command, or cwd status
+files or temporary directories are created on this path. TTY history uses a
+generation-private path with `SaveNothing`, without precreating its directory;
+if a command explicitly enables history saving, generation cleanup still owns
+that path. Pipe stdin and ConPTY remain user-input channels.
+The stdout done frame and matching pipe status must both arrive before an
+execution completes, preserving output-tail ordering across the two transports.
+Reset, stop, startup failure, and shell exit release the control endpoint with
+the generation. Other shell adapters retain file-based runner transport.
+
 ## Code Mode selection
 
 Code Mode follows upstream defaults: plugin tools use `execute` unless their
