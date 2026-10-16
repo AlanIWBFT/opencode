@@ -19,6 +19,7 @@ import { AttachmentError, SkillNotFoundError } from "./error.js"
 
 export type Input = {
   text: string
+  context?: PromptInput.Prompt["context"]
   files?: PromptInput.Prompt["files"]
   agents?: PromptInput.Prompt["agents"]
   skills?: PromptInput.Prompt["skills"]
@@ -42,6 +43,7 @@ export const prepare = Effect.fn("SessionPrompt.prepare")(function* (request: {
       messageID: request.messageID,
       prompt: structuredClone({
         text: request.input.text,
+        context: request.input.context?.slice(),
         files: request.input.files?.slice(),
         agents: request.input.agents?.slice(),
         skills: request.input.skills?.slice(),
@@ -82,6 +84,7 @@ export const prepare = Effect.fn("SessionPrompt.prepare")(function* (request: {
         files,
         skills: selected?.length ? selected : undefined,
         metadata: event.metadata,
+        context: input.context?.filter((item) => item.text.trim()),
       }),
       delivery: event.delivery,
     } satisfies SessionInbox.Item

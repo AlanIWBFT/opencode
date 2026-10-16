@@ -179,16 +179,23 @@ export const make = Effect.fn("SessionInbox.make")(function* () {
     readonly id: SessionMessage.ID
     readonly sessionID: SessionSchema.ID
     readonly item: Item & { readonly type: Type }
+    readonly revertTo?: SessionMessage.ID
   }) {
     const existing = yield* reconcile({ ...request, type: request.item.type, delivery: request.item.delivery })
     if (existing !== undefined) return existing
-    const admitted = yield* bus
-      .publish(SessionEvent.InboxEnqueued, {
-        inboxID: request.id,
-        sessionID: request.sessionID,
-        item: request.item,
-      })
-      .pipe(
+    const enqueued = {
+      inboxID: request.id,
+      sessionID: request.sessionID,
+      item: request.item,
+    }
+    const admitted = yield* (request.revertTo
+      ? bus
+          .publishAll([
+            [SessionEvent.RevertEvent.Committed, { sessionID: request.sessionID, to: request.revertTo }],
+            [SessionEvent.InboxEnqueued, enqueued],
+          ])
+          .pipe(Effect.map((events) => events[1]))
+      : bus.publish(SessionEvent.InboxEnqueued, enqueued)).pipe(
         Effect.map((event) =>
           Info.make({
             id: request.id,
@@ -475,6 +482,30 @@ const publish = Effect.fn("SessionInbox.publish")(function* (
     (row) => {
       if (row.type !== "move" && row.type !== "user" && row.type !== "synthetic")
         return Effect.die(new LifecycleConflict({ id: row.id }))
+      const entry = fromRow(row)
+      if (entry.type === "user" && entry.payload.context?.length) {
+        // Context stays inside its owning inbox item until delivery. Queue,
+        // steer and cancellation therefore cannot split it from the prompt.
+        const contexts = entry.payload.context.map((payload) => ({ id: SessionMessage.ID.create(), payload }))
+        const events = contexts.flatMap((context) => [
+          [
+            SessionEvent.InboxEnqueued,
+            {
+              sessionID,
+              inboxID: context.id,
+              item: { type: "synthetic", payload: context.payload, delivery: entry.delivery },
+            },
+          ] as const,
+          [SessionEvent.InboxDelivered, { sessionID, inboxID: context.id }] as const,
+        ])
+        return bus
+          .publishAll([
+            events[0],
+            ...events.slice(1),
+            [SessionEvent.InboxDelivered, { sessionID, inboxID: entry.id }],
+          ])
+          .pipe(Effect.asVoid)
+      }
       return bus
         .publish(SessionEvent.InboxDelivered, {
           sessionID,

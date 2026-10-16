@@ -211,6 +211,7 @@ export interface Interface {
     sessionID: SessionSchema.ID
     command: string
     text: string
+    context?: PromptInput.Prompt["context"]
     files?: PromptInput.Prompt["files"]
     agents?: PromptInput.Prompt["agents"]
     skills?: PromptInput.Prompt["skills"]
