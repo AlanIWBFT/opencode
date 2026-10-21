@@ -507,7 +507,7 @@ test("authoritative end values replace accumulated deltas in the durable ended e
   })
 })
 
-test("tool input deltas are accumulated without being published", async () => {
+test("other tool input deltas are accumulated without being published", async () => {
   const { published, publisher } = capture()
   await Effect.runPromise(
     Effect.forEach(
@@ -527,6 +527,64 @@ test("tool input deltas are accumulated without being published", async () => {
     text: '{"path":"file.txt"}',
   })
 })
+
+it.effect("batches patch input while the provider is paused and flushes before input ends", () =>
+  Effect.gen(function* () {
+    const { published, publisher } = capture()
+    const prefix = '{"patchText":"*** Begin Patch\\n'
+    const body = '*** Add File: demo.txt\\n+hello\\n'
+    const suffix = '*** End Patch"}'
+    yield* publisher.publish(LLMEvent.toolInputStart({ id: "patch-call", name: "patch" }))
+    yield* publisher.publish(LLMEvent.toolInputDelta({ id: "patch-call", name: "patch", text: prefix }))
+    yield* publisher.publish(LLMEvent.toolInputDelta({ id: "patch-call", name: "patch", text: body }))
+    yield* TestClock.adjust("99 millis")
+    expect(published.some((event) => event.type === "session.tool.input.delta")).toBe(false)
+    yield* TestClock.adjust("1 millis")
+    expect(published.filter((event) => event.type === "session.tool.input.delta")).toMatchObject([
+      { data: { sessionID, id: "patch-call", delta: prefix + body } },
+    ])
+    expect(published.some((event) => event.type === "session.tool.input.ended.1")).toBe(false)
+
+    yield* publisher.publish(LLMEvent.toolInputDelta({ id: "patch-call", name: "patch", text: suffix }))
+    yield* publisher.publish(LLMEvent.toolInputEnd({ id: "patch-call", name: "patch" }))
+    expect(published.slice(-2)).toMatchObject([
+      { type: "session.tool.input.delta", data: { id: "patch-call", delta: suffix } },
+      { type: "session.tool.input.ended.1", data: { id: "patch-call", text: prefix + body + suffix } },
+    ])
+    const count = published.length
+    yield* TestClock.adjust("1 second")
+    expect(published).toHaveLength(count)
+  }),
+)
+
+it.effect("keeps parallel patch inputs separate and flushes them before the next block", () =>
+  Effect.gen(function* () {
+    const { published, publisher } = capture()
+    yield* publisher.publish(LLMEvent.toolInputStart({ id: "a", name: "patch" }))
+    yield* publisher.publish(LLMEvent.toolInputDelta({ id: "a", name: "patch", text: "first" }))
+    yield* publisher.publish(LLMEvent.toolInputStart({ id: "b", name: "patch" }))
+    expect(published.slice(-2)).toMatchObject([
+      { type: "session.tool.input.delta", data: { id: "a", delta: "first" } },
+      { type: "session.tool.input.started.1", data: { id: "b" } },
+    ])
+    yield* publisher.publish(LLMEvent.toolInputDelta({ id: "a", name: "patch", text: " more" }))
+    yield* publisher.publish(LLMEvent.toolInputDelta({ id: "b", name: "patch", text: "second" }))
+    yield* publisher.publish(LLMEvent.toolInputStart({ id: "read", name: "read" }))
+    yield* publisher.publish(LLMEvent.toolInputDelta({ id: "read", name: "read", text: "hidden" }))
+    yield* TestClock.adjust("100 millis")
+    expect(published.filter((event) => event.type === "session.tool.input.delta")).toMatchObject([
+      { data: { id: "a", delta: "first" } },
+      { data: { id: "a", delta: " more" } },
+      { data: { id: "b", delta: "second" } },
+    ])
+    yield* publisher.flush()
+    expect(published.filter((event) => event.type === "session.tool.input.ended.1")).toMatchObject([
+      { data: { id: "a", text: "first more" } },
+      { data: { id: "b", text: "second" } },
+      { data: { id: "read", text: "hidden" } },
+    ])
+  }),
+)
 
 test("provider-executed tool metadata is flattened using the route key", async () => {
   const { published, publisher } = capture("openai")
