@@ -169,18 +169,19 @@ export const createLLMEventPublisher = (bus: Pick<Bus.Interface, "publish">, inp
     type Fragment = {
       readonly ordinal: number
       readonly values: string[]
+      readonly stream: boolean
       pending: string
       timer?: Fiber.Fiber<void>
       native?: SessionMessage.Native
     }
     const chunks = new Map<string, Fragment>()
     let nextOrdinal = 0
-    const start = (id: string, native?: SessionMessage.Native) =>
+    const start = (id: string, native?: SessionMessage.Native, stream = true) =>
       Effect.suspend(() => {
         if (chunks.has(id)) return Effect.die(new Error(`Duplicate ${name} start: ${id}`))
         if (single && chunks.size > 0) return Effect.die(new Error(`${name} start before end: ${id}`))
         const ordinal = nextOrdinal++
-        chunks.set(id, { ordinal, values: [], pending: "", native })
+        chunks.set(id, { ordinal, values: [], pending: "", native, stream })
         return Effect.succeed(ordinal)
       })
     const publishDelta = Effect.fnUntraced(function* (id: string) {
@@ -198,7 +199,7 @@ export const createLLMEventPublisher = (bus: Pick<Bus.Interface, "publish">, inp
       const current = chunks.get(id)
       if (!current) return yield* Effect.die(new Error(`${name} delta before start: ${id}`))
       current.values.push(value)
-      if (delta) current.pending += value
+      if (delta && current.stream) current.pending += value
       if (native !== undefined) current.native = { ...current.native, ...native }
       if (current.pending && !current.timer) {
         // Own the trailing flush in the provider fiber, even if no more chunks arrive.
@@ -284,6 +285,15 @@ export const createLLMEventPublisher = (bus: Pick<Bus.Interface, "publish">, inp
         text: value,
       })
     }),
+    (id, value) =>
+      Effect.gen(function* () {
+        yield* bus.publish(SessionEvent.Tool.Input.Delta, {
+          sessionID: input.sessionID,
+          assistantMessageID,
+          id,
+          delta: value,
+        })
+      }),
   )
 
   // Deltas are batched, but block starts are not. Publishing held deltas first keeps each
@@ -291,6 +301,7 @@ export const createLLMEventPublisher = (bus: Pick<Bus.Interface, "publish">, inp
   const publishPendingDeltas = Effect.fnUntraced(function* () {
     yield* text.publishPending()
     yield* reasoning.publishPending()
+    yield* toolInput.publishPending()
   })
 
   const flushFragments = Effect.fnUntraced(function* () {
@@ -313,7 +324,8 @@ export const createLLMEventPublisher = (bus: Pick<Bus.Interface, "publish">, inp
       providerExecuted: event.providerExecuted === true,
     }
     tools.set(event.id, tool)
-    yield* toolInput.start(event.id)
+    // Only patch has a live input preview; other arguments remain end-only.
+    yield* toolInput.start(event.id, undefined, event.name === "patch")
     yield* publishPendingDeltas()
     yield* bus.publish(SessionEvent.Tool.Input.Started, {
       sessionID: input.sessionID,
