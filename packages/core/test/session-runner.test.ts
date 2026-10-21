@@ -789,7 +789,7 @@ const replaySessionProjection = (id: Session.ID) =>
     )
   })
 
-type FragmentKind = "text" | "reasoning" | "tool input"
+type FragmentKind = "text" | "reasoning" | "tool input" | "patch input"
 
 type FragmentFixture = {
   readonly delta?: Event.Definition
@@ -799,7 +799,7 @@ type FragmentFixture = {
   readonly expectedContent: unknown
 }
 
-const fragmentKinds: readonly FragmentKind[] = ["text", "reasoning", "tool input"]
+const fragmentKinds: readonly FragmentKind[] = ["text", "reasoning", "tool input", "patch input"]
 
 const fragmentID = (kind: FragmentKind, suffix: string) => `${kind === "tool input" ? "call" : kind}-${suffix}`
 
@@ -846,16 +846,19 @@ const fragmentFixture = (kind: FragmentKind, id: string, chunks: readonly string
         expectedContent,
       }
     }
-    case "tool input": {
+    case "tool input":
+    case "patch input": {
+      const name = kind === "patch input" ? "patch" : "echo"
       const partialEvents = [
         LLMEvent.stepStart({ index: 0 }),
-        LLMEvent.toolInputStart({ id, name: "echo" }),
-        ...chunks.map((text) => LLMEvent.toolInputDelta({ id, name: "echo", text })),
+        LLMEvent.toolInputStart({ id, name }),
+        ...chunks.map((text) => LLMEvent.toolInputDelta({ id, name, text })),
       ]
       const expectedContent = { type: "tool", id, state: { status: "streaming", input: text } }
       return {
+        delta: kind === "patch input" ? SessionEvent.Tool.Input.Delta : undefined,
         partialEvents,
-        completeEvents: [...partialEvents, LLMEvent.toolInputEnd({ id, name: "echo" })],
+        completeEvents: [...partialEvents, LLMEvent.toolInputEnd({ id, name })],
         expectedAssistant: {
           type: "assistant",
           content: [
@@ -928,7 +931,7 @@ function* verifyPartialFlushOnFailure(s: Scenario, kind: FragmentKind) {
   expect(yield* s.context).toMatchObject([
     Expected.user(prompt),
     Expected.assistant({ finish: "error", error: { type: "provider.invalid-request", message: "Invalid request" } }, [
-      kind === "tool input"
+      kind === "tool input" || kind === "patch input"
         ? Expected.failedTool(
             { id: fragmentID(kind, "partial") },
             { error: { type: "provider.invalid-request", message: "Invalid request" } },
@@ -958,7 +961,7 @@ function* verifyPartialFlushOnInterruption(s: Scenario, kind: FragmentKind) {
   expect(yield* s.context).toMatchObject([
     Expected.user(prompt),
     Expected.assistant({ finish: "error", error: { type: "aborted", message: "Step interrupted" } }, [
-      kind === "tool input"
+      kind === "tool input" || kind === "patch input"
         ? Expected.failedTool({ id: fragmentID(kind, "interrupted") }, {})
         : fixture.expectedContent,
     ]),
@@ -6973,6 +6976,32 @@ describe("SessionRunnerLLM", () => {
     yield* TestClock.adjust("100 millis")
     expect(deltas.pollUnsafe()).toBeDefined()
     expect(Array.from(yield* Fiber.join(deltas)).map((event) => event.data.delta)).toEqual(["Checking the project."])
+    yield* Fiber.interrupt(running)
+  })
+
+  scenario("broadcasts patch input before the provider finishes generating arguments", function* (s) {
+    const paused = yield* Deferred.make<void>()
+    const prefix = '{"patchText":"*** Begin Patch\\n*** Add File: demo.txt\\n+hello\\n'
+    yield* s.admit("Preview a patch")
+    yield* s.llm.push(
+      Stream.concat(
+        Stream.fromIterable([
+          LLMEvent.toolInputStart({ id: "patch-preview", name: "patch" }),
+          LLMEvent.toolInputDelta({ id: "patch-preview", name: "patch", text: prefix }),
+        ]),
+        Stream.fromEffect(Deferred.succeed(paused, undefined)).pipe(Stream.flatMap(() => Stream.never)),
+      ),
+    )
+    const deltas = yield* s.bus
+      .subscribe(SessionEvent.Tool.Input.Delta)
+      .pipe(Stream.take(1), Stream.runCollect, Effect.forkScoped({ startImmediately: true }))
+    const running = yield* s.resume.pipe(Effect.forkScoped)
+    yield* Deferred.await(paused)
+    yield* TestClock.adjust("100 millis")
+    expect(deltas.pollUnsafe()).toBeDefined()
+    expect(Array.from(yield* Fiber.join(deltas)).map((event) => event.data)).toMatchObject([
+      { sessionID, id: "patch-preview", delta: prefix },
+    ])
     yield* Fiber.interrupt(running)
   })
 
