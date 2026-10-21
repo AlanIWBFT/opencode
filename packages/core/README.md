@@ -26,6 +26,16 @@ that delivery. Repeating the user message ID preserves the original admission
 and does not regenerate its context. Standalone synthetic inputs remain available
 for independent notifications and compaction restoration.
 
+## Patch input previews
+
+The session runner broadcasts `patch` argument deltas through the existing
+ephemeral `session.tool.input.delta` event, batched on the same 100 ms interval
+as text and reasoning. Pending deltas flush before the next block starts and
+before the input ends, including failure and interruption cleanup. The complete
+input remains in the durable input-ended event; deltas do not write history.
+Other tools retain end-only input publication, keeping live argument traffic
+limited to the patch preview consumer.
+
 ## Conditional location release
 
 Automatic UI cleanup calls `debug.location.evict` with `preserveExec: true`.
