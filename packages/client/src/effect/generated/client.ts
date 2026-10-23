@@ -91,6 +91,8 @@ import type {
   SessionLogOutput,
   SessionInterruptInput,
   SessionInterruptOutput,
+  SessionStopInput,
+  SessionStopOutput,
   SessionBackgroundInput,
   SessionBackgroundOutput,
   SessionMessageGetInput,
@@ -542,6 +544,7 @@ const EndpointSessionPrompt = (raw: RawClient["server.session"]) => (input: Sess
       payload: {
         id: input["id"],
         text: input["text"],
+        context: input["context"],
         files: input["files"],
         agents: input["agents"],
         skills: input["skills"],
@@ -562,6 +565,7 @@ const EndpointSessionCommand = (raw: RawClient["server.session"]) => (input: Ses
       payload: {
         name: input["name"],
         text: input["text"],
+        context: input["context"],
         files: input["files"],
         agents: input["agents"],
         skills: input["skills"],
@@ -737,6 +741,11 @@ const EndpointSessionInterrupt = (raw: RawClient["server.session"]) => (input: S
     ),
   )
 
+const EndpointSessionStop = (raw: RawClient["server.session"]) => (input: SessionStopInput) =>
+  preserveEffect<SessionStopOutput>()(
+    raw["session.stop"]({ params: { sessionID: input["sessionID"] } }).pipe(Effect.mapError(mapClientError)),
+  )
+
 const EndpointSessionBackground = (raw: RawClient["server.session"]) => (input: SessionBackgroundInput) =>
   preserveEffect<SessionBackgroundOutput>()(
     raw["session.background"]({ params: { sessionID: input["sessionID"] } }).pipe(Effect.mapError(mapClientError)),
@@ -851,6 +860,7 @@ const adaptGroupSession = (raw: RawClient["server.session"]) => ({
   generate: EndpointSessionGenerate(raw),
   log: EndpointSessionLog(raw),
   interrupt: EndpointSessionInterrupt(raw),
+  stop: EndpointSessionStop(raw),
   background: EndpointSessionBackground(raw),
   message: { get: EndpointSessionMessageGet(raw) },
   form: {
@@ -1704,7 +1714,9 @@ const EndpointDebugLocationList = (raw: RawClient["server.debug"]) => () =>
 
 const EndpointDebugLocationEvict = (raw: RawClient["server.debug"]) => (input?: DebugLocationEvictInput) =>
   preserveEffect<DebugLocationEvictOutput>()(
-    raw["debug.location.evict"]({ query: { location: input?.["location"] } }).pipe(Effect.mapError(mapClientError)),
+    raw["debug.location.evict"]({
+      query: { location: input?.["location"], preserveExec: input?.["preserveExec"] },
+    }).pipe(Effect.mapError(mapClientError)),
   )
 
 const adaptGroupDebug = (raw: RawClient["server.debug"]) => ({
