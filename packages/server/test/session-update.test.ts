@@ -62,6 +62,17 @@ it.live("explicit stop accepts an idle session and rejects an unknown session", 
   }).pipe(Effect.scoped),
 )
 
+it.live("exec control lists existing owners and validates selected stop requests", () =>
+  Effect.gen(function* () {
+    const request = yield* makeRequest()
+    expect(yield* request("/api/session/exec", "GET")).toEqual([])
+    const created = Schema.decodeUnknownSync(SessionResponse)(yield* request("/api/session", "POST", {}))
+    expect(yield* request(`/api/session/${created.data.id}/exec/stop`, "POST", { execIDs: [123] })).toEqual({ matched: 0, terminated: 0, failed: 0 })
+    yield* request(`/api/session/${Session.ID.create()}/exec/stop`, "POST", { execIDs: [123] }, 404)
+    yield* request(`/api/session/${created.data.id}/exec/stop`, "POST", { execIDs: [-1] }, 400)
+  }).pipe(Effect.scoped),
+)
+
 it.live("updates session metadata through PATCH", () =>
   Effect.gen(function* () {
     const request = yield* makeRequest()

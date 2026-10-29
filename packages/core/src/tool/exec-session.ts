@@ -1434,7 +1434,7 @@ const layer = Layer.effect(
               started,
               input.yieldTimeMs,
               input.maxOutputTokens,
-              false,
+              true,
             )
             return preparation.lostReason
               ? {
@@ -2069,6 +2069,33 @@ const layer = Layer.effect(
     })
 
     yield* control.register(stop, {
+      commands: {
+        list: () => Array.from(state.executions.values()).filter((entry) => entry.running && entry.executionExposed).map((entry) => ({
+          sessionID: entry.sessionID, execID: entry.execID, command: entry.command, startedAt: entry.startedAt,
+        })),
+        stop: (sessionID, execIDs) => Effect.gen(function* () {
+          const selected = new Set(execIDs)
+          const entries = Array.from(state.executions.values()).filter((entry) => entry.sessionID === sessionID && selected.has(entry.execID))
+          const results = yield* Effect.forEach(entries, Effect.fnUntraced(function* (entry) {
+            yield* refresh(state, entry)
+            if (!entry.running) return "completed" as const
+            const shouldKill = yield* requestTermination(entry, "execution stopped by user")
+            if (shouldKill) yield* killLaneTransport(entry.lane)
+            const deadline = performance.now() + 3_500
+            while (entry.running && performance.now() < deadline) {
+              yield* Effect.sleep("50 millis")
+              yield* refresh(state, entry)
+            }
+            yield* updateOriginal(entry).pipe(Effect.ignore)
+            return entry.running ? "failed" as const : "terminated" as const
+          }), { concurrency: "unbounded" })
+          return {
+            matched: results.filter((result) => result !== "completed").length,
+            terminated: results.filter((result) => result === "terminated").length,
+            failed: results.filter((result) => result === "failed").length,
+          }
+        }).pipe(Effect.uninterruptible),
+      },
       location: Location.Ref.make({ directory: location.directory, workspaceID: location.workspaceID }),
       busy: () =>
         liveLanes(state).some((lane) => !lane.resourcesReleased) ||
