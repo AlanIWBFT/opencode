@@ -26,6 +26,15 @@ that delivery. Repeating the user message ID preserves the original admission
 and does not regenerate its context. Standalone synthetic inputs remain available
 for independent notifications and compaction restoration.
 
+`session.inbox.close` is stronger than ordinary cancellation: it waits for the
+addressed user/synthetic ID's complete admission and wake, persists an admission
+closure, then cancels the item only if it is still pending. It returns `closed`,
+`cancelled`, or `delivered`; delivered history is never withdrawn. Late requests
+and retries with that ID fail without waking the session, across backend restarts.
+Other inbox work is untouched. Closure markers are operational KV state, removed
+with the session, not messages or replayable conversation events. Ordinary
+`session.inbox.cancel` still permits that ID to be admitted again.
+
 ## Patch input previews
 
 The session runner broadcasts `patch` argument deltas through the existing
