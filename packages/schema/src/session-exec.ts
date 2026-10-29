@@ -6,6 +6,14 @@ import { SessionID } from "./session-id.js"
 import { SessionMessage } from "./session-message.js"
 import { Tool } from "./tool.js"
 
+export interface Running extends Schema.Schema.Type<typeof Running> {}
+export const Running = Schema.Struct({
+  sessionID: SessionID,
+  execID: NonNegativeInt,
+  command: Schema.String,
+  startedAt: Schema.Number,
+}).annotate({ identifier: "Session.Exec.Running" })
+
 export interface Metadata extends Schema.Schema.Type<typeof Metadata> {}
 export const Metadata = Schema.Struct({
   command: Schema.String,
