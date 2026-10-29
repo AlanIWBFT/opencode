@@ -1,10 +1,11 @@
 export * as SessionInbox from "./inbox.js"
 
-import { and, asc, eq, or } from "drizzle-orm"
+import { and, asc, eq, gte, lt, or } from "drizzle-orm"
 import { Context, DateTime, Effect, Layer, Schema } from "effect"
 import { makeGlobalNode } from "@opencode/util/effect/app-node"
 import {
   Compaction,
+  CloseResult,
   CompactionPayload,
   Delivery,
   Info,
@@ -29,11 +30,13 @@ import { SessionSchema } from "./schema.js"
 import { SessionStored } from "./stored.js"
 import { SessionInboxTable, SessionMessageTable } from "./sql.js"
 import { SessionHistory } from "./history.js"
+import { KVTable } from "../kv/sql.js"
 
 type DatabaseService = Database.Interface["db"]
 
 export {
   Compaction,
+  CloseResult,
   CompactionPayload,
   Delivery,
   Info,
@@ -68,6 +71,8 @@ const decodeMove = Schema.decodeUnknownSync(MovePayload)
 const encodeMove = Schema.encodeSync(MovePayload)
 const inboxLocks = KeyedMutex.makeUnsafe<SessionSchema.ID>()
 type PendingRef = { readonly id: SessionMessage.ID; readonly sessionID: SessionSchema.ID }
+const closedPrefix = (sessionID: SessionSchema.ID) => `session-inbox-closed/${sessionID}/`
+const closedKey = (input: PendingRef) => `${closedPrefix(input.sessionID)}${input.id}`
 
 export const serialized = <A, E, R>(sessionID: SessionSchema.ID, effect: Effect.Effect<A, E, R>) =>
   inboxLocks.withLock(sessionID)(effect)
@@ -172,6 +177,11 @@ export const make = Effect.fn("SessionInbox.make")(function* () {
   const database = yield* Database.Service
   const db = database.db
   const bus = yield* Bus.Service
+  // Covers the whole request, including preparation and its advisory wake.
+  // Closing an ID cannot finish while an older request can still wake it.
+  const admissionLocks = KeyedMutex.makeUnsafe<string>()
+  const withAdmission = <A, E, R>(input: PendingRef, effect: Effect.Effect<A, E, R>) =>
+    admissionLocks.withLock(closedKey(input))(effect)
 
   /** First admission wins for matching Session and type, without preparing a new payload. */
   const reconcile = Effect.fn("SessionInbox.reconcile")(function* <Type extends Item["type"]>(request: {
@@ -180,6 +190,8 @@ export const make = Effect.fn("SessionInbox.make")(function* () {
     readonly type: Type
     readonly delivery: Delivery
   }) {
+    const closed = yield* db.select({ key: KVTable.key }).from(KVTable).where(eq(KVTable.key, closedKey(request))).get().pipe(Effect.orDie)
+    if (closed) return yield* new LifecycleConflict({ id: request.id })
     const existing =
       (yield* find(db, request.id)) ?? (yield* promotedFromMessage(db, request.sessionID, request.id, request.delivery))
     if (existing === undefined) return undefined
@@ -277,6 +289,27 @@ export const make = Effect.fn("SessionInbox.make")(function* () {
     ),
   )
 
+  const close = Effect.fn("SessionInbox.close")((input: PendingRef) =>
+    withAdmission(input, serialized(input.sessionID, Effect.gen(function* () {
+      const pending = yield* find(db, input.id)
+      const message = yield* db.select({ sessionID: SessionMessageTable.session_id, type: SessionMessageTable.type })
+        .from(SessionMessageTable).where(eq(SessionMessageTable.id, input.id)).get().pipe(Effect.orDie)
+      if ((pending && (pending.sessionID !== input.sessionID || (pending.type !== "user" && pending.type !== "synthetic")))
+        || (message && (message.sessionID !== input.sessionID || (message.type !== "user" && message.type !== "synthetic"))))
+        return yield* new LifecycleConflict({ id: input.id })
+      // Operational state, not conversation history. Persist before cancelling:
+      // a failed cancellation keeps admission closed and can be retried safely.
+      yield* db.insert(KVTable).values({ key: closedKey(input), value: true }).onConflictDoNothing().run().pipe(Effect.orDie)
+      if (pending) yield* bus.publish(SessionEvent.InboxCancelled, { sessionID: input.sessionID, inboxID: input.id })
+      return CloseResult.make({ state: pending ? "cancelled" : message ? "delivered" : "closed" })
+    }))).pipe(Effect.uninterruptible),
+  )
+
+  const forgetClosed = (sessionID: SessionSchema.ID) => {
+    const prefix = closedPrefix(sessionID)
+    return db.delete(KVTable).where(and(gte(KVTable.key, prefix), lt(KVTable.key, `${prefix}\uffff`))).run().pipe(Effect.orDie, Effect.asVoid)
+  }
+
   const queue = Effect.fn("SessionInbox.queue")((input: PendingRef) =>
     publishMutation(
       input,
@@ -291,6 +324,9 @@ export const make = Effect.fn("SessionInbox.make")(function* () {
   return {
     list: (sessionID: SessionSchema.ID) => list(db, sessionID),
     reconcile,
+    withAdmission,
+    close,
+    forgetClosed,
     admit,
     admitCompaction,
     cancel,

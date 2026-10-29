@@ -25,8 +25,9 @@ export const make = (
     const get = store
       .get(sessionID)
       .pipe(Effect.flatMap((session) => (session ? Effect.succeed(session) : new NotFoundError({ sessionID }))))
-    yield* get
     const id = input.id ?? SessionMessage.ID.create()
+    return yield* inbox.withAdmission({ id, sessionID }, Effect.gen(function* () {
+    yield* get
     const admitted = yield* inbox
       .admit({
         id,
@@ -46,4 +47,5 @@ export const make = (
       )
     if (input.resume !== false && !(yield* get).revert) yield* wake(sessionID)
     return admitted
+    }))
   }, Effect.uninterruptible)

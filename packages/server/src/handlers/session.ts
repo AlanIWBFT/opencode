@@ -549,6 +549,18 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
         }),
       )
       .handle(
+        "session.inbox.close",
+        Effect.fn(function* (ctx) {
+          return { data: yield* session.closeInbox(ctx.params).pipe(
+            Effect.catchTag("Session.NotFoundError", missingSession),
+            Effect.catchTag("Session.InboxConflictError", (error) => new ConflictError({
+              resource: error.inboxID,
+              message: `Only a user or synthetic input owned by this session can be closed: ${error.inboxID}`,
+            })),
+          ) }
+        }),
+      )
+      .handle(
         "session.inbox.update",
         Effect.fn(function* (ctx) {
           return yield* pendingMutation(

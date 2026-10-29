@@ -135,6 +135,12 @@ export const make = Effect.fn("Session.make")(function* () {
     (sessionID: SessionSchema.ID, inboxID: SessionMessage.ID) => mutatePending(sessionID, inboxID, admission.cancel),
     Effect.uninterruptible,
   )
+  const closeInbox = Effect.fn("Session.closeInbox")(function* (sessionID: SessionSchema.ID, inboxID: SessionMessage.ID) {
+    yield* get(sessionID)
+    return yield* admission.close({ sessionID, id: inboxID }).pipe(
+      Effect.catchTag("SessionInbox.LifecycleConflict", () => new InboxConflictError({ sessionID, inboxID })),
+    )
+  }, Effect.uninterruptible)
   const steerInbox = Effect.fn("Session.steerInbox")(function* (
     sessionID: SessionSchema.ID,
     inboxID: SessionMessage.ID,
@@ -147,11 +153,11 @@ export const make = Effect.fn("Session.make")(function* () {
     Effect.uninterruptible,
   )
   const prompt = Effect.fn("Session.prompt")(
-    (sessionID: SessionSchema.ID, input: PromptRequest, onAccepted?: Effect.Effect<void>) =>
-      Effect.uninterruptibleMask((restore) =>
-        Effect.gen(function* () {
+    (sessionID: SessionSchema.ID, input: PromptRequest, onAccepted?: Effect.Effect<void>) => {
+      const messageID = input.id ?? SessionMessage.ID.create()
+      return Effect.uninterruptibleMask((restore) =>
+        admission.withAdmission({ sessionID, id: messageID }, Effect.gen(function* () {
           const session = yield* get(sessionID)
-          const messageID = input.id ?? SessionMessage.ID.create()
           const admitted = yield* Effect.gen(function* () {
             const existing = yield* admission.reconcile({
               id: messageID,
@@ -182,8 +188,9 @@ export const make = Effect.fn("Session.make")(function* () {
           // Checkpoint an accepted handoff before observing cancellation. Prompt preparation above stays interruptible.
           if (onAccepted) yield* onAccepted
           return admitted
-        }),
-      ),
+        })),
+      )
+    },
   )
   const shell = Effect.fn("Session.shell")(function* (
     sessionID: SessionSchema.ID,
@@ -334,6 +341,7 @@ export const make = Effect.fn("Session.make")(function* () {
     resume,
     interrupt,
     cancelInbox,
+    closeInbox,
     steerInbox,
     queueInbox,
     revert,
@@ -360,6 +368,7 @@ export const make = Effect.fn("Session.make")(function* () {
     const resume = operations.resume.bind(undefined, sessionID)
     const interrupt = operations.interrupt.bind(undefined, sessionID)
     const cancelInbox = operations.cancelInbox.bind(undefined, sessionID)
+    const closeInbox = operations.closeInbox.bind(undefined, sessionID)
     const steerInbox = operations.steerInbox.bind(undefined, sessionID)
     const queueInbox = operations.queueInbox.bind(undefined, sessionID)
     const stage = operations.revert.stage.bind(undefined, sessionID)
@@ -389,6 +398,7 @@ export const make = Effect.fn("Session.make")(function* () {
       resume,
       interrupt,
       cancelInbox,
+      closeInbox,
       steerInbox,
       queueInbox,
       revert,
