@@ -141,6 +141,12 @@ export const make = Effect.fn("Session.make")(function* () {
     (sessionID: SessionSchema.ID, inboxID: SessionMessage.ID) => mutatePending(sessionID, inboxID, admission.cancel),
     Effect.uninterruptible,
   )
+  const closeInbox = Effect.fn("Session.closeInbox")(function* (sessionID: SessionSchema.ID, inboxID: SessionMessage.ID) {
+    yield* get(sessionID)
+    return yield* admission.close({ sessionID, id: inboxID }).pipe(
+      Effect.catchTag("SessionInbox.LifecycleConflict", () => new InboxConflictError({ sessionID, inboxID })),
+    )
+  }, Effect.uninterruptible)
   const steerInbox = Effect.fn("Session.steerInbox")(function* (
     sessionID: SessionSchema.ID,
     inboxID: SessionMessage.ID,
@@ -152,11 +158,11 @@ export const make = Effect.fn("Session.make")(function* () {
     (sessionID: SessionSchema.ID, inboxID: SessionMessage.ID) => mutatePending(sessionID, inboxID, admission.queue),
     Effect.uninterruptible,
   )
-  const prompt = Effect.fn("Session.prompt")((sessionID: SessionSchema.ID, input: PromptRequest) =>
-    Effect.uninterruptibleMask((restore) =>
-      Effect.gen(function* () {
+  const prompt = Effect.fn("Session.prompt")((sessionID: SessionSchema.ID, input: PromptRequest) => {
+    const messageID = input.id ?? SessionMessage.ID.create()
+    return Effect.uninterruptibleMask((restore) =>
+      admission.withAdmission({ sessionID, id: messageID }, Effect.gen(function* () {
         const session = yield* get(sessionID)
-        const messageID = input.id ?? SessionMessage.ID.create()
         const admitted = yield* Effect.gen(function* () {
           const existing = yield* admission.reconcile({
             id: messageID,
@@ -186,9 +192,9 @@ export const make = Effect.fn("Session.make")(function* () {
         )
         if (input.resume !== false) yield* execution.wake(sessionID)
         return admitted
-      }),
-    ),
-  )
+      })),
+    )
+  })
   const shell = Effect.fn("Session.shell")(function* (
     sessionID: SessionSchema.ID,
     input: { id?: SessionMessage.ID; command: string },
@@ -294,11 +300,11 @@ export const make = Effect.fn("Session.make")(function* () {
         delivery?: SessionInbox.Delivery
         resume?: boolean
       },
-    ) =>
-      Effect.uninterruptible(
-        Effect.gen(function* () {
+    ) => {
+      const inputID = input.id ?? SessionMessage.ID.create()
+      return Effect.uninterruptible(
+        admission.withAdmission({ sessionID, id: inputID }, Effect.gen(function* () {
           yield* get(sessionID)
-          const inputID = input.id ?? SessionMessage.ID.create()
           const admittedInput = {
             type: "synthetic",
             payload: SessionInbox.SyntheticPayload.make({
@@ -322,8 +328,9 @@ export const make = Effect.fn("Session.make")(function* () {
             )
           if (input.resume !== false && !(yield* get(sessionID)).revert) yield* execution.wake(sessionID)
           return admitted
-        }),
-      ),
+        })),
+      )
+    },
   )
   const interrupt = Effect.fn("Session.interrupt")(
     (sessionID: SessionSchema.ID, options?: { readonly resume?: boolean }) =>
@@ -377,6 +384,7 @@ export const make = Effect.fn("Session.make")(function* () {
     resume,
     interrupt,
     cancelInbox,
+    closeInbox,
     steerInbox,
     queueInbox,
     revert,
@@ -403,6 +411,7 @@ export const make = Effect.fn("Session.make")(function* () {
     const resume = operations.resume.bind(undefined, sessionID)
     const interrupt = operations.interrupt.bind(undefined, sessionID)
     const cancelInbox = operations.cancelInbox.bind(undefined, sessionID)
+    const closeInbox = operations.closeInbox.bind(undefined, sessionID)
     const steerInbox = operations.steerInbox.bind(undefined, sessionID)
     const queueInbox = operations.queueInbox.bind(undefined, sessionID)
     const stage = operations.revert.stage.bind(undefined, sessionID)
@@ -432,6 +441,7 @@ export const make = Effect.fn("Session.make")(function* () {
       resume,
       interrupt,
       cancelInbox,
+      closeInbox,
       steerInbox,
       queueInbox,
       revert,

@@ -71,6 +71,8 @@ import type {
   SessionInboxListOutput,
   SessionInboxCancelInput,
   SessionInboxCancelOutput,
+  SessionInboxCloseInput,
+  SessionInboxCloseOutput,
   SessionInboxUpdateInput,
   SessionInboxUpdateOutput,
   SessionInstructionsEntryListInput,
@@ -947,6 +949,17 @@ export function make(options: ClientOptions) {
             },
             requestOptions,
           ),
+        close: (input: SessionInboxCloseInput, requestOptions?: RequestOptions) =>
+          request<{ readonly data: SessionInboxCloseOutput }>(
+            {
+              method: "POST",
+              path: `/api/session/${encodeURIComponent(input.sessionID)}/inbox/${encodeURIComponent(input.inboxID)}/close`,
+              successStatus: 200,
+              declaredStatuses: [400, 401, 404, 409],
+              empty: false,
+            },
+            requestOptions,
+          ).then((value) => value.data),
         update: (input: SessionInboxUpdateInput, requestOptions?: RequestOptions) =>
           request<SessionInboxUpdateOutput>(
             {

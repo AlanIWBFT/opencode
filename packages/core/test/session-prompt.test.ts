@@ -1,6 +1,6 @@
 import { describe, expect } from "bun:test"
 import type { FileSystem } from "@opencode/core/filesystem"
-import { DateTime, Effect, Fiber, Layer, LayerMap, Schema, Stream } from "effect"
+import { DateTime, Deferred, Effect, Fiber, Layer, LayerMap, Schema, Stream } from "effect"
 import path from "path"
 import { pathToFileURL } from "url"
 import { eq } from "drizzle-orm"
@@ -49,6 +49,7 @@ const executionCalls: Session.ID[] = []
 const interruptCalls: Session.ID[] = []
 const interruptContinuations: Array<boolean | undefined> = []
 const wakeCalls: Session.ID[] = []
+const wakeWaiters = new Map<Session.ID, Effect.Effect<void>>()
 const activeSessions = new Set<Session.ID>()
 const execution = Layer.succeed(
   SessionExecution.Service,
@@ -68,7 +69,7 @@ const execution = Layer.succeed(
     wake: (sessionID) =>
       Effect.sync(() => {
         wakeCalls.push(sessionID)
-      }),
+      }).pipe(Effect.andThen(Effect.suspend(() => wakeWaiters.get(sessionID) ?? Effect.void))),
     awaitIdle: () => Effect.void,
   }),
 )
@@ -1263,6 +1264,98 @@ describe("Session.prompt", () => {
 })
 
 describe("Session.inbox", () => {
+  it.effect("closes an unseen ID durably without accepting late prompts or synthetic input", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const session = yield* Session.Service
+      const inboxID = SessionMessage.ID.create()
+      wakeCalls.length = 0
+      expect(yield* session.closeInbox({ sessionID, inboxID })).toEqual({ state: "closed" })
+      expect(yield* session.prompt({ sessionID, id: inboxID, text: "late" }).pipe(Effect.flip)).toMatchObject({ _tag: "Session.PromptConflictError" })
+      expect(yield* session.synthetic({ sessionID, id: inboxID, text: "late" }).pipe(Effect.flip)).toMatchObject({ _tag: "Session.SyntheticConflictError" })
+      expect(yield* session.inbox(sessionID)).toEqual([])
+      expect(wakeCalls).toEqual([])
+      // Reconstruct the owner over the same DB: closure is not an in-memory flag.
+      const restored = yield* SessionInbox.make()
+      expect(yield* restored.reconcile({ sessionID, id: inboxID, type: "user", delivery: "steer" }).pipe(Effect.flip))
+        .toMatchObject({ _tag: "SessionInbox.LifecycleConflict" })
+      expect(yield* session.closeInbox({ sessionID, inboxID })).toEqual({ state: "closed" })
+    }),
+  )
+
+  it.effect("closes only the addressed prompt and its attached context, leaving other inbox work intact", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const session = yield* Session.Service
+      const owned = yield* session.prompt({ sessionID, text: "review", context: [{ text: "review context" }], resume: false })
+      const ordinary = yield* session.prompt({ sessionID, text: "user queue", delivery: "queue", resume: false })
+      const notification = yield* session.synthetic({ sessionID, text: "independent completion", resume: false })
+      const { db } = yield* Database.Service
+      const otherSessionID = Session.ID.make("ses_other_closure")
+      yield* db.insert(SessionTable).values({ id: otherSessionID, project_id: Project.ID.global, slug: "other", directory: "/project", title: "other", version: "test" })
+        .run().pipe(Effect.orDie)
+      expect(yield* session.closeInbox({ sessionID: otherSessionID, inboxID: owned.id }).pipe(Effect.flip))
+        .toMatchObject({ _tag: "Session.InboxConflictError" })
+      expect(yield* session.closeInbox({ sessionID, inboxID: owned.id })).toEqual({ state: "cancelled" })
+      expect((yield* session.inbox(sessionID)).map((item) => item.id)).toEqual([ordinary.id, notification.id])
+      expect(yield* session.messages({ sessionID })).toEqual([])
+      expect(yield* session.prompt({ sessionID, id: owned.id, text: "retry" }).pipe(Effect.flip)).toMatchObject({ _tag: "Session.PromptConflictError" })
+      expect(yield* session.closeInbox({ sessionID: Session.ID.make("ses_missing"), inboxID: ordinary.id }).pipe(Effect.flip))
+        .toMatchObject({ _tag: "Session.NotFoundError" })
+    }),
+  )
+
+  it.effect("keeps delivered history while closing its ID against later wakeups", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const session = yield* Session.Service
+      const { db } = yield* Database.Service
+      const bus = yield* Bus.Service
+      const input = yield* session.synthetic({ sessionID, text: "delivered review", resume: false })
+      yield* SessionInbox.promote(db, bus, sessionID, "input")
+      const history = yield* session.messages({ sessionID })
+      wakeCalls.length = 0
+      expect(yield* session.closeInbox({ sessionID, inboxID: input.id })).toEqual({ state: "delivered" })
+      expect(yield* session.messages({ sessionID })).toEqual(history)
+      expect(yield* session.synthetic({ sessionID, id: input.id, text: "retry" }).pipe(Effect.flip)).toMatchObject({ _tag: "Session.SyntheticConflictError" })
+      expect(wakeCalls).toEqual([])
+    }),
+  )
+
+  it.effect("waits for an in-flight admission's wake before confirming closure", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const session = yield* Session.Service
+      const inboxID = SessionMessage.ID.create()
+      const entered = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      const order: string[] = []
+      wakeWaiters.set(sessionID, Effect.gen(function* () {
+        yield* Deferred.succeed(entered, undefined)
+        yield* Deferred.await(release)
+        order.push("wake completed")
+      }))
+      try {
+        const sending = yield* session.prompt({ sessionID, id: inboxID, text: "review" }).pipe(Effect.forkChild({ startImmediately: true }))
+        yield* Deferred.await(entered)
+        const closing = yield* session.closeInbox({ sessionID, inboxID }).pipe(
+          Effect.tap(() => Effect.sync(() => { order.push("closed") })),
+          Effect.forkChild({ startImmediately: true }),
+        )
+        yield* Effect.yieldNow
+        expect(order).toEqual([])
+        yield* Deferred.succeed(release, undefined)
+        yield* Fiber.join(sending)
+        expect(yield* Fiber.join(closing)).toEqual({ state: "cancelled" })
+        expect(order).toEqual(["wake completed", "closed"])
+        expect(yield* session.inbox(sessionID)).toEqual([])
+      } finally {
+        yield* Deferred.succeed(release, undefined)
+        wakeWaiters.delete(sessionID)
+      }
+    }),
+  )
+
   it.effect("fails for an unknown session", () =>
     Effect.gen(function* () {
       const session = yield* Session.Service

@@ -713,6 +713,12 @@ export type SessionInboxCancelOperation<E = never> = (
   input: SessionInboxCancelInput,
 ) => Effect.Effect<SessionInboxCancelOutput, E>
 
+export type SessionInboxCloseInput = { readonly sessionID: Session.ID; readonly inboxID: SessionMessage.ID }
+export type SessionInboxCloseOutput = SessionInbox.CloseResult
+export type SessionInboxCloseOperation<E = never> = (
+  input: SessionInboxCloseInput,
+) => Effect.Effect<SessionInboxCloseOutput, E>
+
 export type SessionInboxUpdateInput = {
   readonly sessionID: Session.ID
   readonly inboxID: SessionMessage.ID
@@ -1164,6 +1170,7 @@ export interface SessionApi<E = never> {
   readonly inbox: {
     readonly list: SessionInboxListOperation<E>
     readonly cancel: SessionInboxCancelOperation<E>
+    readonly close: SessionInboxCloseOperation<E>
     readonly update: SessionInboxUpdateOperation<E>
   }
   readonly instructions: {

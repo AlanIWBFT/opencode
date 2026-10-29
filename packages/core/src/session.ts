@@ -183,6 +183,8 @@ export interface Interface {
   /** Experimental: {@link Interface.inbox} with files stored in `blob` left as `media:` refs when the session's location enables `experimental.media_blob`. */
   readonly inboxWithRefs: (sessionID: SessionSchema.ID) => Effect.Effect<SessionInbox.MediaInfo[], NotFoundError>
   readonly cancelInbox: (input: InboxItemRef) => Effect.Effect<void, NotFoundError | InboxConflictError>
+  /** Permanently closes one user/synthetic ID, including admission requests not yet received. */
+  readonly closeInbox: (input: InboxItemRef) => Effect.Effect<SessionInbox.CloseResult, NotFoundError | InboxConflictError>
   readonly steerInbox: (input: InboxItemRef) => Effect.Effect<void, NotFoundError | InboxConflictError>
   readonly queueInbox: (input: InboxItemRef) => Effect.Effect<void, NotFoundError | InboxConflictError>
   /**
@@ -291,6 +293,7 @@ const layer = Layer.effect(
     const environments = yield* SessionEnvironment.Service
     const locations = yield* LocationServiceMap.Service
     const sessions = yield* Session.make()
+    const admission = yield* SessionInbox.Service
     // `experimental.media_blob` as the session's own location configures it, where its media is written.
     const keepsMediaRefs = (session: SessionSchema.Info) =>
       SessionBlob.enabled.pipe(
@@ -416,6 +419,7 @@ const layer = Layer.effect(
         yield* environments.clear(sessionID)
         yield* bus.publish(SessionEvent.Deleted, { sessionID })
         yield* execSnapshots.remove(sessionID)
+        yield* admission.forgetClosed(sessionID)
         yield* bus.remove(sessionID)
       }),
       list: Effect.fn("Session.list")(function* (input = {}) {
@@ -492,6 +496,7 @@ const layer = Layer.effect(
         return yield* SessionInbox.listWithRefs(db, sessionID)
       }),
       cancelInbox: (input) => sessions.forSession(input.sessionID).cancelInbox(input.inboxID),
+      closeInbox: (input) => sessions.forSession(input.sessionID).closeInbox(input.inboxID),
       steerInbox: (input) => sessions.forSession(input.sessionID).steerInbox(input.inboxID),
       queueInbox: (input) => sessions.forSession(input.sessionID).queueInbox(input.inboxID),
       log: (input) =>

@@ -11,6 +11,11 @@ import { SessionMessage } from "./session-message.js"
 export const Delivery = Schema.Literals(["steer", "queue"]).annotate({ identifier: "Session.Inbox.Delivery" })
 export type Delivery = typeof Delivery.Type
 
+export interface CloseResult extends Schema.Schema.Type<typeof CloseResult> {}
+export const CloseResult = Schema.Struct({
+  state: Schema.Literals(["closed", "cancelled", "delivered"]),
+}).annotate({ identifier: "Session.Inbox.CloseResult" })
+
 export interface UserPayload extends Schema.Schema.Type<typeof UserPayload> {}
 export const UserPayload = Schema.Struct({
   ...Prompt.fields,

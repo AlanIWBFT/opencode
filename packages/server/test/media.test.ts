@@ -248,6 +248,9 @@ it.live("serves stored media as refs only to clients that opt in while experimen
           { id: queued.id, payload: { files: [{ data: png, mime: "image/png", name: "again.png" }] } },
         ])
         await opted.session.inbox.cancel({ sessionID, inboxID: queued.id })
+        expect(await opted.session.inbox.close({ sessionID, inboxID: queued.id })).toEqual({ state: "closed" })
+        await expect(plain.session.prompt({ sessionID, id: queued.id, text: "late retry", resume: false }))
+          .rejects.toMatchObject({ _tag: "ConflictError" })
 
         // A ref whose blob is gone reaches opted-in clients as the same placeholder inline readers get.
         const gone = "e".repeat(64)
