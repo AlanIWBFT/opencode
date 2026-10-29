@@ -152,6 +152,8 @@ export type SessionStatsToolUsage = {
 
 export type SessionStatsActivity = { date: string; steps: number }
 
+export type SessionInboxCloseResult = { state: "closed" | "cancelled" | "delivered" }
+
 export type InstructionEntryKey = string
 
 export type EventID = string
@@ -3461,6 +3463,10 @@ export type SessionInboxListOutput = { data: Array<SessionInboxInfo> }["data"]
 export type SessionInboxCancelInput = { readonly sessionID: string; readonly inboxID: string }
 
 export type SessionInboxCancelOutput = void
+
+export type SessionInboxCloseInput = { readonly sessionID: string; readonly inboxID: string }
+
+export type SessionInboxCloseOutput = { data: SessionInboxCloseResult }["data"]
 
 export type SessionInboxUpdateInput = {
   readonly sessionID: string

@@ -573,6 +573,20 @@ export const makeSessionGroup = <I extends HttpApiMiddleware.AnyId, S, FormI ext
       ),
     )
     .add(
+      HttpApiEndpoint.post("session.inbox.close", "/api/session/:sessionID/inbox/:inboxID/close", {
+        params: { sessionID: Session.ID, inboxID: SessionMessage.ID },
+        success: Schema.Struct({ data: SessionInbox.CloseResult }),
+        error: [ConflictError, SessionNotFoundError],
+      }).annotateMerge(
+        OpenApi.annotations({
+          identifier: "session.inbox.close",
+          summary: "Close admission for one input ID",
+          description:
+            "Wait for in-flight user/synthetic admission and its wake, permanently reject this ID for this session, and cancel it if still pending. Delivered history is retained. Idempotent across retries and backend restarts. Ordinary inbox cancellation does not close admission.",
+        }),
+      ),
+    )
+    .add(
       HttpApiEndpoint.patch("session.inbox.update", "/api/session/:sessionID/inbox/:inboxID", {
         params: { sessionID: Session.ID, inboxID: SessionMessage.ID },
         payload: Schema.Struct({ delivery: SessionInbox.Delivery }),
