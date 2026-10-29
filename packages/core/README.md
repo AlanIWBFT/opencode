@@ -60,6 +60,15 @@ the retiring directory does not close its replacement's exec owner.
 
 ## Persistent exec control
 
+`session.exec.list` reads running commands from existing process-local owners,
+without starting locations or including idle shell slots. Only commands exposed
+as still running after their initial wait are listed. `session.exec.stop`
+checks session ownership and stops only the selected execution IDs. It preserves
+other lanes, the agent turn and unread model output. Completed and unknown IDs
+are no-ops; failed termination is reported in the result counts. Command preview
+events carry the resulting state to clients. These operations use the global
+owner registry so a session move cannot route control to a newly created owner.
+
 Windows PowerShell lanes use `src/tool/exec-session/pipe.ts` for a generation-owned
 named pipe. The fixed shell loader receives the runner in memory; subsequent
 frames carry command source and return cwd. No runner, command, or cwd status

@@ -1,4 +1,5 @@
 import { SessionMessage } from "@opencode/schema/session-message"
+import { SessionExec } from "@opencode/schema/session-exec"
 import { SessionInbox } from "@opencode/schema/session-inbox"
 import { PromptInput } from "@opencode/schema/prompt-input"
 import { Session } from "@opencode/schema/session"
@@ -729,6 +730,27 @@ export const makeSessionGroup = <I extends HttpApiMiddleware.AnyId, S, FormI ext
               "Interrupt this session's execution and close its persistent command slots, including detached commands. Background child sessions are not stopped. Later input and background notifications may resume this session. Counts describe attempted termination of running commands; failed may be nonzero.",
           }),
         ),
+    )
+    .add(
+      HttpApiEndpoint.get("session.exec.list", "/api/session/exec", {
+        success: Schema.Array(SessionExec.Running),
+      }).annotateMerge(OpenApi.annotations({
+        identifier: "session.exec.list",
+        summary: "List running persistent commands",
+        description: "List commands owned by this process across existing locations without starting any locations. Idle shell slots are excluded.",
+      })),
+    )
+    .add(
+      HttpApiEndpoint.post("session.exec.stop", "/api/session/:sessionID/exec/stop", {
+        params: { sessionID: Session.ID },
+        payload: Schema.Struct({ execIDs: Schema.Array(NonNegativeInt) }),
+        success: Schema.Struct({ matched: NonNegativeInt, terminated: NonNegativeInt, failed: NonNegativeInt }),
+        error: SessionNotFoundError,
+      }).annotateMerge(OpenApi.annotations({
+        identifier: "session.exec.stop",
+        summary: "Stop selected persistent commands",
+        description: "Stops only the selected commands owned by this session. Does not interrupt the agent or other commands, start locations, or consume command output. Already completed or unknown IDs are a no-op.",
+      })),
     )
     .add(
       HttpApiEndpoint.post("session.background", "/api/session/:sessionID/background", {

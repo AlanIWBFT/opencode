@@ -89,6 +89,9 @@ import type {
   SessionInterruptOutput,
   SessionStopInput,
   SessionStopOutput,
+  SessionExecListOutput,
+  SessionExecStopInput,
+  SessionExecStopOutput,
   SessionBackgroundInput,
   SessionBackgroundOutput,
   SessionMessageGetInput,
@@ -1058,6 +1061,31 @@ export function make(options: ClientOptions) {
           },
           requestOptions,
         ),
+      exec: {
+        list: (requestOptions?: RequestOptions) =>
+          request<SessionExecListOutput>(
+            {
+              method: "GET",
+              path: `/api/session/exec`,
+              successStatus: 200,
+              declaredStatuses: [400, 401],
+              empty: false,
+            },
+            requestOptions,
+          ),
+        stop: (input: SessionExecStopInput, requestOptions?: RequestOptions) =>
+          request<SessionExecStopOutput>(
+            {
+              method: "POST",
+              path: `/api/session/${encodeURIComponent(input.sessionID)}/exec/stop`,
+              body: { execIDs: input["execIDs"] },
+              successStatus: 200,
+              declaredStatuses: [400, 401, 404],
+              empty: false,
+            },
+            requestOptions,
+          ),
+      },
       background: (input: SessionBackgroundInput, requestOptions?: RequestOptions) =>
         request<SessionBackgroundOutput>(
           {

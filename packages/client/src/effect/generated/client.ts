@@ -95,6 +95,9 @@ import type {
   SessionInterruptOutput,
   SessionStopInput,
   SessionStopOutput,
+  SessionExecListOutput,
+  SessionExecStopInput,
+  SessionExecStopOutput,
   SessionBackgroundInput,
   SessionBackgroundOutput,
   SessionMessageGetInput,
@@ -756,6 +759,17 @@ const EndpointSessionStop = (raw: RawClient["server.session"]) => (input: Sessio
     raw["session.stop"]({ params: { sessionID: input["sessionID"] } }).pipe(Effect.mapError(mapClientError)),
   )
 
+const EndpointSessionExecList = (raw: RawClient["server.session"]) => () =>
+  preserveEffect<SessionExecListOutput>()(raw["session.exec.list"]({}).pipe(Effect.mapError(mapClientError)))
+
+const EndpointSessionExecStop = (raw: RawClient["server.session"]) => (input: SessionExecStopInput) =>
+  preserveEffect<SessionExecStopOutput>()(
+    raw["session.exec.stop"]({
+      params: { sessionID: input["sessionID"] },
+      payload: { execIDs: input["execIDs"] },
+    }).pipe(Effect.mapError(mapClientError)),
+  )
+
 const EndpointSessionBackground = (raw: RawClient["server.session"]) => (input: SessionBackgroundInput) =>
   preserveEffect<SessionBackgroundOutput>()(
     raw["session.background"]({ params: { sessionID: input["sessionID"] } }).pipe(Effect.mapError(mapClientError)),
@@ -872,6 +886,7 @@ const adaptGroupSession = (raw: RawClient["server.session"]) => ({
   log: EndpointSessionLog(raw),
   interrupt: EndpointSessionInterrupt(raw),
   stop: EndpointSessionStop(raw),
+  exec: { list: EndpointSessionExecList(raw), stop: EndpointSessionExecStop(raw) },
   background: EndpointSessionBackground(raw),
   message: { get: EndpointSessionMessageGet(raw) },
   form: {

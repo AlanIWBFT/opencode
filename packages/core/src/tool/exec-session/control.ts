@@ -2,6 +2,7 @@ export * as ExecSessionControl from "./control.js"
 
 import { Context, Effect, Layer, Schema, Scope, Semaphore } from "effect"
 import type { SessionID } from "@opencode/schema/session-id"
+import type { SessionExec } from "@opencode/schema/session-exec"
 import { makeGlobalNode } from "@opencode/util/effect/app-node"
 import { KV } from "../../kv.js"
 import { Location } from "../../location.js"
@@ -25,6 +26,10 @@ interface Lifetime {
   readonly location: Location.Ref
   readonly busy: () => boolean
   readonly close: () => void
+  readonly commands?: {
+    readonly list: () => readonly SessionExec.Running[]
+    readonly stop: (sessionID: SessionID, execIDs: readonly number[]) => Effect.Effect<Result>
+  }
 }
 
 export interface Interface {
@@ -36,6 +41,8 @@ export interface Interface {
   readonly releaseLocation: (location: Location.Ref, release: Effect.Effect<void>) => Effect.Effect<boolean>
   /** Stops only existing owners; a session action must not create a workspace runtime just to stop it. */
   readonly stop: Stop
+  readonly listCommands: Effect.Effect<readonly SessionExec.Running[]>
+  readonly stopCommands: (sessionID: SessionID, execIDs: readonly number[]) => Effect.Effect<Result>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/ExecSessionControl") {}
@@ -65,6 +72,17 @@ export const layer = Layer.effect(
     }
     let nextID = sequence === undefined ? 1 : Schema.decodeUnknownSync(Schema.Int)(sequence)
     return Service.of({
+      listCommands: Effect.sync(() => Array.from(owners.values()).flatMap((owner) => owner?.commands?.list() ?? [])),
+      stopCommands: (sessionID, execIDs) => Effect.suspend(() =>
+        Effect.forEach(Array.from(owners.values()), (owner) =>
+          owner?.commands?.stop(sessionID, execIDs) ?? Effect.succeed({ matched: 0, terminated: 0, failed: 0 }),
+          { concurrency: "unbounded" },
+        ).pipe(Effect.map((results) => results.reduce((sum, result) => ({
+          matched: sum.matched + result.matched,
+          terminated: sum.terminated + result.terminated,
+          failed: sum.failed + result.failed,
+        }), { matched: 0, terminated: 0, failed: 0 }))),
+      ),
       nextID: lock.withPermit(
         Effect.gen(function* () {
           const id = nextID++

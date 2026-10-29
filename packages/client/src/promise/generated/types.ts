@@ -422,6 +422,8 @@ export type PermissionRule = { action: string; resource: string; effect: Permiss
 
 export type PluginInfo = { id?: PluginID; source: PluginSource; features: PluginFeatures; state: PluginState }
 
+export type SessionExecRunning = { sessionID: SessionID; execID: number; command: string; startedAt: number }
+
 export type SessionForkBoundary =
   | { type: "before"; messageID: SessionMessageID }
   | { type: "through"; messageID: SessionMessageID }
@@ -3750,6 +3752,12 @@ export type SessionInterruptOutput = SessionInterruptResponse
 export type SessionStopInput = { readonly sessionID: string }
 
 export type SessionStopOutput = SessionStopResponse
+
+export type SessionExecListOutput = Array<SessionExecRunning>
+
+export type SessionExecStopInput = { readonly sessionID: string; readonly execIDs: ReadonlyArray<number> }
+
+export type SessionExecStopOutput = { matched: number; terminated: number; failed: number }
 
 export type SessionBackgroundInput = { readonly sessionID: string }
 

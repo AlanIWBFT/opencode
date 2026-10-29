@@ -29,6 +29,7 @@ import { SessionStore } from "./session/store.js"
 import { SessionExecSnapshots } from "./session/exec-snapshots.js"
 import { SessionExecPresentation } from "./session/exec-presentation.js"
 import { ExecSessionControl } from "./tool/exec-session/control.js"
+import type { SessionExec } from "@opencode/schema/session-exec"
 import { KeyedMutex } from "./effect/keyed-mutex.js"
 import { SessionExecution } from "./session/execution.js"
 import {
@@ -250,6 +251,8 @@ export interface Interface {
   readonly interrupt: (sessionID: SessionSchema.ID, options?: { readonly resume?: boolean }) => Effect.Effect<boolean>
   /** Interrupt this session and close its persistent command slots, without stopping background children. */
   readonly stop: (sessionID: SessionSchema.ID) => Effect.Effect<ExecSessionControl.Result, NotFoundError>
+  readonly listCommands: Effect.Effect<readonly SessionExec.Running[]>
+  readonly stopCommands: (sessionID: SessionSchema.ID, execIDs: readonly number[]) => Effect.Effect<ExecSessionControl.Result, NotFoundError>
   readonly synthetic: (
     input: Parameters<Session.Handle["synthetic"]>[0] & { sessionID: SessionSchema.ID },
   ) => ReturnType<Session.Handle["synthetic"]>
@@ -579,6 +582,11 @@ const layer = Layer.effect(
           yield* execution.interrupt(sessionID, { awaitSettlement: true })
           return yield* execControl.stop([{ sessionID }])
         }).pipe(Effect.uninterruptible),
+      listCommands: execControl.listCommands,
+      stopCommands: (sessionID, execIDs) => Effect.gen(function* () {
+        yield* result.get(sessionID)
+        return yield* execControl.stopCommands(sessionID, execIDs)
+      }),
       revert: {
         stage: (input) => sessions.forSession(input.sessionID).revert.stage(input),
         clear: (sessionID) => sessions.forSession(sessionID).revert.clear(),

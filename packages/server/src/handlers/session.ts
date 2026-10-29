@@ -64,6 +64,10 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
       )
 
     return handlers
+      .handle("session.exec.list", () => session.listCommands)
+      .handle("session.exec.stop", (ctx) => session.stopCommands(ctx.params.sessionID, ctx.payload.execIDs).pipe(
+        Effect.catchTag("Session.NotFoundError", missingSession),
+      ))
       .handle(
         "session.list",
         Effect.fn(function* (ctx) {

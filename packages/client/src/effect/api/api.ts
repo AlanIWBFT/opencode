@@ -775,6 +775,20 @@ export type SessionStopInput = { readonly sessionID: Session.ID }
 export type SessionStopOutput = { readonly matched: number; readonly terminated: number; readonly failed: number }
 export type SessionStopOperation<E = never> = (input: SessionStopInput) => Effect.Effect<SessionStopOutput, E>
 
+export type SessionExecListOutput = ReadonlyArray<{
+  readonly sessionID: Session.ID
+  readonly execID: number
+  readonly command: string
+  readonly startedAt: number
+}>
+export type SessionExecListOperation<E = never> = () => Effect.Effect<SessionExecListOutput, E>
+
+export type SessionExecStopInput = { readonly sessionID: Session.ID; readonly execIDs: ReadonlyArray<number> }
+export type SessionExecStopOutput = { readonly matched: number; readonly terminated: number; readonly failed: number }
+export type SessionExecStopOperation<E = never> = (
+  input: SessionExecStopInput,
+) => Effect.Effect<SessionExecStopOutput, E>
+
 export type SessionBackgroundInput = { readonly sessionID: Session.ID }
 export type SessionBackgroundOutput = void
 export type SessionBackgroundOperation<E = never> = (
@@ -1184,6 +1198,7 @@ export interface SessionApi<E = never> {
   readonly log: SessionLogOperation<E>
   readonly interrupt: SessionInterruptOperation<E>
   readonly stop: SessionStopOperation<E>
+  readonly exec: { readonly list: SessionExecListOperation<E>; readonly stop: SessionExecStopOperation<E> }
   readonly background: SessionBackgroundOperation<E>
   readonly message: { readonly get: SessionMessageGetOperation<E> }
   readonly form: {

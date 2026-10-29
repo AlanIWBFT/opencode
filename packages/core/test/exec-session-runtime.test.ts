@@ -1,5 +1,7 @@
 import { expect } from "bun:test"
-import { Effect } from "effect"
+import { Effect, Fiber, Stream } from "effect"
+import { Bus } from "@opencode/core/bus"
+import { SessionEvent } from "@opencode/schema/session-event"
 import { AppNodeBuilder } from "@opencode/core/effect/app-node-builder"
 import { LayerNode } from "@opencode/util/effect/layer-node"
 import { Location } from "@opencode/core/location"
@@ -15,12 +17,52 @@ import { testEffect } from "./lib/effect"
 
 const it = testEffect(
   AppNodeBuilder.build(
-    LayerNode.group([ExecSession.node, ExecSessionControl.node, Session.node, Location.node, LocationLifecycle.node]),
+    LayerNode.group([ExecSession.node, ExecSessionControl.node, Session.node, Location.node, LocationLifecycle.node, Bus.node]),
     [Location.node.replace(tempLocationLayer), SessionExecution.node.replace(SessionExecution.noopLayer)],
   ),
 )
 const shell = process.platform === "win32" ? Bun.which("pwsh") : null
 const windowsTest = shell ? it.live : it.live.skip
+
+windowsTest("selected command stop preserves other lanes, session ownership and unread output", () =>
+  Effect.gen(function* () {
+    const location = yield* Location.Service
+    const sessions = yield* Session.Service
+    const executions = yield* ExecSession.Service
+    const session = yield* sessions.create({ location: { directory: location.directory } })
+    const other = yield* sessions.create({ location: { directory: location.directory } })
+    const invocation: ExecSession.Invocation = {
+      sessionID: session.id, messageID: SessionMessage.ID.create(), display: "root", metadata: () => Effect.void,
+    }
+    const bus = yield* Bus.Service
+    const silentStarted = yield* bus.subscribe([SessionEvent.Exec.Updated]).pipe(
+      Stream.filter((event) => event.data.sessionID === session.id && event.data.metadata.command === "Start-Sleep -Seconds 60" && event.data.metadata.sessionExposed === true),
+      Stream.take(1), Stream.runCollect, Effect.forkChild({ startImmediately: true }),
+    )
+    const launch = (laneID: number) => executions.launch({
+      command: laneID === 0 ? "Write-Output 'retained-output'; Start-Sleep -Seconds 60" : "Start-Sleep -Seconds 60",
+      shell: shell!, cwd: location.directory, env: {}, invocation: { ...invocation, callID: `call_${laneID}` }, laneID, yieldTimeMs: 0,
+      onExecutionStarted: (execID) => Effect.gen(function* () {
+        expect((yield* sessions.listCommands).some((entry) => entry.execID === execID)).toBe(false)
+      }),
+      prepare: () => Effect.succeed({ script: persistentShellScript(shell!, { command: laneID === 0 ? "Write-Output 'retained-output'; Start-Sleep -Seconds 60" : "Start-Sleep -Seconds 60" }) }),
+    })
+    const first = yield* launch(0)
+    const second = yield* launch(1)
+    expect(first.running).toBe(true)
+    expect(second.running).toBe(true)
+    expect((yield* Fiber.join(silentStarted))[0].data.metadata.processRunning).toBe(true)
+    expect((yield* sessions.listCommands).map((entry) => entry.execID)).toEqual([first.execID!, second.execID!])
+    expect(yield* sessions.stopCommands(other.id, [first.execID!])).toEqual({ matched: 0, terminated: 0, failed: 0 })
+    expect(yield* sessions.stopCommands(session.id, [first.execID!])).toEqual({ matched: 1, terminated: 1, failed: 0 })
+    expect((yield* sessions.listCommands).map((entry) => entry.execID)).toEqual([second.execID!])
+    const output = yield* executions.write({ execID: first.execID!, invocation, yieldTimeMs: 0 })
+    expect(output.running).toBe(false)
+    expect(first.output + output.output).toContain("retained-output")
+    expect(yield* sessions.stopCommands(session.id, [first.execID!, second.execID!])).toEqual({ matched: 1, terminated: 1, failed: 0 })
+    expect(yield* sessions.listCommands).toEqual([])
+  }),
+)
 
 for (const tty of [false, true]) {
   windowsTest(
