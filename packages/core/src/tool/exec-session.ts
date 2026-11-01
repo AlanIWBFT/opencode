@@ -30,6 +30,7 @@ import {
 import {
   appendModelOutput,
   createModelOutput,
+  hasModelOutput,
   readModelOutput,
   sanitizeTranscript,
   type ModelOutput,
@@ -142,6 +143,7 @@ export type Chunk = {
   running: boolean
   exitCode?: number
   truncated: boolean
+  hasMoreOutput?: boolean
   wallTimeMs: number
   metadata: Metadata
   error?: string
@@ -1777,6 +1779,7 @@ const layer = Layer.effect(
         running: entry.running,
         exitCode: entry.exitCode,
         truncated: output.truncated,
+        hasMoreOutput: output.hasMoreOutput,
         wallTimeMs: performance.now() - started,
         metadata: metadata(entry, invocation.display),
       }
@@ -2034,6 +2037,7 @@ const layer = Layer.effect(
         running: entry.running,
         exitCode: entry.exitCode,
         truncated: entry.truncated,
+        hasMoreOutput: hasModelOutput(entry.modelOutput),
         wallTimeMs: performance.now() - started,
         error,
         metadata: {
@@ -2058,6 +2062,7 @@ const layer = Layer.effect(
         running: false,
         exitCode: entry.exitCode,
         truncated: output.truncated,
+        hasMoreOutput: output.hasMoreOutput,
         wallTimeMs: performance.now() - started,
         error,
         metadata: {

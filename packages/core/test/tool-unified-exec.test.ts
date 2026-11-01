@@ -1,5 +1,6 @@
 import { expect } from "bun:test"
-import { Effect, Layer, Schema } from "effect"
+import { Effect, Fiber, Layer, Schema, Stream } from "effect"
+import { Bus } from "@opencode/core/bus"
 import { AppNodeBuilder } from "@opencode/core/effect/app-node-builder"
 import { LayerNode } from "@opencode/util/effect/layer-node"
 import { makeLocationNode } from "@opencode/util/effect/app-node"
@@ -18,6 +19,7 @@ import { ExecSession } from "@opencode/core/tool/exec-session"
 import { UnifiedExecTool } from "@opencode/core/tool/plugin/unified-exec"
 import { ChildCall } from "@opencode/schema/tool"
 import { SessionExec } from "@opencode/schema/session-exec"
+import { SessionEvent } from "@opencode/schema/session-event"
 import { tempLocationLayer } from "./fixture/location"
 import { testEffect } from "./lib/effect"
 import { executeTool, registerToolPlugin, toolIdentity } from "./lib/tool"
@@ -39,7 +41,7 @@ const plugin = makeLocationNode({
   ],
 })
 const base = AppNodeBuilder.build(
-  LayerNode.group([plugin, Tool.node, Session.node, Location.node, ExecSession.node, PluginHooks.node]),
+  LayerNode.group([plugin, Tool.node, Session.node, Location.node, ExecSession.node, PluginHooks.node, Bus.node]),
   [
     Location.node.replace(tempLocationLayer),
     Config.node.replace(Config.testLayer()),
@@ -98,6 +100,61 @@ windowsDirect(
       expect(denied.status).toBe("error")
     }),
   { timeout: 20_000 },
+)
+
+windowsDirect("failed stdin reports unread output without consuming it", () =>
+  Effect.gen(function* () {
+    const tools = yield* Tool.Service
+    const sessions = yield* Session.Service
+    const location = yield* Location.Service
+    const bus = yield* Bus.Service
+    const session = yield* sessions.create({
+      location: { directory: location.directory },
+      permissions: [{ action: "*", resource: "*", effect: "allow" }],
+    })
+    yield* Effect.addFinalizer(() => sessions.stop(session.id).pipe(Effect.asVoid, Effect.orDie))
+    const ready = yield* bus.subscribe([SessionEvent.Exec.Updated]).pipe(
+      Stream.filter((event) => event.data.sessionID === session.id && event.data.metadata.output.includes("buffered-output-ready")),
+      Stream.take(1),
+      Stream.runCollect,
+      Effect.forkChild({ startImmediately: true }),
+    )
+    const started = yield* executeTool(tools, {
+      ...toolIdentity,
+      sessionID: session.id,
+      call: {
+        type: "tool-call", id: "buffered", name: "exec_command",
+        input: { cmd: "[Console]::Write('buffered-output-ready'); $null = [Console]::ReadKey($true)", tty: true, yield_time_ms: 0, max_output_tokens: 1 },
+      },
+    })
+    expect(started.status).toBe("completed")
+    const execID = Schema.decodeUnknownSync(SessionExec.Metadata)(started.metadata).execID
+    expect(execID).toBeDefined()
+    yield* Fiber.join(ready).pipe(Effect.timeout("10 seconds"))
+    const reject = () => executeTool(tools, {
+      ...toolIdentity,
+      sessionID: session.id,
+      call: { type: "tool-call", id: "reject", name: "write_stdin", input: { exec_id: execID, close_stdin: true } },
+    })
+    const failed = yield* reject()
+    expect(failed.output).toContain("does not support closing stdin with tty enabled")
+    expect(failed.output).toContain("has_more_output: true")
+    const drained = yield* executeTool(tools, {
+      ...toolIdentity,
+      sessionID: session.id,
+      call: { type: "tool-call", id: "drain", name: "poll_exec", input: { exec_id: execID, yield_time_ms: 0 } },
+    })
+    expect(drained.output).toContain("output-ready")
+    expect(drained.output).toContain("has_more_output: false")
+    expect((yield* reject()).output).toContain("has_more_output: false")
+    const unknown = yield* executeTool(tools, {
+      ...toolIdentity,
+      sessionID: session.id,
+      call: { type: "tool-call", id: "unknown", name: "poll_exec", input: { exec_id: 2147483647, yield_time_ms: 0 } },
+    })
+    expect(unknown.output).toContain("Error:")
+    expect(unknown.output).not.toContain("has_more_output:")
+  }),
 )
 
 windowsScript(
