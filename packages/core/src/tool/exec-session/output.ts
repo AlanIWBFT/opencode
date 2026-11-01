@@ -98,7 +98,8 @@ export function sanitizeTranscript(state: TranscriptState, input: string) {
 }
 
 export function readModelOutput(output: ModelOutput, running: boolean, maxOutputTokens: number | undefined) {
-  return running ? readRunningModelOutput(output, maxOutputTokens) : readCompletedModelOutput(output, maxOutputTokens)
+  const result = running ? readRunningModelOutput(output, maxOutputTokens) : readCompletedModelOutput(output, maxOutputTokens)
+  return { ...result, hasMoreOutput: hasModelOutput(output) }
 }
 
 export function appendModelOutput(output: ModelOutput, text: string) {
@@ -154,7 +155,7 @@ function readRunningModelOutput(output: ModelOutput, maxOutputTokens: number | u
     output.headBytes -= Buffer.byteLength(text)
     const truncated = hasModelOutput(output)
     return {
-      text: truncated ? text + "\n\n...output truncated..." : text,
+      text,
       truncated,
     }
   }
@@ -248,7 +249,7 @@ function readCompletedModelOutput(output: ModelOutput, maxOutputTokens: number |
   }
 }
 
-function hasModelOutput(output: ModelOutput) {
+export function hasModelOutput(output: ModelOutput) {
   return Boolean(output.head || output.tailBytes || output.omittedBytes || output.omissionUnknown)
 }
 
