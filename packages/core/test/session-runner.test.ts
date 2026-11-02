@@ -1619,7 +1619,10 @@ describe("SessionRunnerLLM", () => {
         }),
       )
       yield* s.admit("Echo before moving")
-      yield* s.llm.push(TestLLM.toolCall("call-move", "echo", { text: "moving" }), TestLLM.text("Done", "text-after-move"))
+      yield* s.llm.push(
+        TestLLM.toolCall("call-move", "echo", { text: "moving" }),
+        TestLLM.text("Done", "text-after-move"),
+      )
       const tools = yield* s.blockTools()
       const run = yield* s.resume.pipe(Effect.forkChild)
       yield* tools.started
@@ -5446,8 +5449,8 @@ describe("SessionRunnerLLM", () => {
           { codemode: false },
         )
         yield* s.llm.push(
-          TestLLM.tool("historical-question", "question", input),
-          TestLLM.tool("historical-page", "openchamber_render", {
+          TestLLM.toolCall("historical-question", "question", input),
+          TestLLM.toolCall("historical-page", "openchamber_render", {
             request: { title: "Panel layout", html: "<html>Original page</html>" },
           }),
           TestLLM.text("Recorded", "question-recorded"),
@@ -6084,7 +6087,10 @@ describe("SessionRunnerLLM", () => {
     // the window instead of rejecting it.
     s.currentModel = recoveryModel
     yield* s.llm.push(
-      TestLLM.complete({ reason: { normalized: "length" }, usage: { inputTokens: 199_994, nonCachedInputTokens: 199_994, outputTokens: 0 } }),
+      TestLLM.complete({
+        reason: { normalized: "length" },
+        usage: { inputTokens: 199_994, nonCachedInputTokens: 199_994, outputTokens: 0 },
+      }),
       TestLLM.text("## Objective\n- summary", "summary"),
       TestLLM.text("Done", "done"),
     )

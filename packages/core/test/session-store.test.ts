@@ -66,10 +66,9 @@ describe("SessionStore", () => {
       ])
       const store = yield* SessionStore.Service
       for (const directory of ["C:/opencode/repo", "C:\\opencode\\repo"]) {
-        expect((yield* store.list({ directory: AbsolutePath.make(directory) })).map((session) => String(session.id))).toEqual([
-          "ses_native",
-          "ses_forward",
-        ])
+        expect(
+          (yield* store.list({ directory: AbsolutePath.make(directory) })).map((session) => String(session.id)),
+        ).toEqual(["ses_native", "ses_forward"])
       }
     }),
   )
@@ -345,7 +344,9 @@ describe("SessionStore", () => {
         .where(eq(SessionMessageTable.session_id, sessionID))
         .orderBy(asc(SessionMessageTable.seq))
         .all()
-      expect(yield* SessionHistory.decodeMessageRows(database.db, rows)).toEqual(hydrated)
+      expect(yield* SessionHistory.decodeMessageRows(database.db, rows)).toEqual(
+        hydrated.map(({ seq, ...message }) => message),
+      )
     }),
   )
 })

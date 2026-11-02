@@ -16,11 +16,12 @@ import { Tool } from "@opencode/schema/tool"
 import { LayerNode } from "@opencode/util/effect/layer-node"
 import { testEffect } from "./lib/effect"
 import { globalProjectNode } from "./lib/project"
+import { offlineModels } from "./fixture/models"
 
 const it = testEffect(
   AppNodeBuilder.build(
     LayerNode.group([Session.node, SessionTransfer.node, SessionExecSnapshots.node, Database.node]),
-    [Project.node.replace(globalProjectNode), SessionExecution.node.replace(SessionExecution.noopLayer)],
+    [Project.node.replace(globalProjectNode), SessionExecution.node.replace(SessionExecution.noopLayer), offlineModels],
   ),
 )
 
