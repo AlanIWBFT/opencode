@@ -44,10 +44,10 @@ function restore(questions: Question.Prompt[], answers: Question.Answer[]) {
 
 describe("question context rendering", () => {
   test("restores interrupted question submissions and UI notes and skipped choices from explicit metadata only", () => {
-    const user = (metadata: unknown) =>
+    const user = (metadata: unknown, type: "user" | "synthetic" = "user") =>
       Schema.decodeUnknownSync(SessionMessage.Info)({
         id: "msg_answer",
-        type: "user",
+        type,
         text: "Submitted answer",
         time: { created: 1 },
         metadata,
@@ -74,7 +74,7 @@ describe("question context rendering", () => {
             skipped: ["deploy"],
           },
         },
-      }),
+      }, "synthetic"),
     )
     expect(ui).toHaveLength(1)
     const restored = JSON.stringify(

@@ -13,6 +13,11 @@ server when the call omits it, with the original input title as a legacy fallbac
 Unanswered pages are excluded. Intact calls and results already retained in the
 model context are not duplicated.
 
+Interrupted-question follow-ups and inline UI card submissions are recovered from
+their explicit metadata on user or synthetic messages before the compaction marker.
+UI recovery preserves picks, user notes, field values and skipped choices; a skipped
+choice is not agreement. The original failed question tool remains unchanged.
+
 `session.prompt` and prompt-producing commands accept `context`, an ordered
 array of background text, descriptions and JSON metadata. Preparation validates
 the prompt before committing a staged revert. Revert commit and admission share

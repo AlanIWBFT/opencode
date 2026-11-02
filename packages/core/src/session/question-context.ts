@@ -104,7 +104,7 @@ export const load = Effect.fn("SessionQuestionContext.load")(function* (
     .where(
       and(
         eq(SessionMessageTable.session_id, sessionID),
-        inArray(SessionMessageTable.type, ["assistant", "user"]),
+        inArray(SessionMessageTable.type, ["assistant", "user", "synthetic"]),
         lt(SessionMessageTable.seq, boundary.seq),
       ),
     )
@@ -122,7 +122,7 @@ export const load = Effect.fn("SessionQuestionContext.load")(function* (
 })
 
 export function entries(message: SessionMessage.Info): Cache["entries"] {
-  if (message.type === "user") {
+  if (message.type === "user" || message.type === "synthetic") {
     const common = {
       toolID: message.id,
       time: DateTime.toEpochMillis(message.time.created),
