@@ -3907,7 +3907,10 @@ describe("SessionRunnerLLM", () => {
         type: "compaction",
         status: "failed",
         reason: "auto",
-        error: { type: "provider.invalid-request", message: "summary unavailable" },
+        error: {
+          type: "provider.invalid-request", message: "summary unavailable",
+          resolution: { kind: "invalid_input", retry: "never", action: "fix_input" },
+        },
       }),
     )
     expect(context.slice(-3)).toMatchObject([
@@ -5577,6 +5580,17 @@ describe("SessionRunnerLLM", () => {
         const reply = `Explain the compatibility rules first.\n${"Verbatim context, not approval.\n".repeat(120)}Do not infer agreement.`
         const answers = [[reply]]
         const pageAnswer = { answered: true, summary: "Keep both panels", data: { panels: 2 } }
+        const inlineAnswer = {
+          picks: [{ button: "Keep", value: "source", note: "Preserve this exact note\nSecond line" }],
+          values: { targets: ["one", "two"] },
+          skipped: ["deploy"],
+        }
+        yield* s.session.synthetic({
+          sessionID,
+          text: "Submitted inline card answer",
+          metadata: { openchamberUiBlockAnswer: { messageId: "msg_card", block: "block_key", answer: inlineAnswer } },
+          resume: false,
+        })
         yield* transformTools(
           registry,
           {
@@ -5640,6 +5654,9 @@ describe("SessionRunnerLLM", () => {
           expect(restored[0]).toContain("not necessarily a decision")
           expect(restored[0]).toContain("Page: Panel layout")
           expect(restored[0]).toContain("Submitted choice: Keep both panels")
+          expect(restored[0]).toContain("Preserve this exact note")
+          expect(restored[0]).toContain("skipped items are not agreement")
+          expect(restored[0]).toContain("deploy")
           expect(restored[0]).not.toContain("Original page")
           expect(JSON.stringify(yield* s.messages)).not.toContain("<restored-question-context>")
         }
@@ -5661,12 +5678,16 @@ describe("SessionRunnerLLM", () => {
           summary: pageAnswer.summary,
           data: pageAnswer.data,
         })
+        expect(forkCache?.entries.find((entry) => entry.type === "ui")).toMatchObject({
+          source: { messageId: "msg_card", block: "block_key" },
+          data: inlineAnswer,
+        })
         yield* s.session.revert.stage({ sessionID, messageID: first.id, files: false })
         yield* s.session.revert.commit(sessionID)
         expect(yield* SessionQuestionContext.load(s.db, sessionID, yield* s.context)).toBeUndefined()
         expect(
           (yield* SessionQuestionContext.load(s.db, fork.id, yield* s.session.context(fork.id)))?.entries,
-        ).toHaveLength(2)
+        ).toHaveLength(3)
       },
     )
   }
