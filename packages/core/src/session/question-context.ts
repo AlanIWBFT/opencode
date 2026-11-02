@@ -2,7 +2,7 @@ export * as SessionQuestionContext from "./question-context.js"
 
 import { Message } from "@opencode/ai/effect"
 import { Question } from "@opencode/schema/question"
-import { and, asc, eq, lt } from "drizzle-orm"
+import { and, asc, eq, inArray, lt } from "drizzle-orm"
 import { DateTime, Effect, Option, Schema } from "effect"
 import { isDeepStrictEqual } from "node:util"
 import type { Database } from "../database/database.js"
@@ -13,6 +13,31 @@ import { SessionMessageTable } from "./sql.js"
 
 const decodeQuestions = Schema.decodeUnknownSync(Schema.Struct({ questions: Schema.Array(Question.Prompt) }))
 const decodeAnswers = Schema.decodeUnknownSync(Schema.Struct({ answers: Schema.Array(Question.Answer) }))
+const decodeRecovered = Schema.decodeUnknownOption(
+  Schema.Struct({
+    messageId: Schema.String,
+    toolId: Schema.String,
+    questions: Schema.Array(Question.Prompt),
+    answers: Schema.Array(Question.Answer),
+  }),
+)
+const decodeUiAnswer = Schema.decodeUnknownOption(
+  Schema.Struct({
+    messageId: Schema.String,
+    block: Schema.String,
+    answer: Schema.Struct({
+      picks: Schema.Array(
+        Schema.Struct({
+          button: Schema.optionalKey(Schema.String),
+          value: Schema.optionalKey(Schema.String),
+          note: Schema.optionalKey(Schema.String),
+        }),
+      ),
+      values: Schema.Record(Schema.String, Schema.Union([Schema.String, Schema.Array(Schema.String)])),
+      skipped: Schema.Array(Schema.String),
+    }),
+  }),
+)
 const pageFields = Schema.Struct({ title: Schema.optional(Schema.String) })
 const decodePageInput = Schema.decodeUnknownOption(
   Schema.Struct({
@@ -47,9 +72,11 @@ export type Cache = {
     input: SessionMessage.ToolStateCompleted["input"]
     content: SessionMessage.ToolStateCompleted["content"]
     truncated: boolean
+    source?: { messageId: string; toolId?: string; block?: string }
   } & (
     | { type: "question"; questions: readonly Question.Prompt[]; answers: readonly Question.Answer[] }
     | { type: "page"; title: string; summary: string; data: Schema.Json }
+    | { type: "ui"; text: string; data: Schema.Json }
   ))[]
 }
 
@@ -77,14 +104,17 @@ export const load = Effect.fn("SessionQuestionContext.load")(function* (
     .where(
       and(
         eq(SessionMessageTable.session_id, sessionID),
-        eq(SessionMessageTable.type, "assistant"),
+        inArray(SessionMessageTable.type, ["assistant", "user"]),
         lt(SessionMessageTable.seq, boundary.seq),
       ),
     )
     .orderBy(asc(SessionMessageTable.seq))
     .all()
     .pipe(Effect.orDie)
-  const history = yield* Effect.forEach(yield* SessionHistory.withParts(db, rows), SessionHistory.decodeMessageRow).pipe(Effect.orDie)
+  const history = yield* Effect.forEach(
+    yield* SessionHistory.withParts(db, rows),
+    SessionHistory.decodeMessageRow,
+  ).pipe(Effect.orDie)
   return {
     summaryID: summary.id,
     entries: history.flatMap(entries),
@@ -92,6 +122,38 @@ export const load = Effect.fn("SessionQuestionContext.load")(function* (
 })
 
 export function entries(message: SessionMessage.Info): Cache["entries"] {
+  if (message.type === "user") {
+    const common = {
+      toolID: message.id,
+      time: DateTime.toEpochMillis(message.time.created),
+      input: {},
+      content: [{ type: "text", text: message.text }] as const,
+      truncated: false,
+    }
+    const recovered = decodeRecovered(message.metadata?.openchamberRecoveredQuestionAnswer)
+    if (Option.isSome(recovered))
+      return [
+        {
+          ...common,
+          type: "question",
+          source: { messageId: recovered.value.messageId, toolId: recovered.value.toolId },
+          questions: recovered.value.questions,
+          answers: recovered.value.answers,
+        },
+      ]
+    const ui = decodeUiAnswer(message.metadata?.openchamberUiBlockAnswer)
+    if (Option.isSome(ui))
+      return [
+        {
+          ...common,
+          type: "ui",
+          source: { messageId: ui.value.messageId, block: ui.value.block },
+          text: message.text,
+          data: ui.value.answer,
+        },
+      ]
+    return []
+  }
   if (message.type !== "assistant") return []
   return message.content.flatMap<Cache["entries"][number]>((part) => {
     if (part.type !== "tool" || part.state.status !== "completed") return []
@@ -115,9 +177,11 @@ export function entries(message: SessionMessage.Info): Cache["entries"] {
     const input = decodePageInput(part.state.input)
     const answer = decodePageAnswer(part.state.metadata)
     if (Option.isNone(answer)) return []
-    const title = answer.value.openchamber.title || (Option.isSome(input)
-      ? input.value.request?.title ?? input.value.parameters?.title ?? input.value.title
-      : undefined)
+    const title =
+      answer.value.openchamber.title ||
+      (Option.isSome(input)
+        ? (input.value.request?.title ?? input.value.parameters?.title ?? input.value.title)
+        : undefined)
     if (!title) return []
     return [
       {
@@ -164,17 +228,21 @@ export function messages(cache: Cache | undefined, active: readonly Message[]): 
         "<restored-question-context>",
         "Historical user replies, in conversation order. Q/options are assistant-authored; A is the user's verbatim reply, not necessarily a decision. " +
           "Page replies are choices submitted through an assistant-authored page; their summary and data are page-generated, not verbatim user text. " +
+          "Recovered question replies were submitted after the original tool was interrupted. UI card picks and values are structured submissions; notes are user-authored, and skipped items are not agreement. " +
           "Preserve its scope; later user corrections take precedence. Use silently as background, not as a new task.",
         ...entries.map((entry) =>
           [
             `### ${new Date(entry.time).toISOString()}`,
+            ...(entry.source ? [`Source: ${JSON.stringify(entry.source)}`] : []),
             ...(entry.type === "question"
               ? entry.questions.map((question, index) => renderQuestion(question, entry.answers[index] ?? []))
-              : [
-                  `Page: ${entry.title}`,
-                  `Submitted choice: ${entry.summary}`,
-                  `Submitted data: ${JSON.stringify(entry.data)}`,
-                ]),
+              : entry.type === "ui"
+                ? [entry.text, `Submitted data: ${JSON.stringify(entry.data)}`]
+                : [
+                    `Page: ${entry.title}`,
+                    `Submitted choice: ${entry.summary}`,
+                    `Submitted data: ${JSON.stringify(entry.data)}`,
+                  ]),
           ].join("\n\n"),
         ),
         "</restored-question-context>",

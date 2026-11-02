@@ -43,66 +43,127 @@ function restore(questions: Question.Prompt[], answers: Question.Answer[]) {
 }
 
 describe("question context rendering", () => {
+  test("restores interrupted question submissions and UI notes and skipped choices from explicit metadata only", () => {
+    const user = (metadata: unknown) =>
+      Schema.decodeUnknownSync(SessionMessage.Info)({
+        id: "msg_answer",
+        type: "user",
+        text: "Submitted answer",
+        time: { created: 1 },
+        metadata,
+      })
+    const recovered = SessionQuestionContext.entries(
+      user({
+        openchamberRecoveredQuestionAnswer: {
+          messageId: "msg_question",
+          toolId: "call_interrupted",
+          questions: [question],
+          answers: [["Code", "Keep my exact note\nSecond line"]],
+        },
+      }),
+    )
+    expect(recovered).toHaveLength(1)
+    const ui = SessionQuestionContext.entries(
+      user({
+        openchamberUiBlockAnswer: {
+          messageId: "msg_card",
+          block: "block_key",
+          answer: {
+            picks: [{ button: "Keep", value: "source", note: "Do not restart" }],
+            values: { targets: ["one", "two"] },
+            skipped: ["deploy"],
+          },
+        },
+      }),
+    )
+    expect(ui).toHaveLength(1)
+    const restored = JSON.stringify(
+      SessionQuestionContext.messages({ summaryID: SessionMessage.ID.create(), entries: [...recovered, ...ui] }, []),
+    )
+    for (const text of [
+      "call_interrupted",
+      "Second line",
+      "Do not restart",
+      "deploy",
+      "skipped items are not agreement",
+    ])
+      expect(restored).toContain(text)
+    expect(SessionQuestionContext.entries(user({}))).toEqual([])
+    expect(
+      SessionQuestionContext.entries(user({ openchamberRecoveredQuestionAnswer: { questions: [question] } })),
+    ).toEqual([])
+  })
+
   test.each([
     { label: "legacy input title", inputTitle: "Choose a layout", resolvedTitle: undefined },
     { label: "resolved title without input title", inputTitle: undefined, resolvedTitle: "Choose a layout" },
     { label: "resolved title precedence", inputTitle: "Old input title", resolvedTitle: "Choose a layout" },
-  ])("restores page choices using $label without HTML and deduplicates intact calls", ({ inputTitle, resolvedTitle }) => {
-    const input = {
-      request: {
-        action: "render.page",
-        ...(inputTitle ? { title: inputTitle } : {}),
-        html: "<html>private layout markup</html>",
-        awaitAnswer: true,
-      },
-    }
-    const answer = { answered: true, summary: "Two columns", data: { columns: 2, note: "保留侧栏" } }
-    const message = Schema.decodeUnknownSync(SessionMessage.Info)({
-      id: "msg_page",
-      type: "assistant",
-      agent: "build",
-      model: { providerID: "openai", id: "test" },
-      time: { created: 0 },
-      content: [
-        {
-          type: "tool",
-          id: "call_page",
-          name: "openchamber_render",
-          time: { created: 0, completed: 1 },
-          state: {
-            status: "completed",
-            input,
-            content: [{ type: "text", text: JSON.stringify({ answer }) }],
-            metadata: { openchamber: { action: "render.page", ok: true, answer, ...(resolvedTitle ? { title: resolvedTitle } : {}) } },
-          },
+  ])(
+    "restores page choices using $label without HTML and deduplicates intact calls",
+    ({ inputTitle, resolvedTitle }) => {
+      const input = {
+        request: {
+          action: "render.page",
+          ...(inputTitle ? { title: inputTitle } : {}),
+          html: "<html>private layout markup</html>",
+          awaitAnswer: true,
         },
-      ],
-    })
-    const entries = SessionQuestionContext.entries(message)
-    expect(entries).toHaveLength(1)
-    const saved = { summaryID: SessionMessage.ID.create(), entries }
-    const restored = JSON.stringify(SessionQuestionContext.messages(saved, []))
-    expect(restored).toContain("Choose a layout")
-    expect(restored).toContain("Two columns")
-    expect(restored).toContain("保留侧栏")
-    expect(restored).toContain("page-generated, not verbatim user text")
-    expect(restored).not.toContain("private layout markup")
-    const entry = entries[0]
-    const call = Message.make({
-      role: "assistant",
-      content: [ToolCallPart.make({ id: entry.toolID, name: "openchamber_render", input })],
-    })
-    const result = Message.tool(
-      ToolResultPart.make({
-        id: entry.toolID,
-        name: "openchamber_render",
-        resultType: "content",
-        result: entry.content,
-      }),
-    )
-    expect(SessionQuestionContext.messages(saved, [call, result])).toEqual([])
-    expect(SessionQuestionContext.messages(saved, [call])).toHaveLength(1)
-  })
+      }
+      const answer = { answered: true, summary: "Two columns", data: { columns: 2, note: "保留侧栏" } }
+      const message = Schema.decodeUnknownSync(SessionMessage.Info)({
+        id: "msg_page",
+        type: "assistant",
+        agent: "build",
+        model: { providerID: "openai", id: "test" },
+        time: { created: 0 },
+        content: [
+          {
+            type: "tool",
+            id: "call_page",
+            name: "openchamber_render",
+            time: { created: 0, completed: 1 },
+            state: {
+              status: "completed",
+              input,
+              content: [{ type: "text", text: JSON.stringify({ answer }) }],
+              metadata: {
+                openchamber: {
+                  action: "render.page",
+                  ok: true,
+                  answer,
+                  ...(resolvedTitle ? { title: resolvedTitle } : {}),
+                },
+              },
+            },
+          },
+        ],
+      })
+      const entries = SessionQuestionContext.entries(message)
+      expect(entries).toHaveLength(1)
+      const saved = { summaryID: SessionMessage.ID.create(), entries }
+      const restored = JSON.stringify(SessionQuestionContext.messages(saved, []))
+      expect(restored).toContain("Choose a layout")
+      expect(restored).toContain("Two columns")
+      expect(restored).toContain("保留侧栏")
+      expect(restored).toContain("page-generated, not verbatim user text")
+      expect(restored).not.toContain("private layout markup")
+      const entry = entries[0]
+      const call = Message.make({
+        role: "assistant",
+        content: [ToolCallPart.make({ id: entry.toolID, name: "openchamber_render", input })],
+      })
+      const result = Message.tool(
+        ToolResultPart.make({
+          id: entry.toolID,
+          name: "openchamber_render",
+          resultType: "content",
+          result: entry.content,
+        }),
+      )
+      expect(SessionQuestionContext.messages(saved, [call, result])).toEqual([])
+      expect(SessionQuestionContext.messages(saved, [call])).toHaveLength(1)
+    },
+  )
 
   test.each([undefined, { answered: false, reason: "chat" }])(
     "does not restore pages without a submitted answer: %j",
