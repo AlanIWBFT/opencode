@@ -252,22 +252,33 @@ export const Plugin = {
                   })
                 const response = yield* execute(http, check, url, input.format).pipe(
                   Effect.catchIf(isCloudflareChallenge, () => execute(http, check, url, input.format, "opencode")),
-                  Effect.catchTag("HttpClientError", (error) =>
+                  Effect.catchIf(HttpClientError.isHttpClientError, (error) =>
                     Effect.gen(function* () {
                       if (error.reason._tag !== "StatusCodeError") return yield* Effect.fail(error)
                       const response = error.reason.response
-                      failure = WebDiagnostic.diagnose({ source: "target_page", status: response.status, headers: response.headers })
+                      failure = WebDiagnostic.diagnose({
+                        source: "target_page",
+                        status: response.status,
+                        headers: response.headers,
+                      })
                       if (failure.failureKind === "browser_challenge")
                         return yield* Effect.fail(new Error(WebDiagnostic.message(failure)))
                       const body = yield* collectResponsePrefix(response, 64 * 1024)
                       failure = WebDiagnostic.diagnose({
-                        source: "target_page", status: response.status, headers: response.headers, body: new TextDecoder().decode(body),
+                        source: "target_page",
+                        status: response.status,
+                        headers: response.headers,
+                        body: new TextDecoder().decode(body),
                       })
                       return yield* Effect.fail(new Error(WebDiagnostic.message(failure)))
                     }),
                   ),
                 )
-                const headerDiagnostic = WebDiagnostic.diagnose({ source: "target_page", status: response.status, headers: response.headers })
+                const headerDiagnostic = WebDiagnostic.diagnose({
+                  source: "target_page",
+                  status: response.status,
+                  headers: response.headers,
+                })
                 if (headerDiagnostic.failureKind === "browser_challenge")
                   return yield* Effect.fail(new Error(WebDiagnostic.message(headerDiagnostic)))
                 const contentType = response.headers["content-type"] || ""
@@ -278,8 +289,13 @@ export const Plugin = {
                   return yield* Effect.fail(new Error(`Unsupported fetched file content type: ${mime}`))
                 const body = yield* collectBody(response)
                 const diagnostic = WebDiagnostic.diagnose({
-                  source: "target_page", status: response.status, headers: response.headers,
-                  body: mime === "text/html" || mime === "application/xhtml+xml" ? new TextDecoder().decode(body) : undefined,
+                  source: "target_page",
+                  status: response.status,
+                  headers: response.headers,
+                  body:
+                    mime === "text/html" || mime === "application/xhtml+xml"
+                      ? new TextDecoder().decode(body)
+                      : undefined,
                 })
                 if (diagnostic.failureKind === "browser_challenge")
                   return yield* Effect.fail(new Error(WebDiagnostic.message(diagnostic)))

@@ -5608,8 +5608,8 @@ describe("SessionRunnerLLM", () => {
           { codemode: false },
         )
         yield* s.llm.push(
-          TestLLM.tool("historical-question", "question", input),
-          TestLLM.tool("historical-page", "openchamber_render", {
+          TestLLM.toolCall("historical-question", "question", input),
+          TestLLM.toolCall("historical-page", "openchamber_render", {
             request: { title: "Panel layout", html: "<html>Original page</html>" },
           }),
           TestLLM.text("Recorded", "question-recorded"),

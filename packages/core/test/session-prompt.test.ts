@@ -318,14 +318,29 @@ describe("Session.prompt", () => {
       const session = yield* Session.Service
       const { db } = yield* Database.Service
       const bus = yield* Bus.Service
-      const cancelled = yield* session.prompt({ sessionID, text: "cancel", context: [{ text: "cancelled context" }], delivery: "queue", resume: false })
+      const cancelled = yield* session.prompt({
+        sessionID,
+        text: "cancel",
+        context: [{ text: "cancelled context" }],
+        delivery: "queue",
+        resume: false,
+      })
       yield* session.cancelInbox({ sessionID, inboxID: cancelled.id })
       yield* SessionInbox.promote(db, bus, sessionID, "input")
       expect(yield* session.messages({ sessionID })).toEqual([])
-      const steered = yield* session.prompt({ sessionID, text: "steer", context: [{ text: "kept context" }], delivery: "queue", resume: false })
+      const steered = yield* session.prompt({
+        sessionID,
+        text: "steer",
+        context: [{ text: "kept context" }],
+        delivery: "queue",
+        resume: false,
+      })
       yield* session.steerInbox({ sessionID, inboxID: steered.id })
       yield* SessionInbox.promote(db, bus, sessionID, "steer")
-      expect((yield* session.messages({ sessionID, order: "asc" })).map((message) => message.type)).toEqual(["synthetic", "user"])
+      expect((yield* session.messages({ sessionID, order: "asc" })).map((message) => message.type)).toEqual([
+        "synthetic",
+        "user",
+      ])
       expect(yield* admittedCount).toBe(0)
     }),
   )
@@ -339,7 +354,15 @@ describe("Session.prompt", () => {
       const first = yield* session.prompt({ sessionID, text: "original", resume: false })
       yield* SessionInbox.promote(db, bus, sessionID, "input")
       yield* session.revert.stage({ sessionID, messageID: first.id, files: false })
-      const result = yield* session.prompt({ sessionID, text: "invalid", context: [{ text: "must not leak" }], files: [{ uri: "unsupported://file" }], resume: false }).pipe(Effect.result)
+      const result = yield* session
+        .prompt({
+          sessionID,
+          text: "invalid",
+          context: [{ text: "must not leak" }],
+          files: [{ uri: "unsupported://file" }],
+          resume: false,
+        })
+        .pipe(Effect.result)
       expect(result._tag).toBe("Failure")
       expect((yield* session.get(sessionID)).revert?.messageID).toBe(first.id)
       expect(yield* admittedCount).toBe(0)
@@ -362,7 +385,9 @@ describe("Session.prompt", () => {
           ? Effect.die(new Error("admission failed"))
           : Effect.void,
       )
-      const exit = yield* session.prompt({ sessionID, text: "rejected", context: [{ text: "must not leak" }], resume: false }).pipe(Effect.exit)
+      const exit = yield* session
+        .prompt({ sessionID, text: "rejected", context: [{ text: "must not leak" }], resume: false })
+        .pipe(Effect.exit)
       expect(exit._tag).toBe("Failure")
       expect((yield* session.get(sessionID)).revert?.messageID).toBe(first.id)
       expect((yield* session.messages({ sessionID })).map((message) => message.id)).toEqual([first.id])
@@ -771,7 +796,7 @@ describe("Session.prompt", () => {
 
       expect(child.data).toMatchObject({ files: [{ data: pngBase64, mime: "image/png" }] })
       expect(yield* session.messages({ sessionID: imported.id, order: "asc" })).toEqual(
-        mediaMessages("ses_import_broken"),
+        mediaMessages("ses_import_broken").map((message) => ({ ...message, seq: expect.any(Number) })),
       )
       expect(yield* db.select().from(BlobTable).all().pipe(Effect.orDie)).toEqual([])
     }),
@@ -826,7 +851,7 @@ describe("Session.prompt", () => {
 
       const hash = SessionBlob.hashBytes(Buffer.from(pngBase64, "base64"))
       expect(yield* db.select({ hash: BlobTable.hash }).from(BlobTable).all().pipe(Effect.orDie)).toEqual([{ hash }])
-      expect(yield* session.messages({ sessionID: imported.id, order: "asc" })).toEqual(mediaMessages("ses_import_dev"))
+      expect((yield* session.messages({ sessionID: imported.id, order: "asc" })).map(({ seq, ...message }) => message)).toEqual(mediaMessages("ses_import_dev"))
     }),
   )
 
@@ -873,8 +898,12 @@ describe("Session.prompt", () => {
           .all()
           .pipe(Effect.orDie),
       ).toEqual(mediaRows.map((row) => ({ session: media.id, message: row.id, seq: row.seq })))
-      expect(yield* session.messages({ sessionID: media.id, order: "asc" })).toEqual(messages("ses_import_media"))
-      expect(yield* session.messages({ sessionID: plain.id, order: "asc" })).toEqual(messages("ses_import_plain"))
+      expect(yield* session.messages({ sessionID: media.id, order: "asc" })).toEqual(
+        messages("ses_import_media").map((message) => ({ ...message, seq: expect.any(Number) })),
+      )
+      expect(yield* session.messages({ sessionID: plain.id, order: "asc" })).toEqual(
+        messages("ses_import_plain").map((message) => ({ ...message, seq: expect.any(Number) })),
+      )
     }),
   )
 
@@ -1552,14 +1581,19 @@ describe("Session.inbox", () => {
       const inboxID = SessionMessage.ID.create()
       wakeCalls.length = 0
       expect(yield* session.closeInbox({ sessionID, inboxID })).toEqual({ state: "closed" })
-      expect(yield* session.prompt({ sessionID, id: inboxID, text: "late" }).pipe(Effect.flip)).toMatchObject({ _tag: "Session.PromptConflictError" })
-      expect(yield* session.synthetic({ sessionID, id: inboxID, text: "late" }).pipe(Effect.flip)).toMatchObject({ _tag: "Session.SyntheticConflictError" })
+      expect(yield* session.prompt({ sessionID, id: inboxID, text: "late" }).pipe(Effect.flip)).toMatchObject({
+        _tag: "Session.PromptConflictError",
+      })
+      expect(yield* session.synthetic({ sessionID, id: inboxID, text: "late" }).pipe(Effect.flip)).toMatchObject({
+        _tag: "Session.SyntheticConflictError",
+      })
       expect(yield* session.inbox(sessionID)).toEqual([])
       expect(wakeCalls).toEqual([])
       // Reconstruct the owner over the same DB: closure is not an in-memory flag.
       const restored = yield* SessionInbox.make()
-      expect(yield* restored.reconcile({ sessionID, id: inboxID, type: "user", delivery: "steer" }).pipe(Effect.flip))
-        .toMatchObject({ _tag: "SessionInbox.LifecycleConflict" })
+      expect(
+        yield* restored.reconcile({ sessionID, id: inboxID, type: "user", delivery: "steer" }).pipe(Effect.flip),
+      ).toMatchObject({ _tag: "SessionInbox.LifecycleConflict" })
       expect(yield* session.closeInbox({ sessionID, inboxID })).toEqual({ state: "closed" })
     }),
   )
@@ -1568,21 +1602,42 @@ describe("Session.inbox", () => {
     Effect.gen(function* () {
       yield* setup
       const session = yield* Session.Service
-      const owned = yield* session.prompt({ sessionID, text: "review", context: [{ text: "review context" }], resume: false })
+      const owned = yield* session.prompt({
+        sessionID,
+        text: "review",
+        context: [{ text: "review context" }],
+        resume: false,
+      })
       const ordinary = yield* session.prompt({ sessionID, text: "user queue", delivery: "queue", resume: false })
       const notification = yield* session.synthetic({ sessionID, text: "independent completion", resume: false })
       const { db } = yield* Database.Service
       const otherSessionID = Session.ID.make("ses_other_closure")
-      yield* db.insert(SessionTable).values({ id: otherSessionID, project_id: Project.ID.global, slug: "other", directory: "/project", title: "other", version: "test" })
-        .run().pipe(Effect.orDie)
-      expect(yield* session.closeInbox({ sessionID: otherSessionID, inboxID: owned.id }).pipe(Effect.flip))
-        .toMatchObject({ _tag: "Session.InboxConflictError" })
+      yield* db
+        .insert(SessionTable)
+        .values({
+          id: otherSessionID,
+          project_id: Project.ID.global,
+          slug: "other",
+          directory: "/project",
+          title: "other",
+          version: "test",
+        })
+        .run()
+        .pipe(Effect.orDie)
+      expect(
+        yield* session.closeInbox({ sessionID: otherSessionID, inboxID: owned.id }).pipe(Effect.flip),
+      ).toMatchObject({ _tag: "Session.InboxConflictError" })
       expect(yield* session.closeInbox({ sessionID, inboxID: owned.id })).toEqual({ state: "cancelled" })
       expect((yield* session.inbox(sessionID)).map((item) => item.id)).toEqual([ordinary.id, notification.id])
       expect(yield* session.messages({ sessionID })).toEqual([])
-      expect(yield* session.prompt({ sessionID, id: owned.id, text: "retry" }).pipe(Effect.flip)).toMatchObject({ _tag: "Session.PromptConflictError" })
-      expect(yield* session.closeInbox({ sessionID: Session.ID.make("ses_missing"), inboxID: ordinary.id }).pipe(Effect.flip))
-        .toMatchObject({ _tag: "Session.NotFoundError" })
+      expect(yield* session.prompt({ sessionID, id: owned.id, text: "retry" }).pipe(Effect.flip)).toMatchObject({
+        _tag: "Session.PromptConflictError",
+      })
+      expect(
+        yield* session
+          .closeInbox({ sessionID: Session.ID.make("ses_missing"), inboxID: ordinary.id })
+          .pipe(Effect.flip),
+      ).toMatchObject({ _tag: "Session.NotFoundError" })
     }),
   )
 
@@ -1598,7 +1653,9 @@ describe("Session.inbox", () => {
       wakeCalls.length = 0
       expect(yield* session.closeInbox({ sessionID, inboxID: input.id })).toEqual({ state: "delivered" })
       expect(yield* session.messages({ sessionID })).toEqual(history)
-      expect(yield* session.synthetic({ sessionID, id: input.id, text: "retry" }).pipe(Effect.flip)).toMatchObject({ _tag: "Session.SyntheticConflictError" })
+      expect(yield* session.synthetic({ sessionID, id: input.id, text: "retry" }).pipe(Effect.flip)).toMatchObject({
+        _tag: "Session.SyntheticConflictError",
+      })
       expect(wakeCalls).toEqual([])
     }),
   )
@@ -1611,16 +1668,25 @@ describe("Session.inbox", () => {
       const entered = yield* Deferred.make<void>()
       const release = yield* Deferred.make<void>()
       const order: string[] = []
-      wakeWaiters.set(sessionID, Effect.gen(function* () {
-        yield* Deferred.succeed(entered, undefined)
-        yield* Deferred.await(release)
-        order.push("wake completed")
-      }))
+      wakeWaiters.set(
+        sessionID,
+        Effect.gen(function* () {
+          yield* Deferred.succeed(entered, undefined)
+          yield* Deferred.await(release)
+          order.push("wake completed")
+        }),
+      )
       try {
-        const sending = yield* session.prompt({ sessionID, id: inboxID, text: "review" }).pipe(Effect.forkChild({ startImmediately: true }))
+        const sending = yield* session
+          .prompt({ sessionID, id: inboxID, text: "review" })
+          .pipe(Effect.forkChild({ startImmediately: true }))
         yield* Deferred.await(entered)
         const closing = yield* session.closeInbox({ sessionID, inboxID }).pipe(
-          Effect.tap(() => Effect.sync(() => { order.push("closed") })),
+          Effect.tap(() =>
+            Effect.sync(() => {
+              order.push("closed")
+            }),
+          ),
           Effect.forkChild({ startImmediately: true }),
         )
         yield* Effect.yieldNow

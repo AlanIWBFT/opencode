@@ -122,7 +122,10 @@ export const create = (
           const publish = Effect.gen(function* () {
             yield* Ref.set(trailing, false)
             yield* Ref.set(publishedAt, yield* Clock.currentTimeMillis)
-            yield* context.progress({ toolCalls: yield* Ref.get(calls), ...(capture ? { codeModeRevision: revision } : {}) })
+            yield* context.progress({
+              toolCalls: yield* Ref.get(calls),
+              ...(capture ? { codeModeRevision: revision } : {}),
+            })
           })
           const record = (update: (items: Array<ChildCall>) => Array<ChildCall>) =>
             lock.withPermit(
@@ -144,57 +147,62 @@ export const create = (
             record,
             new Map(Array.from(inventory.tools.values(), (tool) => [qualifiedName(tool), tool.name])),
           )
-          const result = yield* runtime(inventory, (yield* vmEnabled) ? "vm" : "legacy").execute(code).pipe(Effect.provideService(Run, {
-            executeTool: (name, tool, input, call) =>
-              Effect.gen(function* () {
-                const index = progress.index(call)
-                const update = (value: Partial<ChildCall>) =>
-                  record((items) => {
-                    const next = [...items]
-                    next[index] = { ...items[index], ...value }
-                    return next
-                  })
-                const invocation = Effect.suspend(() =>
-                  executeTool(name, tool, input, {
-                    ...context,
-                    childID: String(index),
-                    registerCleanup: (cleanup) => {
-                      cleanups.push(cleanup)
-                    },
-                    progress: (metadata) => update({ metadata }).pipe(Effect.asVoid),
+          const result = yield* runtime(inventory, (yield* vmEnabled) ? "vm" : "legacy")
+            .execute(code)
+            .pipe(
+              Effect.provideService(Run, {
+                executeTool: (name, tool, input, call) =>
+                  Effect.gen(function* () {
+                    const index = progress.index(call)
+                    const update = (value: Partial<ChildCall>) =>
+                      record((items) => {
+                        const next = [...items]
+                        next[index] = { ...items[index], ...value }
+                        return next
+                      })
+                    const invocation = Effect.suspend(() =>
+                      executeTool(name, tool, input, {
+                        ...context,
+                        childID: String(index),
+                        registerCleanup: (cleanup) => {
+                          cleanups.push(cleanup)
+                        },
+                        progress: (metadata) => update({ metadata }).pipe(Effect.asVoid),
+                      }),
+                    )
+                    const policy =
+                      typeof tool.options?.codemode === "object" ? tool.options.codemode.concurrency : undefined
+                    const executed = yield* (() => {
+                      if (!policy) return invocation
+                      const suffix =
+                        policy.inputKey && typeof input === "object" && input !== null
+                          ? (input as Record<string, unknown>)[policy.inputKey]
+                          : undefined
+                      const key = JSON.stringify([policy.group, suffix])
+                      const semaphore = concurrency.get(key) ?? Semaphore.makeUnsafe(policy.limit)
+                      concurrency.set(key, semaphore)
+                      return semaphore.withPermit(invocation)
+                    })().pipe(
+                      Effect.mapError((error) => new ToolFailure({ message: toSessionError(error).message, error })),
+                    )
+                    const content = resultContent(executed)
+                    const outputFileParts = outputFiles(content)
+                    yield* update({
+                      content,
+                      ...(executed.metadata === undefined ? {} : { metadata: executed.metadata }),
+                    })
+                    if (outputFileParts.length > 0)
+                      yield* Ref.update(files, (items) => [...items, { index, files: outputFileParts }])
+                    return resultValue(executed)
                   }),
-                )
-                const policy =
-                  typeof tool.options?.codemode === "object" ? tool.options.codemode.concurrency : undefined
-                const executed = yield* (() => {
-                  if (!policy) return invocation
-                  const suffix =
-                    policy.inputKey && typeof input === "object" && input !== null
-                      ? (input as Record<string, unknown>)[policy.inputKey]
-                      : undefined
-                  const key = JSON.stringify([policy.group, suffix])
-                  const semaphore = concurrency.get(key) ?? Semaphore.makeUnsafe(policy.limit)
-                  concurrency.set(key, semaphore)
-                  return semaphore.withPermit(invocation)
-                })().pipe(Effect.mapError((error) => new ToolFailure({ message: toSessionError(error).message, error })))
-                const content = resultContent(executed)
-                const outputFileParts = outputFiles(content)
-                yield* update({
-                  content,
-                  ...(executed.metadata === undefined ? {} : { metadata: executed.metadata }),
-                })
-                if (outputFileParts.length > 0)
-                  yield* Ref.update(files, (items) => [...items, { index, files: outputFileParts }])
-                return resultValue(executed)
+                hooks: progress.hooks,
               }),
-            hooks: progress.hooks,
-          }),
-            Effect.onError(() =>
-              lock.withPermit(Ref.get(trailing).pipe(Effect.flatMap((pending) => (pending ? publish : Effect.void)))),
-            ),
-            Effect.provideService(CodeModeExecution.Service, context),
-            Effect.provideService(Permission.Service, permission),
-          )
+              Effect.onError(() =>
+                lock.withPermit(Ref.get(trailing).pipe(Effect.flatMap((pending) => (pending ? publish : Effect.void)))),
+              ),
+              Effect.provideService(CodeModeExecution.Service, context),
+              Effect.provideService(Permission.Service, permission),
+            )
           if (!result.ok) yield* cleanup
           const toolCalls = yield* Ref.get(calls)
           const collected = (yield* Ref.get(files))
@@ -226,7 +234,10 @@ export const create = (
             content,
             metadata,
           }
-        }).pipe(Effect.onExit((exit) => (Exit.isFailure(exit) ? cleanup : Effect.void)), Effect.scoped)
+        }).pipe(
+          Effect.onExit((exit) => (Exit.isFailure(exit) ? cleanup : Effect.void)),
+          Effect.scoped,
+        )
       }),
   } satisfies Info
 }

@@ -10,7 +10,6 @@ import { FSUtil } from "@opencode/util/fs-util"
 import { Effect, Schema } from "effect"
 import { ChildProcess } from "effect/process"
 import path from "node:path"
-import { Config } from "../../config.js"
 import { Environment } from "../../environment/index.js"
 import { FileAccess } from "../../file-access.js"
 import { Location } from "../../location.js"
@@ -85,7 +84,6 @@ export const Plugin = {
     const environments = yield* SessionEnvironment.Service
     const permission = yield* Permission.Service
     const access = yield* FileAccess.Service
-    const config = yield* Config.Service
     const hooks = yield* PluginHooks.Service
     const resolveShell = shellSelect
       .resolve({ priority: "compat" })
@@ -111,10 +109,7 @@ export const Plugin = {
       context: Tool.Context,
     ) {
       const target = yield* access.resolve({ path: cwd, kind: "directory" })
-      const portable =
-        Config.latest(yield* config.entries(), "experimental")?.portable_shell_scanner ??
-        (ctx.app.channel === "local" || ctx.app.channel === "dev")
-      const parsed = yield* ShellParse.scan(command, shell, target.absolute, { portable })
+      const parsed = yield* ShellParse.scan(command, shell, target.absolute)
       const directories = yield* Effect.forEach(parsed.directories, (directory) =>
         access.resolve({ path: FileAccess.resolvePath(target.absolute, directory), kind: "directory" }),
       )

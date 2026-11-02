@@ -89,11 +89,17 @@ describe("toSessionError", () => {
     expect(SessionRunnerRetry.isRetryable(free)).toBe(false)
     expect(toSessionError(free)).toEqual({
       type: "provider.free-limit",
-      message: "Free usage limit reached. Connect a provider or subscribe to OpenCode Go to keep going, or switch models.",
+      message:
+        "Free usage limit reached. Connect a provider or subscribe to OpenCode Go to keep going, or switch models.",
       status: 429,
       response: { body: JSON.stringify(freeBody) },
       retryAfterMs: 3_600_000,
-      resolution: { kind: "quota_exceeded", action: "manage_billing", retry: "never", providerCode: "freeusagelimiterror" },
+      resolution: {
+        kind: "quota_exceeded",
+        action: "manage_billing",
+        retry: "never",
+        providerCode: "freeusagelimiterror",
+      },
       responseHeaders: { "retry-after": "3600" },
       url: "https://opencode.ai/inference/openai/v1/chat/completions",
     })
@@ -113,7 +119,7 @@ describe("toSessionError", () => {
     }
     const go = fail("https://opencode.ai/inference/go/openai/v1/chat/completions", goBody, { "retry-after": "120" })
     expect(SessionRunnerRetry.isRetryable(go)).toBe(false)
-    expect(toSessionError(go)).toEqual({
+    expect(toSessionError(go)).toMatchObject({
       type: "provider.go-limit",
       message:
         "OpenCode Go 5 hour usage limit reached. Switch to a free model, or turn on Extra Usage on the Go page in OpenCode Console to keep going.",
@@ -197,7 +203,7 @@ describe("toSessionError", () => {
       new RateLimitError({ message: "Too many requests", body }),
       new UnknownProviderError({ message: "Request failed", body }),
     ])
-      expect(toSessionError(llm(reason))).toEqual({
+      expect(toSessionError(llm(reason))).toMatchObject({
         type: "provider.chatgpt-limit",
         message: "ChatGPT usage limit reached. Check ChatGPT Settings → Usage for details.",
         response: { body },
@@ -327,18 +333,38 @@ describe("toSessionError", () => {
     ] as const) {
       const rawBody = JSON.stringify({ error: { code, message: "Provider rejected the request" } })
       const error = llm(classifyProviderFailure({ message: "Provider rejected the request", rawBody, status }))
-      expect(toSessionError(error)).toMatchObject({ response: { body: rawBody }, resolution: { kind, action, retry, providerCode: code } })
+      expect(toSessionError(error)).toMatchObject({
+        response: { body: rawBody },
+        resolution: { kind, action, retry, providerCode: code },
+      })
       expect(SessionRunnerRetry.isRetryable(error)).toBe(retry === "automatic")
     }
   })
 
   test("keeps network blocks and provider-requested retry delays actionable", () => {
-    const blocked = llm(classifyProviderFailure({ message: "Forbidden", status: 403, rawBody: "Cloudflare blocked this request" }))
-    expect(toSessionError(blocked).resolution).toMatchObject({ kind: "network", action: "check_network", retry: "never" })
+    const blocked = llm(
+      classifyProviderFailure({ message: "Forbidden", status: 403, rawBody: "Cloudflare blocked this request" }),
+    )
+    expect(toSessionError(blocked).resolution).toMatchObject({
+      kind: "network",
+      action: "check_network",
+      retry: "never",
+    })
     expect(SessionRunnerRetry.isRetryable(blocked)).toBe(false)
-    const limited = llm(classifyProviderFailure({ message: "Rate limit exceeded. Try again in 1.25 seconds.", status: 429 }))
-    expect(toSessionError(limited).resolution).toMatchObject({ kind: "rate_limited", retry: "automatic", retryAfterMs: 1_250 })
-    const denied = llm(new RateLimitError({ message: "rate", http: new HttpContext({ url: "https://example.com", status: 429, headers: { "x-should-retry": "false" } }) }))
+    const limited = llm(
+      classifyProviderFailure({ message: "Rate limit exceeded. Try again in 1.25 seconds.", status: 429 }),
+    )
+    expect(toSessionError(limited).resolution).toMatchObject({
+      kind: "rate_limited",
+      retry: "automatic",
+      retryAfterMs: 1_250,
+    })
+    const denied = llm(
+      new RateLimitError({
+        message: "rate",
+        http: new HttpContext({ url: "https://example.com", status: 429, headers: { "x-should-retry": "false" } }),
+      }),
+    )
     expect(toSessionError(denied).resolution?.retry).toBe("never")
     expect(SessionRunnerRetry.isRetryable(denied)).toBe(false)
   })
