@@ -69,6 +69,11 @@ import type {
   SessionGenerateOutput,
   SessionInterruptInput,
   SessionInterruptOutput,
+  SessionStopInput,
+  SessionStopOutput,
+  SessionExecListOutput,
+  SessionExecStopInput,
+  SessionExecStopOutput,
   SessionBackgroundInput,
   SessionBackgroundOutput,
   SessionMessageGetInput,
@@ -751,6 +756,7 @@ export function make(options: ClientOptions) {
             body: {
               id: input["id"],
               text: input["text"],
+              context: input["context"],
               files: input["files"],
               agents: input["agents"],
               skills: input["skills"],
@@ -772,6 +778,7 @@ export function make(options: ClientOptions) {
             body: {
               name: input["name"],
               text: input["text"],
+              context: input["context"],
               files: input["files"],
               agents: input["agents"],
               skills: input["skills"],
@@ -956,6 +963,42 @@ export function make(options: ClientOptions) {
           },
           requestOptions,
         ),
+      stop: (input: SessionStopInput, requestOptions?: RequestOptions) =>
+        request<SessionStopOutput>(
+          {
+            method: "POST",
+            path: `/api/session/${encodeURIComponent(input.sessionID)}/stop`,
+            successStatus: 200,
+            declaredStatuses: [400, 401, 404],
+            empty: false,
+          },
+          requestOptions,
+        ),
+      exec: {
+        list: (requestOptions?: RequestOptions) =>
+          request<SessionExecListOutput>(
+            {
+              method: "GET",
+              path: `/api/session/exec`,
+              successStatus: 200,
+              declaredStatuses: [400, 401],
+              empty: false,
+            },
+            requestOptions,
+          ),
+        stop: (input: SessionExecStopInput, requestOptions?: RequestOptions) =>
+          request<SessionExecStopOutput>(
+            {
+              method: "POST",
+              path: `/api/session/${encodeURIComponent(input.sessionID)}/exec/stop`,
+              body: { execIDs: input["execIDs"] },
+              successStatus: 200,
+              declaredStatuses: [400, 401, 404],
+              empty: false,
+            },
+            requestOptions,
+          ),
+      },
       background: (input: SessionBackgroundInput, requestOptions?: RequestOptions) =>
         request<SessionBackgroundOutput>(
           {
@@ -2640,9 +2683,9 @@ export function make(options: ClientOptions) {
             {
               method: "DELETE",
               path: `/api/debug/location`,
-              query: { location: input?.["location"] },
+              query: { location: input?.["location"], preserveExec: input?.["preserveExec"] },
               successStatus: 204,
-              declaredStatuses: [400, 401],
+              declaredStatuses: [400, 401, 409],
               empty: true,
             },
             requestOptions,
