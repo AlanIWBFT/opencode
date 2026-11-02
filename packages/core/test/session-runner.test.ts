@@ -5786,8 +5786,8 @@ describe("SessionRunnerLLM", () => {
           { codemode: false },
         )
         yield* s.llm.push(
-          TestLLM.tool("historical-question", "question", input),
-          TestLLM.tool("historical-page", "openchamber_render", {
+          TestLLM.toolCall("historical-question", "question", input),
+          TestLLM.toolCall("historical-page", "openchamber_render", {
             action: "render.page",
             parameters: { title: "Panel layout", html: "<html>Original page</html>" },
           }),
