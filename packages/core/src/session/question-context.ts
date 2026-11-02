@@ -1,6 +1,6 @@
 export * as SessionQuestionContext from "./question-context.js"
 
-import { Message } from "@opencode/ai/effect"
+import { Message, type ContentPart } from "@opencode/ai/effect"
 import { Question } from "@opencode/schema/question"
 import { and, asc, eq, inArray, lt } from "drizzle-orm"
 import { DateTime, Effect, Option, Schema } from "effect"
@@ -103,7 +103,7 @@ export const load = Effect.fn("SessionQuestionContext.load")(function* (
     .where(
       and(
         eq(SessionMessageTable.session_id, sessionID),
-        inArray(SessionMessageTable.type, ["assistant", "user"]),
+        inArray(SessionMessageTable.type, ["assistant", "user", "synthetic"]),
         lt(SessionMessageTable.seq, boundary.seq),
       ),
     )
@@ -121,7 +121,7 @@ export const load = Effect.fn("SessionQuestionContext.load")(function* (
 })
 
 export function entries(message: SessionMessage.Info): Cache["entries"] {
-  if (message.type === "user") {
+  if (message.type === "user" || message.type === "synthetic") {
     const common = {
       toolID: message.id,
       time: DateTime.toEpochMillis(message.time.created),
@@ -196,7 +196,8 @@ export function entries(message: SessionMessage.Info): Cache["entries"] {
 
 export function messages(cache: Cache | undefined, active: readonly Message[]): Message[] {
   if (!cache) return []
-  const parts = active.flatMap((message) => message.content)
+  const parts = active.filter((message) => message.role === "assistant" || message.role === "tool")
+    .flatMap<ContentPart>((message) => message.content)
   const calls = new Map(
     parts.flatMap((part) =>
       part.type === "tool-call" && (part.name === "question" || part.name === "openchamber_render")
