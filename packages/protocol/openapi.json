@@ -1525,7 +1525,7 @@
                   "type": "object",
                   "properties": {
                     "data": {
-                      "$ref": "#/components/schemas/SessionTransfer.Data"
+                      "$ref": "#/components/schemas/SessionTransfer.Exported"
                     }
                   },
                   "required": ["data"],
@@ -1809,7 +1809,7 @@
             }
           }
         },
-        "description": "Update mutable session properties.",
+        "description": "Update mutable session properties without loading the session directory. An empty title regenerates it using the directory's model configuration.",
         "summary": "Update session",
         "requestBody": {
           "content": {
@@ -2290,6 +2290,12 @@
                   "text": {
                     "type": "string"
                   },
+                  "context": {
+                    "type": "array",
+                    "items": {
+                      "$ref": "#/components/schemas/Prompt.Context"
+                    }
+                  },
                   "files": {
                     "type": "array",
                     "items": {
@@ -2424,6 +2430,12 @@
                   },
                   "text": {
                     "type": "string"
+                  },
+                  "context": {
+                    "type": "array",
+                    "items": {
+                      "$ref": "#/components/schemas/Prompt.Context"
+                    }
                   },
                   "files": {
                     "type": "array",
@@ -3677,6 +3689,92 @@
         }
       }
     },
+    "/api/session/{sessionID}/inbox/{inboxID}/close": {
+      "post": {
+        "tags": ["session"],
+        "operationId": "session.inbox.close",
+        "parameters": [
+          {
+            "name": "sessionID",
+            "in": "path",
+            "schema": {
+              "$ref": "#/components/schemas/Session.ID"
+            },
+            "required": true
+          },
+          {
+            "name": "inboxID",
+            "in": "path",
+            "schema": {
+              "$ref": "#/components/schemas/Session.Message.ID"
+            },
+            "required": true
+          }
+        ],
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/Session.Inbox.CloseResult"
+                    }
+                  },
+                  "required": ["data"],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "InvalidRequestError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvalidRequestErrorEncoded"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "UnauthorizedError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnauthorizedErrorEncoded"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "SessionNotFoundError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionNotFoundErrorEncoded"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "ConflictError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConflictErrorEncoded"
+                }
+              }
+            }
+          }
+        },
+        "description": "Wait for in-flight user/synthetic admission and its wake, permanently reject this ID for this session, and cancel it if still pending. Delivered history is retained. Idempotent across retries and backend restarts. Ordinary inbox cancellation does not close admission.",
+        "summary": "Close admission for one input ID"
+      }
+    },
     "/api/experimental/session/{sessionID}/instructions/entries": {
       "get": {
         "tags": ["session"],
@@ -4240,6 +4338,214 @@
         "summary": "Interrupt session execution"
       }
     },
+    "/api/session/{sessionID}/stop": {
+      "post": {
+        "tags": ["session"],
+        "operationId": "session.stop",
+        "parameters": [
+          {
+            "name": "sessionID",
+            "in": "path",
+            "schema": {
+              "$ref": "#/components/schemas/Session.ID"
+            },
+            "required": true
+          }
+        ],
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "SessionStopResponse",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionStopResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "InvalidRequestError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvalidRequestErrorEncoded"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "UnauthorizedError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnauthorizedErrorEncoded"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "SessionNotFoundError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionNotFoundErrorEncoded"
+                }
+              }
+            }
+          }
+        },
+        "description": "Interrupt this session's execution and close its persistent command slots, including detached commands. Only existing process-local owners are stopped; no locations are initialized. Background child sessions are not stopped. Later input and background notifications may resume this session. Counts describe attempted termination of running commands; failed may be nonzero.",
+        "summary": "Stop session and its persistent commands"
+      }
+    },
+    "/api/session/exec": {
+      "get": {
+        "tags": ["session"],
+        "operationId": "session.exec.list",
+        "parameters": [],
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Session.Exec.Running"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "InvalidRequestError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvalidRequestErrorEncoded"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "UnauthorizedError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnauthorizedErrorEncoded"
+                }
+              }
+            }
+          }
+        },
+        "description": "List commands owned by this process across existing locations without starting any locations. Idle shell slots are excluded.",
+        "summary": "List running persistent commands"
+      }
+    },
+    "/api/session/{sessionID}/exec/stop": {
+      "post": {
+        "tags": ["session"],
+        "operationId": "session.exec.stop",
+        "parameters": [
+          {
+            "name": "sessionID",
+            "in": "path",
+            "schema": {
+              "$ref": "#/components/schemas/Session.ID"
+            },
+            "required": true
+          }
+        ],
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "matched": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 9007199254740991
+                    },
+                    "terminated": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 9007199254740991
+                    },
+                    "failed": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 9007199254740991
+                    }
+                  },
+                  "required": ["matched", "terminated", "failed"],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "InvalidRequestError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvalidRequestErrorEncoded"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "UnauthorizedError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnauthorizedErrorEncoded"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "SessionNotFoundError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionNotFoundErrorEncoded"
+                }
+              }
+            }
+          }
+        },
+        "description": "Stops only the selected commands owned by this session. Does not interrupt the agent or other commands, start locations, or consume command output. Already completed or unknown IDs are a no-op.",
+        "summary": "Stop selected persistent commands",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "execIDs": {
+                    "type": "array",
+                    "items": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 9007199254740991
+                    }
+                  }
+                },
+                "required": ["execIDs"],
+                "additionalProperties": false
+              }
+            }
+          },
+          "required": true
+        }
+      }
+    },
     "/api/session/{sessionID}/background": {
       "post": {
         "tags": ["session"],
@@ -4326,7 +4632,7 @@
                   "type": "object",
                   "properties": {
                     "data": {
-                      "$ref": "#/components/schemas/Session.Message.Info"
+                      "$ref": "#/components/schemas/Session.Message.StoredInfo"
                     }
                   },
                   "required": ["data"],
@@ -10606,6 +10912,7 @@
                     "session.moved",
                     "session.renamed",
                     "session.metadata.updated",
+                    "session.archive.updated",
                     "session.permissions",
                     "session.viewed",
                     "session.archived",
@@ -10643,6 +10950,9 @@
                     "session.tool.progress",
                     "session.tool.success",
                     "session.tool.failed",
+                    "session.exec.updated",
+                    "session.exec.captured",
+                    "session.script.captured",
                     "session.retry.scheduled",
                     "session.compaction.started",
                     "session.compaction.delta",
@@ -10715,6 +11025,7 @@
                           "session.moved",
                           "session.renamed",
                           "session.metadata.updated",
+                          "session.archive.updated",
                           "session.permissions",
                           "session.viewed",
                           "session.archived",
@@ -10752,6 +11063,9 @@
                           "session.tool.progress",
                           "session.tool.success",
                           "session.tool.failed",
+                          "session.exec.updated",
+                          "session.exec.captured",
+                          "session.script.captured",
                           "session.retry.scheduled",
                           "session.compaction.started",
                           "session.compaction.delta",
@@ -15808,6 +16122,22 @@
             "required": false,
             "style": "deepObject",
             "explode": true
+          },
+          {
+            "name": "preserveExec",
+            "in": "query",
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "enum": ["true", "false"]
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "required": false
           }
         ],
         "security": [],
@@ -15834,9 +16164,19 @@
                 }
               }
             }
+          },
+          "409": {
+            "description": "ConflictError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConflictErrorEncoded"
+                }
+              }
+            }
           }
         },
-        "description": "Dispose the requested location's cached services so its next use boots them fresh.",
+        "description": "Dispose the requested location's cached services so its next use boots them fresh. With preserveExec, live or starting persistent command slots prevent disposal (409).",
         "summary": "Evict a loaded location"
       }
     },
@@ -16168,6 +16508,37 @@
                 "properties": {
                   "query": {
                     "type": "string"
+                  },
+                  "numResults": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 20
+                  },
+                  "includeDomains": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "maxItems": 20
+                  },
+                  "excludeDomains": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "maxItems": 20
+                  },
+                  "highlightsQuery": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 4096
+                  },
+                  "maxCharacters": {
+                    "type": "integer",
+                    "minimum": 200,
+                    "maximum": 8000
                   },
                   "providerID": {
                     "$ref": "#/components/schemas/WebSearch.ID"
@@ -21677,6 +22048,22 @@
         "type": "string",
         "pattern": "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$"
       },
+      "Prompt.Context": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "metadata": {
+            "type": "object"
+          }
+        },
+        "required": ["text"],
+        "additionalProperties": false
+      },
       "Prompt.FileAttachment": {
         "type": "object",
         "properties": {
@@ -22821,6 +23208,72 @@
         "required": ["_tag", "message"],
         "additionalProperties": false
       },
+      "Session.Error.Resolution": {
+        "type": "object",
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "rate_limited",
+              "usage_limited",
+              "plan_not_included",
+              "quota_exceeded",
+              "policy_blocked",
+              "authentication",
+              "invalid_input",
+              "network",
+              "server"
+            ]
+          },
+          "retry": {
+            "type": "string",
+            "enum": ["automatic", "never"]
+          },
+          "action": {
+            "type": "string",
+            "enum": ["switch_model", "wait", "manage_billing", "reauthenticate", "fix_input", "check_network", "retry"]
+          },
+          "retryAfterMs": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "providerCode": {
+            "type": "string"
+          }
+        },
+        "required": ["kind", "retry", "action"],
+        "additionalProperties": false
+      },
+      "Session.Exec.Running": {
+        "type": "object",
+        "properties": {
+          "sessionID": {
+            "$ref": "#/components/schemas/Session.ID"
+          },
+          "execID": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "command": {
+            "type": "string"
+          },
+          "startedAt": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "string",
+                "enum": ["Infinity", "-Infinity", "NaN"]
+              }
+            ]
+          }
+        },
+        "required": ["sessionID", "execID", "command", "startedAt"],
+        "additionalProperties": false
+      },
       "Session.ForkBoundary": {
         "anyOf": [
           {
@@ -22856,6 +23309,17 @@
       "Session.ID": {
         "type": "string",
         "pattern": "^ses"
+      },
+      "Session.Inbox.CloseResult": {
+        "type": "object",
+        "properties": {
+          "state": {
+            "type": "string",
+            "enum": ["closed", "cancelled", "delivered"]
+          }
+        },
+        "required": ["state"],
+        "additionalProperties": false
       },
       "Session.Inbox.Compaction": {
         "type": "object",
@@ -23068,6 +23532,12 @@
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/Prompt.SkillAttachment"
+            }
+          },
+          "context": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Prompt.Context"
             }
           },
           "metadata": {
@@ -23838,6 +24308,698 @@
         "required": ["id", "time", "type", "skill", "name", "text"],
         "additionalProperties": false
       },
+      "Session.Message.StoredInfo": {
+        "anyOf": [
+          {
+            "type": "object",
+            "properties": {
+              "id": {
+                "$ref": "#/components/schemas/Session.Message.ID"
+              },
+              "metadata": {
+                "type": "object"
+              },
+              "time": {
+                "type": "object",
+                "properties": {
+                  "created": {
+                    "type": "number"
+                  }
+                },
+                "required": ["created"],
+                "additionalProperties": false
+              },
+              "type": {
+                "type": "string",
+                "enum": ["agent-switched"]
+              },
+              "agent": {
+                "$ref": "#/components/schemas/Agent.ID"
+              },
+              "previous": {
+                "$ref": "#/components/schemas/Agent.ID"
+              },
+              "seq": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991,
+                "description": "Authoritative message creation order within its session. Stable across updates; not an event-update sequence or part order."
+              }
+            },
+            "required": ["id", "time", "type", "agent", "seq"],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "id": {
+                "$ref": "#/components/schemas/Session.Message.ID"
+              },
+              "metadata": {
+                "type": "object"
+              },
+              "time": {
+                "type": "object",
+                "properties": {
+                  "created": {
+                    "type": "number"
+                  }
+                },
+                "required": ["created"],
+                "additionalProperties": false
+              },
+              "type": {
+                "type": "string",
+                "enum": ["model-switched"]
+              },
+              "model": {
+                "$ref": "#/components/schemas/Model.Ref"
+              },
+              "previous": {
+                "$ref": "#/components/schemas/Model.Ref"
+              },
+              "seq": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991,
+                "description": "Authoritative message creation order within its session. Stable across updates; not an event-update sequence or part order."
+              }
+            },
+            "required": ["id", "time", "type", "model", "seq"],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "id": {
+                "$ref": "#/components/schemas/Session.Message.ID"
+              },
+              "metadata": {
+                "type": "object"
+              },
+              "time": {
+                "type": "object",
+                "properties": {
+                  "created": {
+                    "type": "number"
+                  }
+                },
+                "required": ["created"],
+                "additionalProperties": false
+              },
+              "type": {
+                "type": "string",
+                "enum": ["location-switched"]
+              },
+              "projectID": {
+                "$ref": "#/components/schemas/Project.ID"
+              },
+              "subpath": {
+                "$ref": "#/components/schemas/RelativePath"
+              },
+              "location": {
+                "$ref": "#/components/schemas/Location.PublicRef"
+              },
+              "previous": {
+                "anyOf": [
+                  {
+                    "type": "object",
+                    "properties": {
+                      "location": {
+                        "$ref": "#/components/schemas/Location.PublicRef"
+                      },
+                      "projectID": {
+                        "$ref": "#/components/schemas/Project.ID"
+                      },
+                      "subpath": {
+                        "$ref": "#/components/schemas/RelativePath"
+                      }
+                    },
+                    "required": ["location"],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "seq": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991,
+                "description": "Authoritative message creation order within its session. Stable across updates; not an event-update sequence or part order."
+              }
+            },
+            "required": ["id", "time", "type", "location", "seq"],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "id": {
+                "$ref": "#/components/schemas/Session.Message.ID"
+              },
+              "metadata": {
+                "type": "object"
+              },
+              "time": {
+                "type": "object",
+                "properties": {
+                  "created": {
+                    "type": "number"
+                  }
+                },
+                "required": ["created"],
+                "additionalProperties": false
+              },
+              "text": {
+                "type": "string"
+              },
+              "files": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/Prompt.FileAttachment"
+                }
+              },
+              "agents": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/Prompt.AgentAttachment"
+                }
+              },
+              "skills": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/Prompt.SkillAttachment"
+                }
+              },
+              "type": {
+                "type": "string",
+                "enum": ["user"]
+              },
+              "seq": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991,
+                "description": "Authoritative message creation order within its session. Stable across updates; not an event-update sequence or part order."
+              }
+            },
+            "required": ["id", "time", "text", "type", "seq"],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "id": {
+                "$ref": "#/components/schemas/Session.Message.ID"
+              },
+              "metadata": {
+                "type": "object"
+              },
+              "time": {
+                "type": "object",
+                "properties": {
+                  "created": {
+                    "type": "number"
+                  }
+                },
+                "required": ["created"],
+                "additionalProperties": false
+              },
+              "text": {
+                "type": "string"
+              },
+              "description": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string",
+                "enum": ["synthetic"]
+              },
+              "seq": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991,
+                "description": "Authoritative message creation order within its session. Stable across updates; not an event-update sequence or part order."
+              }
+            },
+            "required": ["id", "time", "text", "type", "seq"],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "id": {
+                "$ref": "#/components/schemas/Session.Message.ID"
+              },
+              "metadata": {
+                "type": "object"
+              },
+              "time": {
+                "type": "object",
+                "properties": {
+                  "created": {
+                    "type": "number"
+                  }
+                },
+                "required": ["created"],
+                "additionalProperties": false
+              },
+              "type": {
+                "type": "string",
+                "enum": ["system"]
+              },
+              "text": {
+                "type": "string"
+              },
+              "description": {
+                "type": "string"
+              },
+              "seq": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991,
+                "description": "Authoritative message creation order within its session. Stable across updates; not an event-update sequence or part order."
+              }
+            },
+            "required": ["id", "time", "type", "text", "seq"],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "id": {
+                "$ref": "#/components/schemas/Session.Message.ID"
+              },
+              "metadata": {
+                "type": "object"
+              },
+              "time": {
+                "type": "object",
+                "properties": {
+                  "created": {
+                    "type": "number"
+                  }
+                },
+                "required": ["created"],
+                "additionalProperties": false
+              },
+              "type": {
+                "type": "string",
+                "enum": ["skill"]
+              },
+              "skill": {
+                "$ref": "#/components/schemas/Skill.ID"
+              },
+              "name": {
+                "$ref": "#/components/schemas/Skill.Name"
+              },
+              "text": {
+                "type": "string"
+              },
+              "seq": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991,
+                "description": "Authoritative message creation order within its session. Stable across updates; not an event-update sequence or part order."
+              }
+            },
+            "required": ["id", "time", "type", "skill", "name", "text", "seq"],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "id": {
+                "$ref": "#/components/schemas/Session.Message.ID"
+              },
+              "metadata": {
+                "type": "object"
+              },
+              "time": {
+                "type": "object",
+                "properties": {
+                  "created": {
+                    "type": "number"
+                  },
+                  "completed": {
+                    "type": "number"
+                  }
+                },
+                "required": ["created"],
+                "additionalProperties": false
+              },
+              "type": {
+                "type": "string",
+                "enum": ["shell"]
+              },
+              "shellID": {
+                "$ref": "#/components/schemas/Shell.ID"
+              },
+              "command": {
+                "type": "string"
+              },
+              "status": {
+                "type": "string",
+                "enum": ["running", "exited", "timeout", "killed"]
+              },
+              "exit": {
+                "anyOf": [
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "string",
+                    "enum": ["Infinity", "-Infinity", "NaN"]
+                  }
+                ]
+              },
+              "output": {
+                "type": "object",
+                "properties": {
+                  "output": {
+                    "type": "string"
+                  },
+                  "cursor": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "size": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "truncated": {
+                    "type": "boolean"
+                  }
+                },
+                "required": ["output", "cursor", "size", "truncated"],
+                "additionalProperties": false
+              },
+              "seq": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991,
+                "description": "Authoritative message creation order within its session. Stable across updates; not an event-update sequence or part order."
+              }
+            },
+            "required": ["id", "time", "type", "shellID", "command", "status", "seq"],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "id": {
+                "$ref": "#/components/schemas/Session.Message.ID"
+              },
+              "metadata": {
+                "type": "object"
+              },
+              "time": {
+                "type": "object",
+                "properties": {
+                  "created": {
+                    "type": "number"
+                  },
+                  "streamed": {
+                    "type": "number"
+                  },
+                  "completed": {
+                    "type": "number"
+                  }
+                },
+                "required": ["created"],
+                "additionalProperties": false
+              },
+              "type": {
+                "type": "string",
+                "enum": ["assistant"]
+              },
+              "agent": {
+                "$ref": "#/components/schemas/Agent.ID"
+              },
+              "model": {
+                "$ref": "#/components/schemas/Model.Ref"
+              },
+              "content": {
+                "type": "array",
+                "items": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/Session.Message.Assistant.Text"
+                    },
+                    {
+                      "$ref": "#/components/schemas/Session.Message.Assistant.Reasoning"
+                    },
+                    {
+                      "$ref": "#/components/schemas/Session.Message.Assistant.Tool"
+                    }
+                  ]
+                }
+              },
+              "snapshot": {
+                "type": "object",
+                "properties": {
+                  "start": {
+                    "$ref": "#/components/schemas/Snapshot.ID"
+                  },
+                  "end": {
+                    "$ref": "#/components/schemas/Snapshot.ID"
+                  },
+                  "files": {
+                    "type": "array",
+                    "items": {
+                      "$ref": "#/components/schemas/RelativePath"
+                    }
+                  }
+                },
+                "additionalProperties": false
+              },
+              "finish": {
+                "type": "string",
+                "enum": ["stop", "length", "tool-calls", "content-filter", "error", "unknown"]
+              },
+              "rawFinish": {
+                "type": "string"
+              },
+              "native": {
+                "$ref": "#/components/schemas/Session.Message.Native"
+              },
+              "cost": {
+                "$ref": "#/components/schemas/Money.USD"
+              },
+              "tokens": {
+                "$ref": "#/components/schemas/TokenUsage.Info"
+              },
+              "error": {
+                "$ref": "#/components/schemas/Session.StructuredError"
+              },
+              "retry": {
+                "$ref": "#/components/schemas/Session.Message.Assistant.Retry"
+              },
+              "seq": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991,
+                "description": "Authoritative message creation order within its session. Stable across updates; not an event-update sequence or part order."
+              }
+            },
+            "required": ["id", "time", "type", "agent", "model", "content", "seq"],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": ["compaction"]
+              },
+              "id": {
+                "$ref": "#/components/schemas/Session.Message.ID"
+              },
+              "metadata": {
+                "type": "object"
+              },
+              "time": {
+                "type": "object",
+                "properties": {
+                  "created": {
+                    "type": "number"
+                  }
+                },
+                "required": ["created"],
+                "additionalProperties": false
+              },
+              "status": {
+                "type": "string",
+                "enum": ["running"]
+              },
+              "reason": {
+                "type": "string",
+                "enum": ["auto", "manual"]
+              },
+              "summary": {
+                "type": "string"
+              },
+              "seq": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991,
+                "description": "Authoritative message creation order within its session. Stable across updates; not an event-update sequence or part order."
+              }
+            },
+            "required": ["type", "id", "time", "status", "reason", "summary", "seq"],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": ["compaction"]
+              },
+              "id": {
+                "$ref": "#/components/schemas/Session.Message.ID"
+              },
+              "metadata": {
+                "type": "object"
+              },
+              "time": {
+                "type": "object",
+                "properties": {
+                  "created": {
+                    "type": "number"
+                  }
+                },
+                "required": ["created"],
+                "additionalProperties": false
+              },
+              "status": {
+                "type": "string",
+                "enum": ["completed"]
+              },
+              "reason": {
+                "type": "string",
+                "enum": ["auto", "manual"]
+              },
+              "model": {
+                "$ref": "#/components/schemas/Model.Ref"
+              },
+              "native": {
+                "$ref": "#/components/schemas/Session.Message.Native"
+              },
+              "summary": {
+                "type": "string"
+              },
+              "cost": {
+                "$ref": "#/components/schemas/Money.USD"
+              },
+              "tokens": {
+                "$ref": "#/components/schemas/TokenUsage.Info"
+              },
+              "seq": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991,
+                "description": "Authoritative message creation order within its session. Stable across updates; not an event-update sequence or part order."
+              }
+            },
+            "required": ["type", "id", "time", "status", "reason", "summary", "seq"],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": ["compaction"]
+              },
+              "id": {
+                "$ref": "#/components/schemas/Session.Message.ID"
+              },
+              "metadata": {
+                "type": "object"
+              },
+              "time": {
+                "type": "object",
+                "properties": {
+                  "created": {
+                    "type": "number"
+                  }
+                },
+                "required": ["created"],
+                "additionalProperties": false
+              },
+              "status": {
+                "type": "string",
+                "enum": ["failed"]
+              },
+              "reason": {
+                "type": "string",
+                "enum": ["auto", "manual"]
+              },
+              "error": {
+                "$ref": "#/components/schemas/Session.StructuredError"
+              },
+              "cost": {
+                "$ref": "#/components/schemas/Money.USD"
+              },
+              "tokens": {
+                "$ref": "#/components/schemas/TokenUsage.Info"
+              },
+              "seq": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991,
+                "description": "Authoritative message creation order within its session. Stable across updates; not an event-update sequence or part order."
+              }
+            },
+            "required": ["type", "id", "time", "status", "reason", "error", "seq"],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "id": {
+                "$ref": "#/components/schemas/Session.Message.ID"
+              },
+              "metadata": {
+                "type": "object"
+              },
+              "time": {
+                "type": "object",
+                "properties": {
+                  "created": {
+                    "type": "number"
+                  }
+                },
+                "required": ["created"],
+                "additionalProperties": false
+              },
+              "type": {
+                "type": "string",
+                "enum": ["idle"]
+              },
+              "outcome": {
+                "type": "string",
+                "enum": ["succeeded", "failed", "interrupted"]
+              },
+              "error": {
+                "$ref": "#/components/schemas/Session.StructuredError"
+              },
+              "seq": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991,
+                "description": "Authoritative message creation order within its session. Stable across updates; not an event-update sequence or part order."
+              }
+            },
+            "required": ["id", "time", "type", "outcome", "seq"],
+            "additionalProperties": false
+          }
+        ]
+      },
       "Session.Message.Synthetic": {
         "type": "object",
         "properties": {
@@ -24097,6 +25259,21 @@
             "type": "integer",
             "minimum": 0,
             "maximum": 9007199254740991
+          },
+          "resolution": {
+            "$ref": "#/components/schemas/Session.Error.Resolution"
+          },
+          "responseBody": {
+            "type": "string"
+          },
+          "responseHeaders": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            }
+          },
+          "url": {
+            "type": "string"
           }
         },
         "required": ["type", "message"],
@@ -24168,7 +25345,7 @@
           "data": {
             "type": "array",
             "items": {
-              "$ref": "#/components/schemas/Session.Message.Info"
+              "$ref": "#/components/schemas/Session.Message.StoredInfo"
             }
           },
           "cursor": {
@@ -24447,7 +25624,29 @@
           }
         ]
       },
-      "SessionTransfer.Data": {
+      "SessionStopResponse": {
+        "type": "object",
+        "properties": {
+          "matched": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "terminated": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "failed": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          }
+        },
+        "required": ["matched", "terminated", "failed"],
+        "additionalProperties": false
+      },
+      "SessionTransfer.Exported": {
         "type": "object",
         "properties": {
           "info": {
@@ -24456,7 +25655,7 @@
           "messages": {
             "type": "array",
             "items": {
-              "$ref": "#/components/schemas/Session.Message.Info"
+              "$ref": "#/components/schemas/Session.Message.StoredInfo"
             }
           }
         },
@@ -25202,6 +26401,10 @@
       "WebSearch.ID": {
         "type": "string"
       },
+      "WebSearch.OptionName": {
+        "type": "string",
+        "enum": ["numResults", "includeDomains", "excludeDomains", "highlightsQuery", "maxCharacters"]
+      },
       "WebSearch.Provider": {
         "type": "object",
         "properties": {
@@ -25210,6 +26413,12 @@
           },
           "name": {
             "type": "string"
+          },
+          "options": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/WebSearch.OptionName"
+            }
           }
         },
         "required": ["id", "name"],
@@ -25242,6 +26451,10 @@
           },
           "content": {
             "type": "string"
+          },
+          "contentKind": {
+            "type": "string",
+            "enum": ["highlights", "text-preview"]
           },
           "time": {
             "type": "object",
