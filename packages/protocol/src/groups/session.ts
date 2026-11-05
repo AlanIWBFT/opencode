@@ -716,16 +716,14 @@ export const makeSessionGroup = <I extends HttpApiMiddleware.AnyId, S, FormI ext
           failed: NonNegativeInt,
         }).annotate({ identifier: "SessionStopResponse" }),
         error: SessionNotFoundError,
-      })
-        .middleware(sessionLocationMiddleware)
-        .annotateMerge(
-          OpenApi.annotations({
-            identifier: "session.stop",
-            summary: "Stop session and its persistent commands",
-            description:
-              "Interrupt this session's execution and close its persistent command slots, including detached commands. Background child sessions are not stopped. Later input and background notifications may resume this session. Counts describe attempted termination of running commands; failed may be nonzero.",
-          }),
-        ),
+      }).annotateMerge(
+        OpenApi.annotations({
+          identifier: "session.stop",
+          summary: "Stop session and its persistent commands",
+          description:
+            "Interrupt this session's execution and close its persistent command slots, including detached commands. Only existing process-local owners are stopped; no locations are initialized. Background child sessions are not stopped. Later input and background notifications may resume this session. Counts describe attempted termination of running commands; failed may be nonzero.",
+        }),
+      ),
     )
     .add(
       HttpApiEndpoint.get("session.exec.list", "/api/session/exec", {

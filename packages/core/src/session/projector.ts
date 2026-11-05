@@ -1,7 +1,7 @@
 export * as SessionProjector from "./projector.js"
 
 import { castDraft, produce, type WritableDraft } from "immer"
-import { detachExecMetadata } from "./exec-metadata.js"
+import { detachExecMetadata, detachExecPart } from "./exec-metadata.js"
 
 import { and, asc, desc, eq, gt, gte, inArray, isNull, lt, lte, or, sql } from "drizzle-orm"
 import { DateTime, Effect, Layer, Option, Schema, Stream } from "effect"
@@ -283,7 +283,8 @@ const projectFork = Effect.fn("SessionProjector.projectFork")(function* (
       ).pipe(Effect.map((batches) => batches.flat()))
       const partValues: Array<typeof SessionPartTable.$inferInsert> = yield* Effect.forEach(storedParts, (part) =>
         Effect.gen(function* () {
-          const data = media ? SessionBlob.split(part.data) : undefined
+          const detached = SessionHistory.encodePart(detachExecPart(SessionHistory.decodePartRowSync(part)))
+          const data = media ? SessionBlob.split(detached) : undefined
           if (data?.moved) yield* SessionBlob.save(db, data.blobs)
           return {
             message_id: idMap.get(part.message_id)!,
@@ -293,7 +294,7 @@ const projectFork = Effect.fn("SessionProjector.projectFork")(function* (
             call_id: part.call_id,
             time_created: part.time_created,
             time_updated: part.time_updated,
-            data: data?.data ?? part.data,
+            data: data?.data ?? detached,
           }
         }),
       )

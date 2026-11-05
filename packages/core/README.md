@@ -65,6 +65,12 @@ the retiring directory does not close its replacement's exec owner.
 
 ## Persistent exec control
 
+`session.stop` interrupts the session and closes its persistent command slots
+through existing process-local owners, without initializing its location. It
+remains available after the stored directory disappears, so clients can stop
+before deleting the session. Termination failures remain explicit in the result
+counts.
+
 `session.exec.list` reads running commands from existing process-local owners,
 without starting locations or including idle shell slots. Only commands exposed
 as still running after their initial wait are listed. `session.exec.stop`

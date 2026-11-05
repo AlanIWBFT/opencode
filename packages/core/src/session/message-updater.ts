@@ -2,7 +2,7 @@ import { castDraft, produce, type WritableDraft } from "immer"
 import { DateTime, Effect, Match, pipe, Schema } from "effect"
 import { SessionEvent } from "./event.js"
 import { SessionMessage } from "./message.js"
-import { applyExecMetadata, applyScriptMetadata } from "./exec-metadata.js"
+import { applyExecPartMetadata, applyScriptPartMetadata } from "./exec-metadata.js"
 
 export interface Adapter {
   readonly getAgent: () => Effect.Effect<SessionMessage.AgentSelected["agent"] | undefined>
@@ -390,12 +390,12 @@ export function update(adapter: Adapter, event: SessionEvent.DurableEvent) {
         )
       },
       "session.exec.captured": (event) => {
-        return updateOwnedAssistant(event.data.assistantMessageID, (draft) => {
-          applyExecMetadata(draft, event.data)
-        })
+        return adapter.updateAssistantPart(event.data.assistantMessageID, { type: "tool", callID: event.data.id },
+          (part) => applyExecPartMetadata(part, event.data))
       },
       "session.script.captured": (event) =>
-        updateOwnedAssistant(event.data.assistantMessageID, (draft) => applyScriptMetadata(draft, event.data)),
+        adapter.updateAssistantPart(event.data.assistantMessageID, { type: "tool", callID: event.data.id },
+          (part) => applyScriptPartMetadata(part, event.data)),
       "session.reasoning.started": (event) => {
         return adapter.appendAssistantPart(
           event.data.assistantMessageID,
