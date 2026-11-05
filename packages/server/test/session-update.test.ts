@@ -62,6 +62,50 @@ it.live("explicit stop accepts an idle session and rejects an unknown session", 
   }).pipe(Effect.scoped),
 )
 
+it.live("stops and deletes a session subtree after its directory disappears", () =>
+  Effect.gen(function* () {
+    const temporary = yield* tmpdirScoped()
+    const directory = path.join(temporary.path, "workspace")
+    yield* Effect.promise(() => fs.mkdir(directory))
+    const request = yield* makeRequest()
+    const created = Schema.decodeUnknownSync(SessionResponse)(
+      yield* request("/api/session", "POST", {
+        location: { directory },
+        title: "Deleted workspace",
+      }),
+    ).data
+    const child = Schema.decodeUnknownSync(SessionResponse)(
+      yield* request("/api/session", "POST", {
+        parentID: created.id,
+      }),
+    ).data
+    const other = Schema.decodeUnknownSync(SessionResponse)(
+      yield* request("/api/session", "POST", {
+        location: { directory },
+        title: "Unrelated session",
+      }),
+    ).data
+    const url = `/api/session/${created.id}`
+    expect(yield* request("/api/debug/location", "GET")).toEqual([])
+    expect(yield* request(`${url}/stop`, "POST")).toEqual({ matched: 0, terminated: 0, failed: 0 })
+    expect(yield* request("/api/debug/location", "GET")).toEqual([])
+    yield* Effect.promise(() => fs.rename(directory, path.join(temporary.path, "removed-workspace")))
+
+    expect(yield* request(`${url}/stop`, "POST")).toEqual({ matched: 0, terminated: 0, failed: 0 })
+    expect(Schema.decodeUnknownSync(SessionResponse)(yield* request(url, "GET")).data.id).toBe(created.id)
+    yield* request(url, "DELETE", undefined, 204)
+    yield* request(url, "GET", undefined, 404)
+    yield* request(`/api/session/${child.id}`, "GET", undefined, 404)
+    expect(
+      Schema.decodeUnknownSync(SessionsResponse)(yield* request("/api/session", "GET")).data.map(
+        (session) => session.id,
+      ),
+    ).toEqual([other.id])
+    expect(yield* request("/api/debug/location", "GET")).toEqual([])
+    expect(yield* Effect.promise(() => fs.stat(directory).catch(() => null))).toBeNull()
+  }).pipe(Effect.scoped),
+)
+
 it.live("exec control lists existing owners and validates selected stop requests", () =>
   Effect.gen(function* () {
     const request = yield* makeRequest()
