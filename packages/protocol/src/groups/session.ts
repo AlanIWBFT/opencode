@@ -263,7 +263,10 @@ export const makeSessionGroup = <I extends HttpApiMiddleware.AnyId, S, FormI ext
     .add(
       HttpApiEndpoint.post("session.fork", "/api/session/:sessionID/fork", {
         params: { sessionID: Session.ID },
-        payload: Schema.Struct({ before: SessionMessage.ID.pipe(Schema.optional) }),
+        payload: Schema.Struct({
+          before: SessionMessage.ID.pipe(Schema.optional),
+          experimental: Schema.Struct({ through: SessionMessage.ID.pipe(Schema.optional) }).pipe(Schema.optional),
+        }),
         success: Schema.Struct({ data: PublicSessionInfo }),
         error: [SessionNotFoundError, MessageNotFoundError, InvalidRequestError],
       }).annotateMerge(
@@ -271,7 +274,9 @@ export const makeSessionGroup = <I extends HttpApiMiddleware.AnyId, S, FormI ext
           identifier: "session.fork",
           summary: "Fork session",
           description:
-            "Create a child session by copying projected history before a message. Omit before to copy the full history.",
+            "Create a child session by copying projected history before a message. " +
+            "Experimental: through copies history including the specified message and may change without compatibility guarantees. " +
+            "Pass experimental.through or before, never both. Omit both to copy the full history.",
         }),
       ),
     )

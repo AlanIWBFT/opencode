@@ -40,6 +40,16 @@ Other inbox work is untouched. Closure markers are operational KV state, removed
 with the session, not messages or replayable conversation events. Ordinary
 `session.inbox.cancel` still permits that ID to be admitted again.
 
+## Inclusive fork boundaries
+
+`session.fork` accepts `experimental.through` over HTTP to copy history through
+a specified message, inclusive. It is mutually exclusive with `before`. Both
+boundaries resolve the message inside the parent session and retain that identity
+in the existing fork event. A missing boundary fails instead of copying the tail.
+Omitting both retains the full-history behavior. This lets a side conversation
+keep a completed answer even when the parent has no later message or advances
+before the request arrives.
+
 ## Patch input previews
 
 The session runner broadcasts `patch` argument deltas through the existing

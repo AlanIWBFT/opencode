@@ -104,8 +104,7 @@ type CompactInput = Parameters<Session.Handle["compact"]>[0] & { sessionID: Sess
 
 type ForkInput = {
   sessionID: SessionSchema.ID
-  before?: SessionMessage.ID
-}
+} & ({ before?: SessionMessage.ID; through?: never } | { before?: never; through: SessionMessage.ID })
 
 export {
   AttachmentError,
@@ -355,23 +354,24 @@ const layer = Layer.effect(
       }),
       fork: Effect.fn("Session.fork")(function* (input) {
         const parent = yield* result.get(input.sessionID)
+        const messageID = input.before ?? input.through
         const boundary = yield* db
           .select({ id: SessionMessageTable.id })
           .from(SessionMessageTable)
           .where(
             and(
               eq(SessionMessageTable.session_id, input.sessionID),
-              input.before ? eq(SessionMessageTable.id, input.before) : undefined,
+              messageID ? eq(SessionMessageTable.id, messageID) : undefined,
             ),
           )
           .orderBy(desc(SessionMessageTable.seq))
           .limit(1)
           .get()
           .pipe(Effect.orDie)
-        if (!boundary && input.before)
+        if (!boundary && messageID)
           return yield* new MessageNotFoundError({
             sessionID: input.sessionID,
-            messageID: input.before,
+            messageID,
           })
         if (!boundary) return yield* new ForkEmptyError({ sessionID: input.sessionID })
         const sessionID = SessionSchema.ID.create()

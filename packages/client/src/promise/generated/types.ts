@@ -3639,7 +3639,11 @@ export type SessionRemoveInput = { readonly sessionID: string }
 
 export type SessionRemoveOutput = void
 
-export type SessionForkInput = { readonly sessionID: string; readonly before?: string | undefined }
+export type SessionForkInput = {
+  readonly sessionID: string
+  readonly before?: string | undefined
+  readonly experimental?: { readonly through?: string | undefined } | undefined
+}
 
 export type SessionForkOutput = { data: SessionInfo }["data"]
 

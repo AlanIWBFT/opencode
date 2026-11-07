@@ -205,8 +205,17 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
       .handle(
         "session.fork",
         Effect.fn(function* (ctx) {
+          const through = ctx.payload.experimental?.through
+          if (ctx.payload.before && through)
+            return yield* new InvalidRequestError({
+              message: "before and experimental.through are mutually exclusive",
+              kind: "fork_boundary",
+            })
           return {
-            data: yield* session.fork({ sessionID: ctx.params.sessionID, before: ctx.payload.before }).pipe(
+            data: yield* session.fork({
+              sessionID: ctx.params.sessionID,
+              ...(through ? { through } : { before: ctx.payload.before }),
+            }).pipe(
               Effect.catchTag("Session.NotFoundError", missingSession),
               Effect.catchTag("Session.MessageNotFoundError", missingMessage),
               Effect.catchTag(

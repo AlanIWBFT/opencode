@@ -1792,7 +1792,7 @@
             }
           }
         },
-        "description": "Create a child session by copying projected history before a message. Omit before to copy the full history.",
+        "description": "Create a child session by copying projected history before a message. Experimental: through copies history including the specified message and may change without compatibility guarantees. Pass experimental.through or before, never both. Omit both to copy the full history.",
         "summary": "Fork session",
         "requestBody": {
           "content": {
@@ -1804,6 +1804,29 @@
                     "anyOf": [
                       {
                         "$ref": "#/components/schemas/Session.Message.ID"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "experimental": {
+                    "anyOf": [
+                      {
+                        "type": "object",
+                        "properties": {
+                          "through": {
+                            "anyOf": [
+                              {
+                                "$ref": "#/components/schemas/Session.Message.ID"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          }
+                        },
+                        "additionalProperties": false
                       },
                       {
                         "type": "null"
