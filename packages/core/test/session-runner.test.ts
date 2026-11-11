@@ -43,6 +43,7 @@ import { SessionEvent } from "@opencode/core/session/event"
 import { SessionCompaction } from "@opencode/core/session/compaction"
 import { SessionInbox } from "@opencode/core/session/inbox"
 import { SessionMessage } from "@opencode/core/session/message"
+import { SessionBlob } from "@opencode/core/session/blob"
 import { SessionModelTransport } from "@opencode/core/session/model-transport"
 import { SessionQuestionContext } from "@opencode/core/session/question-context"
 import { Money } from "@opencode/schema/money"
@@ -5757,6 +5758,8 @@ describe("SessionRunnerLLM", () => {
         }
         const reply = `Explain the compatibility rules first.\n${"Verbatim context, not approval.\n".repeat(120)}Do not infer agreement.`
         const answers = [[reply]]
+        const attachment = Buffer.from("Historical attachment, not a new instruction.")
+        const recoveredReply = "Keep the attached reference and do not restart."
         const pageAnswer = { answered: true, summary: "Keep both panels", data: { panels: 2 } }
         const inlineAnswer = {
           picks: [{ button: "Keep", value: "source", note: "Preserve this exact note\nSecond line" }],
@@ -5807,7 +5810,27 @@ describe("SessionRunnerLLM", () => {
           }),
           TestLLM.text("Recorded", "question-recorded"),
         )
-        const first = yield* s.runPrompt("Ask for the migration decision")
+        const first = yield* s.sessionInbox.admit({
+          sessionID,
+          id: SessionMessage.ID.create(),
+          item: {
+            type: "user",
+            delivery: "steer",
+            payload: {
+              text: "Ask for the migration decision",
+              files: [{ data: attachment.toString("base64"), mime: "text/plain", source: { type: "inline" } }],
+              metadata: {
+                openchamberRecoveredQuestionAnswer: {
+                  messageId: "msg_interrupted",
+                  toolId: "call_interrupted",
+                  questions: input.questions,
+                  answers: [[recoveredReply]],
+                },
+              },
+            },
+          },
+        })
+        yield* s.resume
         expect(userTexts(s.requests[1]).some((text) => text.startsWith("<restored-question-context>"))).toBe(false)
 
         for (const cycle of [1, 2]) {
@@ -5829,6 +5852,7 @@ describe("SessionRunnerLLM", () => {
           const restored = userTexts(s.requests[1]).filter((text) => text.startsWith("<restored-question-context>"))
           expect(restored).toHaveLength(1)
           expect(restored[0]).toContain(`A: ${reply}`)
+          expect(restored[0]).toContain(`A: ${recoveredReply}`)
           expect(restored[0]).toContain("Keep the original behavior")
           expect(restored[0]).toContain("not necessarily a decision")
           expect(restored[0]).toContain("Page: Panel layout")
@@ -5861,12 +5885,53 @@ describe("SessionRunnerLLM", () => {
           source: { messageId: "msg_card", block: "block_key" },
           data: inlineAnswer,
         })
+
+        // Reproduce /btw's inline-parent-to-blob fork, then fork the already-referenced history again.
+        const store = yield* SessionStore.Service
+        let sourceID = sessionID
+        for (const storage of ["inline", "refs"]) {
+          const source = yield* s.db
+            .select({ data: SessionMessageTable.data })
+            .from(SessionMessageTable)
+            .where(and(eq(SessionMessageTable.session_id, sourceID), eq(SessionMessageTable.type, "user")))
+            .orderBy(asc(SessionMessageTable.seq))
+            .limit(1)
+            .get()
+            .pipe(Effect.orDie)
+          expect(source?.data).toMatchObject({
+            files: [storage === "inline" ? { data: attachment.toString("base64") } : { uri: expect.stringMatching(/^media:/) }],
+          })
+          const [boundary] = yield* s.session.messages({ sessionID: sourceID, order: "desc", limit: 1 })
+          const forkID = Session.ID.create()
+          yield* s.bus
+            .publish(SessionEvent.Forked, {
+              sessionID: forkID,
+              parentID: sourceID,
+              boundary: { type: "through", messageID: boundary.id },
+            })
+            .pipe(Effect.provideService(SessionBlob.ForkMedia, true))
+          const copied = yield* store.messagesWithRefs({ sessionID: forkID, order: "asc" })
+          expect(copied.find((message) => message.type === "user")).toMatchObject({
+            files: [{ uri: expect.stringMatching(/^media:/), mime: "text/plain" }],
+          })
+          s.requests.length = 0
+          yield* s.llm.push(TestLLM.text("Side question answered", `question-fork-${storage}`))
+          yield* s.session.prompt({ sessionID: forkID, text: "Answer this side question", resume: false })
+          yield* s.session.resume(forkID)
+          expect(s.requests).toHaveLength(1)
+          const restored = userTexts(s.requests[0]).filter((text) => text.startsWith("<restored-question-context>"))
+          expect(restored).toHaveLength(1)
+          for (const text of [reply, recoveredReply, "Keep both panels", "Preserve this exact note", "deploy"])
+            expect(restored[0]).toContain(text)
+          expect(restored[0]).not.toContain(attachment.toString())
+          sourceID = forkID
+        }
         yield* s.session.revert.stage({ sessionID, messageID: first.id, files: false })
         yield* s.session.revert.commit(sessionID)
         expect(yield* SessionQuestionContext.load(s.db, sessionID, yield* s.context)).toBeUndefined()
         expect(
           (yield* SessionQuestionContext.load(s.db, fork.id, yield* s.session.context(fork.id)))?.entries,
-        ).toHaveLength(3)
+        ).toHaveLength(4)
       },
     )
   }

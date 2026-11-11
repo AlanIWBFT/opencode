@@ -8,6 +8,7 @@ import { isDeepStrictEqual } from "node:util"
 import type { Database } from "../database/database.js"
 import { SessionHistory } from "./history.js"
 import type { SessionMessage } from "./message.js"
+import type { SessionStored } from "./stored.js"
 import type { SessionSchema } from "./schema.js"
 import { SessionMessageTable } from "./sql.js"
 
@@ -112,7 +113,7 @@ export const load = Effect.fn("SessionQuestionContext.load")(function* (
     .pipe(Effect.orDie)
   const history = yield* Effect.forEach(
     yield* SessionHistory.withParts(db, rows),
-    SessionHistory.decodeMessageRow,
+    SessionHistory.decodeStoredMessageRow,
   ).pipe(Effect.orDie)
   return {
     summaryID: summary.id,
@@ -120,7 +121,7 @@ export const load = Effect.fn("SessionQuestionContext.load")(function* (
   } satisfies Cache
 })
 
-export function entries(message: SessionMessage.Info): Cache["entries"] {
+export function entries(message: SessionMessage.Info | SessionStored.User): Cache["entries"] {
   if (message.type === "user" || message.type === "synthetic") {
     const common = {
       toolID: message.id,

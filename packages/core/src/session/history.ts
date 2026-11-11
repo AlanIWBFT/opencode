@@ -158,7 +158,7 @@ export const decodeMessageRow = (row: typeof SessionMessageTable.$inferSelect) =
   decode(rowInput(row)).pipe(Effect.mapError(decodeError(row)))
 
 /** Decodes a row without its blobs, so user files may stay refs. Only for readers that never use file bytes. */
-const decodeStoredRow = (
+export const decodeStoredMessageRow = (
   row: typeof SessionMessageTable.$inferSelect,
 ): Effect.Effect<SessionMessage.Info | SessionStored.User, MessageDecodeError> =>
   row.type === "user" ? decodeStoredUser(rowInput(row)).pipe(Effect.mapError(decodeError(row))) : decodeMessageRow(row)
@@ -287,7 +287,7 @@ const withRecentText = Effect.fnUntraced(function* (
     .all()
     .pipe(Effect.orDie)
   // The recent text names attachments by mime and name only, so their bytes are never read.
-  const kept = yield* Effect.forEach(yield* withParts(db, rows), decodeStoredRow, { concurrency: 1 })
+  const kept = yield* Effect.forEach(yield* withParts(db, rows), decodeStoredMessageRow, { concurrency: 1 })
   const recent = kept.map(SessionRecentText.messageToText).filter(Boolean).join("\n\n")
   return [{ ...first, message: { ...compaction, metadata: { ...compaction.metadata, recent } } }, ...entries.slice(1)]
 })
