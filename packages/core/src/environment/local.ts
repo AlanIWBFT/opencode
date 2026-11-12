@@ -47,7 +47,9 @@ export const makeLocalDriver = (spawner: ChildProcessSpawner["Service"]): Driver
       }),
     write: (value, bytes) =>
       attempt(value, async () => {
-        await fs.mkdir(path.dirname(value), { recursive: true })
+        const parent = path.dirname(value)
+        // Windows rejects mkdir on a drive root even when recursive is true.
+        if (parent !== path.parse(parent).root) await fs.mkdir(parent, { recursive: true })
         await fs.writeFile(value, bytes)
       }),
     remove: (value) => attempt(value, () => fs.rm(value, { recursive: true, force: true })),

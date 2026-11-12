@@ -1,4 +1,5 @@
 import fs from "node:fs/promises"
+import path from "node:path"
 import { describe, expect } from "bun:test"
 import { Effect } from "effect"
 import { ChildProcess, ChildProcessSpawner } from "effect/process"
@@ -78,6 +79,19 @@ environmentConformance("local environment", () =>
     }
   }).pipe(Effect.provide(LayerNode.compile(CrossSpawnSpawner.node))),
 )
+
+describe.skipIf(process.platform !== "win32")("local environment drive roots", () => {
+  it.live("writes at a drive root without trying to create it", () =>
+    Effect.gen(function* () {
+      const spawner = yield* ChildProcessSpawner.ChildProcessSpawner
+      const files = makeFiles(makeLocalDriver(spawner))
+      // NUL exercises a real drive root without requiring permission to create files there.
+      const target = path.join(path.parse(process.cwd()).root, "NUL")
+      expect(yield* files.write(target, new TextEncoder().encode("backslash"))).toBeUndefined()
+      expect(yield* files.write(target.replaceAll("\\", "/"), new TextEncoder().encode("slash"))).toBeUndefined()
+    }).pipe(Effect.provide(LayerNode.compile(CrossSpawnSpawner.node))),
+  )
+})
 
 environmentConformance(
   "GNU exec environment",
