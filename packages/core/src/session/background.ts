@@ -1,6 +1,7 @@
 export * as SessionBackground from "./background.js"
 
 import type { Kind, Status } from "@opencode/schema/job"
+import type { SessionExec } from "@opencode/schema/session-exec"
 import { Effect } from "effect"
 import type { Job } from "../job.js"
 import type { OutstandingItem } from "../job/recovery.js"
@@ -81,6 +82,12 @@ export const outstanding = Effect.fnUntraced(function* (
   }
   return items
 })
+
+/** Snapshot process-local commands without making them durable jobs or changing idle hooks. */
+export const runningExec = (store: Lookup, sessionID: SessionSchema.ID, commands: readonly SessionExec.Running[]) => {
+  const parents = new Map<SessionSchema.ID, SessionSchema.ID | null>()
+  return Effect.filter(commands, (command) => descends(store, parents, command.sessionID, sessionID))
+}
 
 /** Active and unconsumed background jobs matching the requested Session, kind, status, and descendant scope. */
 export const list = Effect.fn("SessionBackground.list")(function* (

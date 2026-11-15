@@ -29,13 +29,14 @@ import { Agent } from "@opencode/core/agent"
 import { ID } from "@opencode/core/model"
 import { Provider } from "@opencode/core/provider"
 import { daemonShells } from "./fixture/shell-daemon"
+import { ExecSessionControl } from "@opencode/core/tool/exec-session/control"
 import { Cause, Context, Deferred, Effect, Exit, Fiber, Layer, LayerMap, Logger, Scope } from "effect"
 import { eq } from "drizzle-orm"
 import { testEffect } from "./lib/effect"
 
 const it = testEffect(
   AppNodeBuilder.build(
-    LayerNode.group([Database.node, Bus.node, SessionStore.node, SessionInbox.node, Job.node, KV.node, Session.node]),
+    LayerNode.group([Database.node, Bus.node, SessionStore.node, SessionInbox.node, Job.node, KV.node, Session.node, ExecSessionControl.node]),
   ),
 )
 
@@ -1462,13 +1463,14 @@ describe("SessionRestart background recovery", () => {
     }),
   )
 
-  it.effect("delivers a completed outbox row at boot without touching the child", () =>
+  for (const archived of [false, true]) it.effect(`delivers a completed outbox row at boot without touching the child (archived: ${archived})`, () =>
     Effect.gen(function* () {
       const database = yield* Database.Service
       const jobs = yield* Job.Service
       const parent = Session.ID.make("ses_outbox_parent")
       const child = Session.ID.make("ses_outbox_child")
       yield* seedSessions(database, [parent])
+      if (archived) yield* database.db.update(SessionTable).set({ time_archived: 1 }).where(eq(SessionTable.id, parent)).run().pipe(Effect.orDie)
       yield* seedSessions(database, [child], { parent_id: parent })
       yield* jobs.recordSubagentReport({
         notificationID: SessionMessage.ID.create(),
@@ -1499,10 +1501,10 @@ describe("SessionRestart background recovery", () => {
         restarted,
       )
       yield* Context.get(context, SessionRestart.Service).resumeSuspendedSessions
-      yield* Deferred.await(parentWoken)
+      if (!archived) yield* Deferred.await(parentWoken)
+      yield* Context.get(context, SessionExecution.Service).awaitIdle(parent)
 
-      // Replay uses the snapshot even though the shell is no longer running.
-      expect(drained).toEqual([parent])
+      expect(drained).toEqual(archived ? [] : [parent])
       expect(yield* SessionInbox.list(database.db, parent)).toMatchObject([
         {
           type: "synthetic",

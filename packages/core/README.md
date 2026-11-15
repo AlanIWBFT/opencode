@@ -119,6 +119,11 @@ timing and snapshots. Results and files remain in the outer Script response.
 The upstream VM runtime is the sole engine. Freeform tool inputs and compact result
 formatting follow upstream; exec cleanup, concurrency and snapshots remain local.
 
+Native subagent reports include a point-in-time list of running exec commands in
+the child and its descendants. Idle lanes do not count, and exec completion does
+not wake the parent or become restart-recoverable work. Reports are admitted to
+archived parents without waking them, including outbox delivery after restart.
+
 ## Web research tools
 
 `websearch` accepts a natural-language `query` and optional `numResults` (1–20),

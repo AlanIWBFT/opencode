@@ -44,6 +44,7 @@ export function formatBody(
   if (!background || background.length === 0) return body
   const lines = background.map((item) => {
     const location = item.sessionID !== childSessionID ? `, in ${item.sessionID}` : ""
+    if (item.kind === "exec") return `- exec (${item.execID}${location}): ${clean(item.command)}`
     if (item.kind === "codemode") return `- Code Mode script (${item.jobID}${location})`
     if (item.kind === "shell") return `- shell (${item.shellID}${location}): ${clean(item.command)}`
     if (item.kind === "image") return `- image (${item.model}${location}): ${item.path}`
@@ -67,8 +68,8 @@ export const deliver = Effect.fnUntraced(function* <E>(
       : input.status === "error"
         ? (input.error ?? "Subagent failed")
         : (input.output ?? input.error ?? "Subagent cancelled")
-  // Older rows lack the snapshot. Replay their recorded job status and preserve the full report body.
-  const state = input.status === "completed" && recovery.outstanding?.length ? "running" : input.status
+  const running = recovery.outstanding ? recovery.outstanding.length > 0 : body.includes(STILL_RUNNING)
+  const state = input.status === "completed" && running ? "running" : input.status
   const formatted = formatBody(body, recovery.childSessionID, recovery.outstanding)
   yield* sessions.synthetic({
     ...(input.notificationID ? { id: input.notificationID } : {}),

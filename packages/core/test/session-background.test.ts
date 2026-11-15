@@ -28,6 +28,13 @@ const store: SessionBackground.Lookup = {
 const noJobs = { runningBackground: Effect.succeed([]) }
 
 describe("SessionBackground.outstanding", () => {
+  it.effect("snapshots exec in this session and descendants without counting unrelated commands", () =>
+    Effect.gen(function* () {
+      const commands = [child, grandchild, other].map((sessionID, execID) => ({ sessionID, execID, command: "work", startedAt: 0 }))
+      expect(yield* SessionBackground.runningExec(store, child, commands)).toEqual(commands.slice(0, 2))
+      expect(yield* SessionBackground.outstanding(noJobs, store, child)).toEqual([])
+    }),
+  )
   it.effect("includes active descendants with their agent and title", () =>
     Effect.gen(function* () {
       const items = yield* SessionBackground.outstanding(noJobs, store, root, new Set([root, child, grandchild, other]))

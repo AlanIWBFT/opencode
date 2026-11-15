@@ -25,6 +25,7 @@ import { SessionRunner } from "@opencode/core/session/runner/index"
 import { SessionProjector } from "@opencode/core/session/projector"
 import { SessionMessageTable, SessionTable } from "@opencode/core/session/sql"
 import { SessionStore } from "@opencode/core/session/store"
+import { ExecSessionControl } from "@opencode/core/tool/exec-session/control"
 import { LayerNode } from "@opencode/util/effect/layer-node"
 import { Cause, Context, DateTime, Deferred, Effect, Exit, Layer, LayerMap, Schema, Scope } from "effect"
 import { eq, sql } from "drizzle-orm"
@@ -32,7 +33,7 @@ import { testEffect } from "./lib/effect"
 
 const it = testEffect(
   AppNodeBuilder.build(
-    LayerNode.group([Database.node, Bus.node, SessionStore.node, SessionInbox.node, SessionProjector.node, Job.node]),
+    LayerNode.group([Database.node, Bus.node, SessionStore.node, SessionInbox.node, SessionProjector.node, Job.node, ExecSessionControl.node]),
   ),
 )
 
@@ -479,6 +480,44 @@ describe("SubagentReport settlement", () => {
 })
 
 describe("SubagentReport outbox", () => {
+  it.effect("admits an archived parent's report without waking it and retains running exec details", () =>
+    Effect.gen(function* () {
+      const database = yield* Database.Service
+      const store = yield* SessionStore.Service
+      const jobs = yield* Job.Service
+      const inbox = yield* SessionInbox.Service
+      const parent = sessionID("ses_archived_parent")
+      const child = sessionID("ses_archived_child")
+      const grandchild = sessionID("ses_archived_grandchild")
+      yield* seedSessions(database, [parent])
+      yield* database.db.update(SessionTable).set({ time_archived: 1 }).where(eq(SessionTable.id, parent)).run().pipe(Effect.orDie)
+      yield* seedSessions(database, [child], { parent_id: parent })
+      yield* seedSessions(database, [grandchild], { parent_id: child })
+      yield* seedAssistant(database, child, 100, "Finished this round")
+      const wakes: SessionID[] = []
+      const report = SubagentReport.make({
+        store, jobs, inbox,
+        draining: Effect.succeed(new Set()),
+        commands: Effect.succeed([
+          { sessionID: child, execID: 1, command: "child work", startedAt: 0 },
+          { sessionID: grandchild, execID: 2, command: "descendant work", startedAt: 0 },
+          { sessionID: parent, execID: 3, command: "parent work", startedAt: 0 },
+        ]),
+        wake: (sessionID) => Effect.sync(() => void wakes.push(sessionID)),
+      })
+      const settlement = yield* report.prepare(child, { type: "succeeded" })
+      yield* settlement.commit()
+      yield* settlement.deliver
+      const messages = yield* SessionInbox.list(database.db, parent)
+      expect(messages).toHaveLength(1)
+      const text = JSON.stringify(messages)
+      expect(text).toContain("child work")
+      expect(text).toContain("descendant work")
+      expect(text).not.toContain("parent work")
+      expect(wakes).toEqual([])
+      expect(yield* jobs.pendingBackground).toEqual([])
+    }),
+  )
   it.effect("rolls back the idle projection and claim release when the report insert fails", () =>
     Effect.gen(function* () {
       const database = yield* Database.Service
@@ -524,6 +563,7 @@ describe("SubagentReport outbox", () => {
         jobs,
         inbox,
         draining: Effect.succeed(new Set([grandchild])),
+        commands: Effect.succeed([]),
         wake: (sessionID) => Effect.sync(() => void wakes.push(sessionID)),
       })
       const job = yield* jobs.start({
@@ -614,6 +654,7 @@ describe("SubagentReport outbox", () => {
         jobs,
         inbox,
         draining: Effect.succeed(new Set()),
+        commands: Effect.succeed([]),
         wake: () => Effect.void,
       })
 

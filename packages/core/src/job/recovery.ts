@@ -1,4 +1,5 @@
 import { Schema } from "effect"
+import { SessionExec } from "@opencode/schema/session-exec"
 import { SessionSchema } from "../session/schema.js"
 
 const Shell = Schema.Struct({
@@ -22,6 +23,7 @@ const subagent = {
 
 const CodeMode = Schema.Struct({ kind: Schema.Literal("codemode"), sessionID: SessionSchema.ID, jobID: Schema.String })
 const OutstandingItem = Schema.Union([
+  Schema.Struct({ kind: Schema.Literal("exec"), ...SessionExec.Running.fields }),
   Shell,
   Image,
   CodeMode,

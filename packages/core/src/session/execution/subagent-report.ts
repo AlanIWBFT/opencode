@@ -3,6 +3,7 @@ export * as SubagentReport from "./subagent-report.js"
 import { Automation } from "@opencode/schema/automation"
 import { Effect, Result } from "effect"
 import type { Job } from "../../job.js"
+import type { ExecSessionControl } from "../../tool/exec-session/control.js"
 import { SessionBackground } from "../background.js"
 import { SessionInbox } from "../inbox.js"
 import { SessionMessage } from "../message.js"
@@ -26,6 +27,7 @@ export type Deps = {
   readonly inbox: Inbox
   readonly wake: (sessionID: SessionSchema.ID) => Effect.Effect<void>
   readonly draining: Effect.Effect<ReadonlySet<SessionSchema.ID>>
+  readonly commands: ExecSessionControl.Interface["listCommands"]
 }
 
 /** Narrow inbox admission so delivery does not depend on the full lifecycle service shape. */
@@ -125,7 +127,7 @@ export const make = (deps: Deps) => {
     )
     if (!delivered) return
     const parent = yield* deps.store.get(parentID)
-    if (parent && !parent.revert) yield* deps.wake(parentID)
+    if (parent && !parent.revert && !parent.time.archived) yield* deps.wake(parentID)
   })
 
   const prepare = Effect.fnUntraced(function* (
@@ -144,7 +146,10 @@ export const make = (deps: Deps) => {
       }
     }
     const running = initial?.parentID
-      ? yield* SessionBackground.outstanding(deps.jobs, deps.store, sessionID, yield* deps.draining)
+      ? [
+          ...(yield* SessionBackground.outstanding(deps.jobs, deps.store, sessionID, yield* deps.draining)),
+          ...(yield* SessionBackground.runningExec(deps.store, sessionID, yield* deps.commands)).map((command) => ({ ...command, kind: "exec" as const })),
+        ]
       : []
 
     const box: { postCommit: PostCommit } = { postCommit: { type: "none" } }

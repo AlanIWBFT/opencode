@@ -16,6 +16,7 @@ import { SessionSchema } from "./schema.js"
 import { SessionStore } from "./store.js"
 import { SessionSynthetic } from "./synthetic.js"
 import { toSessionError } from "./to-session-error.js"
+import { ExecSessionControl } from "../tool/exec-session/control.js"
 
 export interface Interface {
   /** Snapshots active execution owned by this process. */
@@ -65,6 +66,7 @@ export const layer = Layer.effect(
     const jobs = yield* Job.Service
     const inbox = yield* SessionInbox.Service
     const scope = yield* Effect.scope
+    const execControl = yield* ExecSessionControl.Service
     const db = (yield* Database.Service).db
     const reportLifecycle = <A>(sessionID: SessionSchema.ID, effect: Effect.Effect<A>) =>
       effect.pipe(
@@ -98,6 +100,7 @@ export const layer = Layer.effect(
       jobs,
       inbox,
       wake,
+      commands: execControl.listCommands,
       draining: Effect.suspend<ReadonlySet<SessionSchema.ID>, never, never>(() =>
         holder.coordinator ? holder.coordinator.draining : Effect.succeed(new Set<SessionSchema.ID>()),
       ),
@@ -226,7 +229,7 @@ function publishTerminal(
 export const node = makeGlobalNode({
   service: Service,
   layer,
-  deps: [SessionStore.node, Instance.node, Bus.node, Database.node, Job.node, SessionInbox.node],
+  deps: [SessionStore.node, Instance.node, Bus.node, Database.node, Job.node, SessionInbox.node, ExecSessionControl.node],
 })
 
 /** Low-level compatibility layer for callers that only need durable Session recording. */
