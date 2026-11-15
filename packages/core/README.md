@@ -19,6 +19,11 @@ their explicit metadata on user or synthetic messages before the compaction mark
 UI recovery preserves picks, user notes, field values and skipped choices; a skipped
 choice is not agreement. The original failed question tool remains unchanged.
 
+Late page answers and shared-page answers retain the original submitted message,
+including question excerpts and truncation markers. Only answered late pages are
+recovered. Shared-page replies remain explicitly unverified third-party data, never
+user instructions or approval.
+
 `session.prompt` and prompt-producing commands accept `context`, an ordered
 array of background text, descriptions and JSON metadata. Preparation validates
 the prompt before committing a staged revert. Revert commit and admission share
