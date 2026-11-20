@@ -43,7 +43,7 @@ export const outstanding = Effect.fnUntraced(function* (
   const owned = yield* Effect.filter(yield* jobs.runningBackground, (recovery) =>
     descends(store, parents, recovery.kind === "subagent" ? recovery.parentSessionID : recovery.sessionID, sessionID),
   )
-  const items: OutstandingItem[] = owned.map((recovery) => {
+  const items: Exclude<OutstandingItem, { kind: "exec" }>[] = owned.map((recovery) => {
     if (recovery.kind === "codemode") return recovery
     if (recovery.kind === "shell")
       return {

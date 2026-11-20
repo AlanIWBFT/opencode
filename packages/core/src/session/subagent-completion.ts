@@ -68,8 +68,7 @@ export const deliver = Effect.fnUntraced(function* <E>(
       : input.status === "error"
         ? (input.error ?? "Subagent failed")
         : (input.output ?? input.error ?? "Subagent cancelled")
-  const running = recovery.outstanding ? recovery.outstanding.length > 0 : body.includes(STILL_RUNNING)
-  const state = input.status === "completed" && running ? "running" : input.status
+  const state = input.status === "completed" && recovery.outstanding?.length ? "running" : input.status
   const formatted = formatBody(body, recovery.childSessionID, recovery.outstanding)
   yield* sessions.synthetic({
     ...(input.notificationID ? { id: input.notificationID } : {}),
