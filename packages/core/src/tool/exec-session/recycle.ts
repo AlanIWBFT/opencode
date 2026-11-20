@@ -5,6 +5,7 @@ const WINDOWS_RECYCLE_HELPER = "OpenCode.Windows.RecycleBin.dll"
 const WINDOWS_RECYCLE_PROTOCOL = 2
 
 function windowsRecycleHelperPath() {
+  if (process.env.OPENCODE_RECYCLE_HELPER_PATH) return process.env.OPENCODE_RECYCLE_HELPER_PATH
   const runtime = path.basename(process.execPath).toLowerCase()
   if (!["bun", "bun.exe", "node", "node.exe"].includes(runtime)) {
     return path.join(path.dirname(process.execPath), WINDOWS_RECYCLE_HELPER)
