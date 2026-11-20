@@ -10,6 +10,9 @@ import { FSUtil } from "@opencode/util/fs-util"
 import { Effect, Schema } from "effect"
 import { ChildProcess } from "effect/process"
 import path from "node:path"
+import { Config } from "../../config.js"
+import { ConfigEntryObserver } from "../../config/plugin/entry-observer.js"
+import { Flag } from "../../flag.js"
 import { Environment } from "../../environment/index.js"
 import { FileAccess } from "../../file-access.js"
 import { Location } from "../../location.js"
@@ -85,6 +88,9 @@ export const Plugin = {
     const permission = yield* Permission.Service
     const access = yield* FileAccess.Service
     const hooks = yield* PluginHooks.Service
+    const config = yield* Config.Service
+    const loaded = yield* ConfigEntryObserver.observe(config, ctx.event, ctx.tool.reload())
+    const flags = yield* Flag.Service
     const resolveShell = shellSelect
       .resolve({ priority: "compat" })
       .pipe(Effect.map((shell) => persistentShellExecutable(shell)))
@@ -131,9 +137,14 @@ export const Plugin = {
     yield* ctx.tool
       .transform((editor) => {
         editor.remove("shell")
+        const full = flags.resolve(loaded.entries).full_codemode.enabled
+        const options: Tool.Options = full ? { permission: "shell", codemode: true, pinned: true } : { permission: "shell", codemode: false }
+        const followup: Tool.Options = full
+          ? { permission: "shell", pinned: true, codemode: { concurrency: { group: "exec-session", limit: 1, inputKey: "exec_id" } } }
+          : options
         editor.add({
           name: "exec_command",
-          options: { permission: "shell", codemode: false },
+          options,
           description: description(),
           input: ExecInput,
           output: Schema.String,
@@ -206,7 +217,7 @@ export const Plugin = {
         })
         editor.add({
           name: "poll_exec",
-          options: { permission: "shell", codemode: false },
+          options: followup,
           input: PollInput,
           output: Schema.String,
           description: "Poll a running exec_command execution for more output without writing to stdin.",
@@ -222,7 +233,7 @@ export const Plugin = {
         })
         editor.add({
           name: "write_stdin",
-          options: { permission: "shell", codemode: false },
+          options: followup,
           input: WriteInput,
           output: Schema.String,
           description:
@@ -259,7 +270,7 @@ export const Plugin = {
         })
         editor.add({
           name: "terminate_exec",
-          options: { permission: "shell", codemode: false },
+          options: followup,
           input: TerminateInput,
           output: Schema.String,
           description:

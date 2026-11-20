@@ -5,6 +5,7 @@ import { AppNodeBuilder } from "@opencode/core/effect/app-node-builder"
 import { LayerNode } from "@opencode/util/effect/layer-node"
 import { makeLocationNode } from "@opencode/util/effect/app-node"
 import { Config } from "@opencode/core/config"
+import { Flag } from "@opencode/core/flag"
 import { Environment } from "@opencode/core/environment/index"
 import { FileAccess } from "@opencode/core/file-access"
 import { Location } from "@opencode/core/location"
@@ -22,7 +23,7 @@ import { SessionExec } from "@opencode/schema/session-exec"
 import { SessionEvent } from "@opencode/schema/session-event"
 import { tempLocationLayer } from "./fixture/location"
 import { testEffect } from "./lib/effect"
-import { executeTool, registerToolPlugin, toolIdentity } from "./lib/tool"
+import { codeModeListings, executeTool, registerToolPlugin, toolIdentity } from "./lib/tool"
 
 const plugin = makeLocationNode({
   name: "test/unified-exec-plugin",
@@ -37,6 +38,7 @@ const plugin = makeLocationNode({
     Permission.node,
     FileAccess.node,
     Config.node,
+    Flag.node,
     PluginHooks.node,
   ],
 })
@@ -50,6 +52,17 @@ const base = AppNodeBuilder.build(
 )
 const direct = testEffect(base)
 const scripts = testEffect(base)
+const full = testEffect(base.pipe(Layer.provide(Layer.succeed(Flag.Overrides, "full_codemode"))))
+full.effect("full Code Mode advertises persistent command controls only inside execute", () =>
+  Effect.gen(function* () {
+    const tools = yield* Tool.Service
+    const snapshot = yield* tools.snapshot()
+    expect(snapshot.definitions.map((tool) => tool.name)).toEqual(["execute"])
+    expect(codeModeListings(snapshot.codeModeCatalog!).map((tool) => tool.path).sort()).toEqual([
+      "exec_command", "poll_exec", "terminate_exec", "write_stdin",
+    ])
+  }),
+)
 const windowsDirect = process.platform === "win32" && Bun.which("pwsh") ? direct.live : direct.live.skip
 const windowsScript = process.platform === "win32" && Bun.which("pwsh") ? scripts.live : scripts.live.skip
 

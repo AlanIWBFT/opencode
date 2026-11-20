@@ -80,10 +80,9 @@ export const Plugin = {
 
     yield* ctx.tool
       .transform((editor) => {
-        if (flags.resolve(loaded.entries).full_codemode.enabled) return
         editor.add({
           name,
-          options: { codemode: false },
+          options: { codemode: flags.resolve(loaded.entries).full_codemode.enabled },
           description:
             "Search file contents using ripgrep's regular expression syntax or literal text matching. Use it to locate specific code, symbols, or text patterns, and narrow searches with `path` or `include`. Returns matching file paths, line numbers, and line previews.",
           input: Input,

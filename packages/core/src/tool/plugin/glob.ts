@@ -62,10 +62,9 @@ export const Plugin = {
 
     yield* ctx.tool
       .transform((editor) => {
-        if (flags.resolve(loaded.entries).full_codemode.enabled) return
         editor.add({
           name,
-          options: { codemode: false },
+          options: { codemode: flags.resolve(loaded.entries).full_codemode.enabled },
           description: 'Search file paths using a glob pattern (examples: "**/*.ts", "src/**/*.tsx").',
           input: Input,
           output: Output,
