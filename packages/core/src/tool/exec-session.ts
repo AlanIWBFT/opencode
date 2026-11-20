@@ -13,7 +13,7 @@ import { Pty } from "../pty.js"
 import { Cause, Context, Deferred, Effect, Exit, Layer, Queue, Scope, Semaphore, Stream } from "effect"
 import { ChildProcess } from "effect/process"
 import type { ChildProcessHandle } from "effect/process/ChildProcessSpawner"
-import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises"
+import { chmod, mkdtemp, readFile, rm, unlink, writeFile } from "node:fs/promises"
 import os from "os"
 import path from "path"
 import {
@@ -355,7 +355,7 @@ const layer = Layer.effect(
       entry.statusFile = undefined
       yield* Effect.forEach(
         files,
-        (file) => Effect.promise(() => Bun.file(file).delete()).pipe(Effect.catchCause(() => Effect.void)),
+        (file) => Effect.promise(() => unlink(file)).pipe(Effect.catchCause(() => Effect.void)),
         {
           concurrency: "unbounded",
           discard: true,
@@ -816,7 +816,7 @@ const layer = Layer.effect(
               Effect.catch(() => Effect.succeed(undefined)),
             )
           : statusFile
-            ? yield* Effect.promise(() => Bun.file(statusFile).text()).pipe(
+            ? yield* Effect.tryPromise(() => readFile(statusFile, "utf8")).pipe(
                 Effect.catch(() => Effect.succeed(undefined)),
               )
             : undefined
@@ -1450,7 +1450,7 @@ const layer = Layer.effect(
             if (!activated) {
               yield* Effect.forEach(
                 files,
-                (file) => Effect.promise(() => Bun.file(file).delete()).pipe(Effect.catchCause(() => Effect.void)),
+                (file) => Effect.promise(() => unlink(file)).pipe(Effect.catchCause(() => Effect.void)),
                 {
                   concurrency: "unbounded",
                   discard: true,
