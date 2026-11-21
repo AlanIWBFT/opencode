@@ -1,6 +1,7 @@
 export * as ServerProcess from "./process"
 
 import { NodeHttpServer } from "@effect/platform-node"
+import { distribution } from "@opencode/protocol/distribution"
 import { Bus } from "@opencode/core/bus"
 import { SessionRestart } from "@opencode/core/session/execution/restart"
 import { Automation } from "@opencode/core/automation"
@@ -218,7 +219,7 @@ const infoResponse = Effect.fnUntraced(function* (
 ) {
   const state = yield* status.current
   return HttpServerResponse.jsonUnsafe(
-    { version, pid: process.pid, urls: urls(), paths: { tmp } },
+    { distribution, version, pid: process.pid, urls: urls(), paths: { tmp } },
     {
       status: state.type === "ready" ? 200 : state.type === "failed" ? 500 : 503,
       headers: state.type === "starting" || state.type === "stopping" ? { "retry-after": "1" } : undefined,

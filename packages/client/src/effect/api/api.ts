@@ -49,6 +49,7 @@ import type { UsageLimits } from "@opencode/schema/usage-limits"
 import type { Config } from "@opencode/schema/config"
 
 export type ServerInfoOutput = {
+  readonly distribution: "openchamber"
   readonly version: string
   readonly pid: number
   readonly hostname?: string | undefined

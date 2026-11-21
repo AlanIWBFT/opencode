@@ -3,7 +3,12 @@
 Managed OpenChamber children use the upstream `opencode serve --stdio` lifetime:
 the CLI reports its listening URL as JSON, and stdin EOF closes its server scope
 and application resources before exit. The parent keeps the stdin pipe open
-until shutdown. There is no local shutdown JSON protocol or capability marker.
+until shutdown. There is no local shutdown JSON protocol.
+
+`opencode --openchamber-info` prints JSON with `distribution: "openchamber"` and
+`version` without starting a service. The running service reports the same
+identity on `GET /api/info`. OpenChamber requires this distribution for its
+backend; an upstream version number alone does not identify the fork.
 
 The local packaged CLI uses channel `dev` and defaults to `opencode-dev.db`.
 Explicit `OPENCODE_DB` and `OPENCODE_DISABLE_CHANNEL_DB` settings retain their

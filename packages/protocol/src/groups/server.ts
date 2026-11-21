@@ -1,8 +1,10 @@
 import { Schema } from "effect"
 import { HttpApiEndpoint, HttpApiGroup, OpenApi } from "effect/http-api"
 import { UnauthorizedError } from "../errors.js"
+import { distribution } from "../distribution.js"
 
 export const ServerInfo = Schema.Struct({
+  distribution: Schema.Literal(distribution),
   version: Schema.String,
   // 0 means the runtime has no OS process identity (e.g. workerd).
   pid: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),

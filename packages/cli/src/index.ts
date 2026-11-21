@@ -18,6 +18,12 @@ import { EffectFlock } from "@opencode/util/effect-flock"
 import { Heap } from "./heap"
 import { CpuProfile } from "./cpu-profile"
 import { ShutdownDeadline } from "./shutdown-deadline"
+import { distribution } from "@opencode/protocol/distribution"
+
+if (process.argv.length === 3 && process.argv[2] === "--openchamber-info") {
+  console.log(JSON.stringify({ distribution, version: OPENCODE_VERSION }))
+  process.exit(0)
+}
 
 // Keep requests to the local service off any proxy. Bun reads lowercase `no_proxy` alone whenever it is set, so both
 // spellings get the same merged list.

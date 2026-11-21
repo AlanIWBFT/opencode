@@ -23598,6 +23598,10 @@
       "ServerInfo": {
         "type": "object",
         "properties": {
+          "distribution": {
+            "type": "string",
+            "enum": ["openchamber"]
+          },
           "version": {
             "type": "string"
           },
@@ -23656,7 +23660,7 @@
             ]
           }
         },
-        "required": ["version", "pid", "urls", "paths"],
+        "required": ["distribution", "version", "pid", "urls", "paths"],
         "additionalProperties": false
       },
       "ServiceUnavailableErrorEncoded": {
@@ -25570,6 +25574,9 @@
                 "type": "object",
                 "properties": {
                   "created": {
+                    "type": "number"
+                  },
+                  "firstToken": {
                     "type": "number"
                   },
                   "streamed": {
